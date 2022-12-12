@@ -9914,19 +9914,19 @@ function RouterError({
 function App() {
   const mode = window.location.search.slice(1);
   const routes = {
-    component: () => __vitePreload(() => import('./index.aa5cb89c.js'),true?["assets/index.aa5cb89c.js","assets/index.1c488565.css"]:void 0),
+    component: () => __vitePreload(() => import('./index.85b1672a.js'),true?["assets/index.85b1672a.js","assets/index.1c488565.css"]:void 0),
     children: [{
       path: '/',
-      component: () => __vitePreload(() => import('./index.d4386aef.js'),true?["assets/index.d4386aef.js","assets/index.faca8b7d.css"]:void 0)
+      component: () => __vitePreload(() => import('./index.25497f7c.js'),true?["assets/index.25497f7c.js","assets/index.faca8b7d.css"]:void 0)
     }, {
       path: '/async',
-      component: () => __vitePreload(() => import('./index.5760799a.js'),true?["assets/index.5760799a.js","assets/index.95290d85.css"]:void 0)
+      component: () => __vitePreload(() => import('./index.e8dbdc71.js'),true?["assets/index.e8dbdc71.js","assets/index.95290d85.css"]:void 0)
     }, {
       path: '/help',
-      component: () => __vitePreload(() => import('./index.73cc49c1.js'),true?["assets/index.73cc49c1.js","assets/index.6476fe21.css"]:void 0)
+      component: () => __vitePreload(() => import('./index.f50c4c1d.js'),true?["assets/index.f50c4c1d.js","assets/index.6476fe21.css"]:void 0)
     }, {
       path: '/about',
-      component: () => __vitePreload(() => import('./index.8c26cd2b.js'),true?["assets/index.8c26cd2b.js","assets/index.e62a4607.css"]:void 0)
+      component: () => __vitePreload(() => import('./index.672278ab.js'),true?["assets/index.672278ab.js","assets/index.e62a4607.css"]:void 0)
     }]
   };
   if (mode === 'hash') {

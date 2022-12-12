@@ -1,4 +1,4 @@
-import { r as react, j as jsxs, a as jsx } from './index.80a5a7ef.js';
+import { r as react, j as jsxs, a as jsx } from './index.58639d43.js';
 
 function thru(interceptor) {
   return v => (interceptor(v), v);
@@ -12,17 +12,23 @@ function thruError(set) {
     throw e;
   };
 }
+function noop() {}
 
 const map = new WeakMap();
 function useInjectable(fn) {
   const ref = react.exports.useRef();
-  ref.current = [fn, []];
+  ref.current = [fn, [], {}];
   const f = react.exports.useCallback((...args) => {
     const [func, injects] = ref.current;
-    return injects.reduce((i, w) => w(i), func)(...args);
+    const callContext = {};
+    return injects.reduce((i, w) => w(i, callContext), func)(...args);
   }, []);
   map.set(f, ref);
   return f;
+}
+function getInjectContext(fn) {
+  const ref = map.get(fn);
+  return ref.current[2];
 }
 function useInject(fn, wrapper) {
   const ref = map.get(fn);
@@ -40,10 +46,81 @@ function useLoadingFn() {
   return [loading, wrap];
 }
 
+function create({
+  cacheTime,
+  hash
+}) {
+  const map = new Map();
+  let useCount = 0;
+  let timer;
+  return {
+    get(key) {
+      const k = hash(key);
+      return map.get(k);
+    },
+    set(key, value) {
+      map.set(hash(key), [value, Date.now()]);
+    },
+    delete(k) {
+      map.delete(hash(k));
+    },
+    clear() {
+      map.clear();
+    },
+    use() {
+      if (cacheTime === Infinity) return noop;
+      useCount++;
+      let called = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      return () => {
+        if (called) return;
+        called = true;
+        if (--useCount === 0) {
+          timer = setTimeout(() => {
+            map.clear();
+            timer = undefined;
+          }, cacheTime);
+        }
+      };
+    }
+  };
+}
+
+const setResultKey = Symbol('set result');
 function useResult(injectableFn, init) {
   const [result, setResult] = react.exports.useState(init);
+  const context = getInjectContext(injectableFn);
+  context[setResultKey] = setResult;
   useInject(injectableFn, f => (...args) => f(...args).then(thruSet(setResult)));
   return result;
+}
+function useCache(injectableFn, cacheProvider, staleTime = 0) {
+  const context = getInjectContext(injectableFn);
+  const staleRef = react.exports.useRef(false);
+  react.exports.useEffect(cacheProvider.use, []);
+  useInject(injectableFn, f => (...args) => {
+    const setResult = context[setResultKey];
+    const refetch = () => f(...args).then(r => {
+      cacheProvider.set(args, r);
+      setResult(r);
+      staleRef.current = false;
+      return r;
+    });
+    return new Promise(resolve => {
+      resolve(cacheProvider.get(args));
+    }).then(cached => {
+      if (!cached) return refetch();
+      const [data, cachedAt] = cached;
+      staleRef.current = Date.now() - cachedAt >= staleTime;
+      if (staleRef.current) {
+        refetch();
+      }
+      return data;
+    }).catch(refetch);
+  });
+  return staleRef.current;
 }
 function useError(injectableFn) {
   const [error, setError] = react.exports.useState();
@@ -83,7 +160,7 @@ function* genId(size) {
 }
 async function fetchList(size) {
   console.log('fetch list start');
-  await sleep(1000);
+  await sleep(5000);
   if (size && size < 0) {
     console.log('fetch list fail');
     throw new Error('PARAMS ERROR: [size] could not lower than 0');
@@ -94,8 +171,13 @@ async function fetchList(size) {
 
 const index_1r00m6o = '';
 
+const cache = create({
+  cacheTime: 10000,
+  hash: k => JSON.stringify(k)
+});
 function Async() {
   const fetchUserList = useInjectable(fetchList);
+  const isStale = useCache(fetchUserList, cache, 2000);
   const users = useResult(fetchUserList);
   const loading = useLoading(fetchUserList);
   const error = useError(fetchUserList);
@@ -128,6 +210,8 @@ function Async() {
         onClick: () => fetchUserList(-1),
         children: "refresh(Error)"
       })]
+    }), isStale && /*#__PURE__*/jsx("p", {
+      children: "data was stale"
     }), /*#__PURE__*/jsx("ul", {
       children: users?.map(user => /*#__PURE__*/jsx("li", {
         children: user.username
