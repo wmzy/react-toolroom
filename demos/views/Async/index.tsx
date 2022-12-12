@@ -4,12 +4,20 @@ import {
   useLoading,
   useRun,
   useInjectable,
-  useError
+  useError,
+  createMemoryCacheProvider,
+  useCache
 } from 'react-toolroom/async';
 import {fetchList} from '@/services/user';
 
+const cache = createMemoryCacheProvider<any, any[]>({
+  cacheTime: 10000,
+  hash: (k: any[]) => JSON.stringify(k)
+});
+
 export default function Async() {
   const fetchUserList = useInjectable(fetchList);
+  const isStale = useCache(fetchUserList, cache, 2000);
   const users = useResult(fetchUserList);
   const loading = useLoading(fetchUserList);
   const error = useError(fetchUserList);
@@ -46,6 +54,7 @@ export default function Async() {
           refresh(Error)
         </button>
       </div>
+      {isStale && <p>data was stale</p>}
       <ul>
         {users?.map((user) => (
           <li key={user.id}>{user.username}</li>

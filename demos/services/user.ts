@@ -19,7 +19,7 @@ function* genId(size: number) {
 
 export async function fetchList(size?: number) {
   console.log('fetch list start');
-  await sleep(1000);
+  await sleep(5000);
   if (size && size < 0) {
     console.log('fetch list fail');
     throw new Error('PARAMS ERROR: [size] could not lower than 0');

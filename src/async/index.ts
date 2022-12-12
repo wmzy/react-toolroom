@@ -1,8 +1,11 @@
-import {AsyncFunc, Func, R} from '@@/types';
-import {useEffect, useState} from 'react';
+import {AsyncFunc, CacheProvider, CacheResult, Func, R} from '@@/types';
+import {useEffect, useRef, useState} from 'react';
 import {thru, thruError, thruSet} from '@@/util';
-import {useInject, useInjectable} from './inject';
+import {useInject, useInjectable, getInjectContext} from './inject';
 import {useLoadingFn} from './base';
+import createMemoryCacheProvider from './memory-cache-provider';
+
+const setResultKey = Symbol('set result');
 
 export function useResult<AF extends AsyncFunc>(
   injectableFn: AF
@@ -17,11 +20,53 @@ export function useResult<AF extends AsyncFunc>(
 ): R<AF> | undefined {
   type RAF = R<AF>;
   const [result, setResult] = useState<RAF | undefined>(init);
+  const context = getInjectContext(injectableFn);
+  context[setResultKey] = setResult;
   useInject(
     injectableFn,
     (f: AF) => ((...args) => f(...args).then(thruSet(setResult))) as AF
   );
   return result;
+}
+
+export function useCache<AF extends AsyncFunc>(
+  injectableFn: AF,
+  cacheProvider: CacheProvider<R<AF>, any[]>,
+  staleTime = 0
+) {
+  const context = getInjectContext(injectableFn);
+  const staleRef = useRef(false);
+
+  useEffect(cacheProvider.use, []);
+
+  useInject(
+    injectableFn,
+    (f: AF) =>
+      ((...args) => {
+        const setResult = context[setResultKey];
+        const refetch = () =>
+          f(...args).then((r) => {
+            cacheProvider.set(args, r);
+            setResult(r);
+            staleRef.current = false;
+            return r;
+          });
+        return new Promise<CacheResult<R<AF>>>((resolve) => {
+          resolve(cacheProvider.get(args));
+        })
+          .then((cached: CacheResult<R<AF>>) => {
+            if (!cached) return refetch();
+            const [data, cachedAt] = cached;
+            staleRef.current = Date.now() - cachedAt >= staleTime;
+            if (staleRef.current) {
+              refetch();
+            }
+            return data;
+          })
+          .catch(refetch);
+      }) as AF
+  );
+  return staleRef.current;
 }
 
 export function useCatch<E extends Error, AF extends AsyncFunc>(
@@ -102,4 +147,4 @@ export function useRun<F extends Func>(fn: F, args: Parameters<F>) {
   useEffect(() => void fn(...args), args);
 }
 
-export {useInjectable};
+export {useInjectable, createMemoryCacheProvider};

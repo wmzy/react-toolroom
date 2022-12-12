@@ -11,14 +11,16 @@ export function useFn<F extends Func>(fn: F): F {
 }
 
 const map = new WeakMap();
+type Wrapper<F extends Func> = (f: F, callContext: any) => F;
 
 export function useInjectable<F extends Func>(fn: F): F {
-  const ref = useRef<[F, ((f: F) => F)[]]>();
-  ref.current = [fn, []];
+  const ref = useRef<[F, Wrapper<F>[], any]>();
+  ref.current = [fn, [], {}];
 
   const f = useCallback((...args: Parameters<F>) => {
     const [func, injects] = ref.current!;
-    return injects.reduce((i, w) => w(i), func)(...args);
+    const callContext = {};
+    return injects.reduce((i, w) => w(i, callContext), func)(...args);
   }, []) as F;
 
   map.set(f, ref);
@@ -26,12 +28,17 @@ export function useInjectable<F extends Func>(fn: F): F {
   return f;
 }
 
-export function useInject<F extends Func>(fn: F, wrapper: (f: F) => F) {
-  const ref = map.get(fn) as MutableRefObject<[F, ((f: F) => F)[]]>;
+export function getInjectContext<F extends Func>(fn: F) {
+  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[], any]>;
+  return ref.current[2];
+}
+
+export function useInject<F extends Func>(fn: F, wrapper: Wrapper<F>) {
+  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[]]>;
   ref.current[1].push(wrapper);
 }
 
-export function useInjectBefore<F extends Func>(fn: F, wrapper: (f: F) => F) {
-  const ref = map.get(fn) as MutableRefObject<[F, ((f: F) => F)[]]>;
+export function useInjectBefore<F extends Func>(fn: F, wrapper: Wrapper<F>) {
+  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[]]>;
   ref.current[1].unshift(wrapper);
 }
