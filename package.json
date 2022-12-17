@@ -5,7 +5,7 @@
   "exports": {
     "./async": {
       "types": "./dist/types/async/index.d.ts",
-      "import": "./dist/async.js"
+      "import": "./dist/async.mjs"
     }
   },
   "scripts": {
