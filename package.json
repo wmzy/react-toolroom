@@ -21,8 +21,8 @@
     "deploy": "cross-env BABEL_ENV=development BUILD_DEMO=true vite build && gh-pages -d dist",
     "test": "cross-env NODE_ENV=test nyc mocha",
     "test:watch": "npm test -- --watch",
-    "prepublishOnly": "npm run build",
-    "postpublish": "git push --follow-tags && npm run deploy",
+    "preversion": "npm run build",
+    "postversion": "git push --follow-tags && npm run deploy",
     "serve": "vite preview"
   },
   "keywords": [],
