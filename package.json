@@ -1,6 +1,6 @@
 {
   "name": "react-toolroom",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "A toolset for react developers.",
   "exports": {
     "./async": {
@@ -9,7 +9,9 @@
       "import": "./dist/async.mjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "start": "vite",
     "build": "vite build && tsc -p tsconfig.production.json && tsc-alias -p tsconfig.production.json",
