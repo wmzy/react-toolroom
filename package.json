@@ -1,10 +1,11 @@
 {
   "name": "react-toolroom",
   "version": "0.2.1",
-  "description": "",
+  "description": "A toolset for react developers.",
   "exports": {
     "./async": {
       "types": "./dist/types/async/index.d.ts",
+      "require": "./dist/async.mjs",
       "import": "./dist/async.mjs"
     }
   },
