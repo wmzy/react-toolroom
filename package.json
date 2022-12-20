@@ -9,6 +9,7 @@
       "import": "./dist/async.mjs"
     }
   },
+  "files": ["dist"],
   "scripts": {
     "start": "vite",
     "build": "vite build && tsc -p tsconfig.production.json && tsc-alias -p tsconfig.production.json",
