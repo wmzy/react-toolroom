@@ -22,6 +22,7 @@ module.exports = {
     'no-void': 'off',
     'react/require-default-props': 'off',
     'react/react-in-jsx-scope': 'off',
+    '@typescript-eslint/no-use-before-define': ['error', {functions: false}],
     'no-use-before-define': ['error', {functions: false}],
     "import/no-extraneous-dependencies": ["error", {"devDependencies": ["{demos,test}/**/*"]}],
     'no-console': process.env.NODE_ENV === 'production' ? 'error' : 'warn',
@@ -30,7 +31,7 @@ module.exports = {
   settings: {
     'import/resolver': 'eslint-import-resolver-typescript',
     'polyfills': [
-      // App which dependence this lib should pollyfill these methods:
+      // App which dependence this lib should polyfill these methods:
       'Promise',
     ]
   },

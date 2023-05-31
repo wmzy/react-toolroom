@@ -26,13 +26,13 @@ export default function Layout() {
             <Link to='/'>Home</Link>
           </li>
           <li>
+            <Link to='/memo'>Memo</Link>
+          </li>
+          <li>
             <Link to='/async'>Async</Link>
           </li>
           <li>
             <Link to='/help'>Help</Link>
-          </li>
-          <li>
-            <Link to='/about'>About</Link>
           </li>
         </ul>
       </nav>

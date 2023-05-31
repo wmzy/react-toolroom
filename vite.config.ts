@@ -3,7 +3,7 @@
 import * as path from 'path';
 import {defineConfig, PluginOption} from 'vite';
 import react from '@vitejs/plugin-react';
-import linaria from '@linaria/rollup';
+import linaria from '@linaria/vite';
 
 const buildDemo = process.env.BUILD_DEMO === 'true';
 const base = buildDemo ? '/react-toolroom/' : '/demos/';
@@ -43,6 +43,7 @@ export default defineConfig({
         lib: {
           name: 'react-toolroom',
           entry: {
+            index: 'src/index.ts',
             async: 'src/async/index.ts'
           },
           formats: ['es']
@@ -62,7 +63,6 @@ export default defineConfig({
   plugins: [
     {
       apply: buildDemo ? 'build' : 'serve',
-      enforce: 'pre',
       ...linaria({
         sourceMap: true,
         exclude: ['node_modules/**']

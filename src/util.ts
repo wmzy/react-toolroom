@@ -1,3 +1,5 @@
+import type {ComponentType} from 'react';
+
 export function thru<T>(interceptor: (v: T) => any) {
   return (v: T) => (interceptor(v), v);
 }
@@ -14,3 +16,7 @@ export function thruError<E extends Error>(set: (e: E) => any) {
 }
 
 export function noop() {}
+
+export function getDisplayName(Component: ComponentType<any>) {
+  return Component.displayName || Component.name || 'Component';
+}

@@ -2,7 +2,7 @@ import {
   View,
   MemoryRouter,
   HashRouter,
-  Router,
+  HistoryRouter as Router,
   Route
 } from 'native-router-react';
 import Loading from '@/components/Loading';
@@ -26,8 +26,8 @@ export default function App() {
         component: () => import('./Help')
       },
       {
-        path: '/about',
-        component: () => import('./About')
+        path: '/memo',
+        component: () => import('./Memo')
       }
     ]
   } as Route;
