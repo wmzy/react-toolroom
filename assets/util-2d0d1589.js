@@ -1,0 +1,1 @@
+function r(n){return t=>(n(t),t)}function u(n){return t=>(n(()=>t),t)}function a(n){return t=>{throw n(t),t}}function o(){}function e(n){return n.displayName||n.name||"Component"}export{r as a,a as b,e as g,o as n,u as t};
