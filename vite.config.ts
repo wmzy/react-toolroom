@@ -6,7 +6,7 @@ import react from '@vitejs/plugin-react';
 import linaria from '@linaria/vite';
 
 const buildDemo = process.env.BUILD_DEMO === 'true';
-const base = buildDemo ? '/react-toolroom/' : '/demos/';
+const base = buildDemo ? '/react-toolroom/demos/' : '/demos/';
 
 export default defineConfig({
   base,
@@ -35,7 +35,9 @@ export default defineConfig({
   },
   esbuild: false,
   build: buildDemo
-    ? {}
+    ? {
+        outDir: 'dist/demos'
+      }
     : {
         target: false, // skip vite:esbuild-transpile
         minify: 'terser',
