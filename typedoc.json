@@ -1,0 +1,10 @@
+{
+  "entryPoints": ["src/index.ts", "src/async/index.ts"],
+  "out": "dist",
+  "sort": [
+    "required-first"
+  ],
+  "navigationLinks": {
+    "Demos": "/react-toolroom/demos/"
+  }
+}

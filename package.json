@@ -23,14 +23,22 @@
     "commit": "lint-staged && git-cz -n",
     "coverage": "nyc report --reporter=text-lcov | coveralls",
     "lint": "eslint --fix src test demos *.js --ext .js,.jsx,.ts,.tsx",
-    "deploy": "cross-env BABEL_ENV=development BUILD_DEMO=true vite build && gh-pages -d dist",
+    "doc:gen": "typedoc",
+    "build:demo": "cross-env BABEL_ENV=development BUILD_DEMO=true vite build",
+    "deploy": "npm run doc:gen && npm run build:demo && gh-pages -d dist",
     "test": "cross-env NODE_ENV=test nyc mocha",
     "test:watch": "npm test -- --watch",
     "preversion": "npm run build",
-    "postversion": "git push --follow-tags && npm run deploy",
+    "postversion": "npm publish",
+    "postpublish": "git push --follow-tags && npm run deploy",
     "serve": "vite preview"
   },
-  "keywords": ["react", "hooks", "util", "react-query"],
+  "keywords": [
+    "react",
+    "hooks",
+    "util",
+    "react-query"
+  ],
   "author": "wmzy",
   "license": "ISC",
   "peerDependencies": {
@@ -88,6 +96,9 @@
     "sinon": "^15.1.0",
     "terser": "^5.17.6",
     "tsc-alias": "^1.8.6",
+    "typedoc": "^0.24.7",
+    "typedoc-plugin-mark-react-functional-components": "^0.2.2",
+    "typedoc-plugin-missing-exports": "^1.0.0",
     "typescript": "^5.0.4",
     "vite": "^4.3.9"
   }
