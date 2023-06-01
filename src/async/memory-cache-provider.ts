@@ -1,6 +1,18 @@
 import {CacheProvider} from '@@/types';
 import {noop} from '@@/util';
 
+/**
+ * Returns a cache provider that stores key-value pairs in a map with an optional
+ * expiration time.
+ *
+ * @param {number} cacheTime - The time in milliseconds for the cache to expire.
+ * @param {(k: K) => string} hash - The hash function used to generate a unique key
+ * for each value.
+ * @template T - The type of the value to be stored in the cache.
+ * @template K - The type of the key used to retrieve the value from the cache.
+ * @returns {CacheProvider<T, K>} Returns an object with methods for getting, setting,
+ * deleting, clearing, and managing the cache expiration.
+ */
 export default function create<T, K extends any[]>({
   cacheTime,
   hash

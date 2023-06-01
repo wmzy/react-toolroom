@@ -4,6 +4,14 @@ import {MutableRefObject, useCallback, useRef} from 'react';
 const map = new WeakMap();
 type Wrapper<F extends Func> = (f: F, callContext: any) => F;
 
+/**
+ * A higher-order function that takes a function as an argument and returns a new
+ * function that can be injected with dependencies. The injected function behaves
+ * the same way as the original function but with additional functionality.
+ *
+ * @param {Func} fn - The function to be made injectable.
+ * @return {Func} - A new function that can be injected with dependencies.
+ */
 export function useInjectable<F extends Func>(fn: F): F {
   const ref = useRef<[F, Wrapper<F>[], any]>();
   ref.current = [fn, [], {}];

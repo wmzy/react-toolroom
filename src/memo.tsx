@@ -63,6 +63,10 @@ export function memoBase<P extends object>(
   return FixedComponent;
 }
 
+/**
+ * It is a extend of React.memo. Use it replace the React.memo and remove the
+ * `useCallback` wrapper of event handler.
+ */
 export default function memo<P extends object>(
   Component: FunctionComponent<P>,
   options?: MemoOptions<P> | PropsAreEqual<P>
