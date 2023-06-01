@@ -1,4 +1,6 @@
-# react-toolroom
+English | [简体中文](./README-zh_CN.md)
+
+# React Toolroom
 
 > A toolset for react developers.
 
@@ -10,51 +12,25 @@ npm i react-toolroom
 
 ## Usage
 
+This package has some submodules for difference scenes.
+Import like this:
+
 ```tsx
+import {memo} from 'react-toolroom';
 import { useResult, useLoading, useRun, useInjectable, useError } from 'react-toolroom/async';
-import {fetchList} from '@/services/user';
-
-export default function Async() {
-  const fetchUserList = useInjectable(fetchList);
-  const users = useResult(fetchUserList);
-  const loading = useLoading(fetchUserList);
-  const error = useError(fetchUserList);
-
-  useRun(fetchUserList, []);
-
-  if (loading) return 'loading...';
-  if (error) {
-    return (
-      <div>
-        <h1>{error.message}</h1>
-        <pre>{error.stack}</pre>
-        <button type='button' onClick={() => fetchUserList()}>
-          refresh
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      <h1>User List</h1>
-      <div>
-        <button type='button' onClick={() => fetchUserList()}>
-          Refresh
-        </button>
-      </div>
-      <ul>
-        {users?.map((user) => (
-          <li key={user.id}>{user.username}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
 
 ```
-See [demos](/demos/) for a complete example.
 
-## Docs 
+Check [demos](/demos/) for a complete example.
 
-[API](https://wmzy.github.io/react-toolroom/)
+## Documentation 
+
+[Documentation](https://wmzy.github.io/react-toolroom/)
+
+## Contributing
+
+Contributions are always welcome!
+
+## License
+
+[MIT](https://choosealicense.com/licenses/mit/)
