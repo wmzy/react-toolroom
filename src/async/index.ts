@@ -72,7 +72,9 @@ import {useInject, useInjectable, getInjectContext} from './inject';
 import {useLoadingFn} from './base';
 import createMemoryCacheProvider from './memory-cache-provider';
 
-const setResultKey = Symbol('set result');
+export {useInject, getInjectContext};
+
+export const setResultKey = Symbol('set result');
 
 /**
  * Get the result of an wrapped async function.
