@@ -1,34 +1,36 @@
 # React Toolroom
 
-> A lightweight toolset for React developers.
+> 轻量级 React 开发者工具集。
 
-## Why React Toolroom?
+[English](./README.md) | 简体中文
 
-- **Memo optimization** - Automatic event handler memoization
-- **Async data fetching** - Simple hooks for API calls
-- **Zero dependencies** - Tiny bundle size
-- **TypeScript first** - Full type safety
+## 为什么选择 React Toolroom?
 
-## Install
+- **Memo 优化** - 自动记忆化事件处理函数
+- **异步数据获取** - 简单的数据获取 Hooks
+- **零依赖** - 极小的包体积
+- **TypeScript优先** - 完整的类型安全
+
+## 安装
 
 ```bash
 npm i react-toolroom
 ```
 
-## Modules
+## 模块
 
-### Core Module
+### 核心模块
 
 ```tsx
 import { memo } from 'react-toolroom';
 
-// Automatically memoizes event handlers
+// 自动记忆化事件处理函数
 const Button = memo(({ onClick, children }) => {
   return <button onClick={onClick}>{children}</button>;
 });
 ```
 
-### Async Module
+### 异步模块
 
 ```tsx
 import { 
@@ -40,13 +42,13 @@ import {
   useCache 
 } from 'react-toolroom/async';
 
-// Create a data fetcher
+// 创建数据获取器
 const fetchUsers = useInjectable(async () => {
   const res = await fetch('/api/users');
   return res.json();
 });
 
-// Use in component
+// 在组件中使用
 function UserList() {
   const users = useResult(fetchUsers);
   const loading = useLoading(fetchUsers);
@@ -60,7 +62,7 @@ function UserList() {
   return <ul>{users.map(u => <li>{u.name}</li>)}</ul>;
 }
 
-// With caching
+// 带缓存
 function CachedUserList() {
   const stale = useCache(fetchUsers, cacheProvider, 60000);
   // ...
@@ -71,54 +73,66 @@ function CachedUserList() {
 
 ### memo
 
-An enhanced version of React.memo that automatically memoizes event handlers.
+增强版的 React.memo，自动记忆化事件处理函数。
 
 ```tsx
 memo(Component, { testEvent, propsAreEqual })
 ```
 
-| Option | Type | Description |
-|--------|------|-------------|
-| testEvent | (key: string) => boolean | Test if prop is event handler (default: /^on[A-Z]/) |
-| propsAreEqual | (prev, next) => boolean | Custom comparison |
+| 参数 | 类型 | 说明 |
+|--------|------|------|
+| testEvent | (key: string) => boolean | 测试属性是否为事件处理函数（默认: /^on[A-Z]/） |
+| propsAreEqual | (prev, next) => boolean | 自定义比较函数 |
 
 ### useInjectable
 
-Wraps an async function for use with other hooks.
+包装异步函数以供其他 hooks 使用。
 
 ### useResult
 
-Gets the result of an async function.
+获取异步函数的结果。
 
 ### useLoading
 
-Gets the loading state of an async function.
+获取异步函数的加载状态。
 
 ### useError
 
-Gets the error of a failed async function.
+获取异步函数的错误。
 
 ### useRun
 
-Runs a function when dependencies change.
+当依赖更改时运行函数。
 
 ### useCache
 
-Caches async function results with stale-while-revalidate.
+缓存异步函数结果，支持 stale-while-revalidate。
 
 ### useCatch
 
-Catches errors from async function.
+捕获异步函数的错误。
 
 ### useFinally
 
-Adds a handler that runs after async function completes.
+添加在异步函数完成后运行的处理器。
 
-## Related Projects
+## 相关项目
 
-- [painless](https://github.com/wmzy/painless) - Frontend template
-- [native-router](https://github.com/native-router/react) - Routing
+- [painless](https://github.com/wmzy/painless) - 前端模板
+- [native-router](https://github.com/native-router/react) - 路由
 
-## License
+## 示例
+
+查看 [demos](./demos/) 获取完整示例。
+
+## 文档
+
+查看 [API 文档](https://wmzy.github.io/react-toolroom/)
+
+## 贡献
+
+欢迎贡献！
+
+## 许可证
 
 MIT
