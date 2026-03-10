@@ -13,7 +13,7 @@ type Wrapper<F extends Func> = (f: F, callContext: any) => F;
  * @return {Func} - A new function that can be injected with dependencies.
  */
 export function useInjectable<F extends Func>(fn: F): F {
-  const ref = useRef<[F, Wrapper<F>[], any]>();
+  const ref = useRef<[F, Wrapper<F>[], any]>(undefined);
   ref.current = [fn, [], {}];
 
   const f = useCallback((...args: Parameters<F>) => {
