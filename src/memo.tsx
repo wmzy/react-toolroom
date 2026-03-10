@@ -39,7 +39,8 @@ export function memoBase<P extends object>(
 ) {
   const MemoComponent = reactMemo(WrappedComponent, propsAreEqual);
 
-  const FixedComponent = forwardRef((props: P, ref) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+const FixedComponent = forwardRef(function FixedComponent(props: any, ref: any) {
     const memoEventsRef = useRef<Record<string, any>>({});
     const memoEvents = memoEventsRef.current;
     const newMemoEvents = Object.keys(props)
@@ -54,7 +55,6 @@ export function memoBase<P extends object>(
 
     memoEventsRef.current = newMemoEvents;
 
-    // @ts-expect-error
     return <MemoComponent ref={ref} {...props} {...newMemoEvents} />;
   });
 
