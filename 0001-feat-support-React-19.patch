@@ -1,0 +1,49 @@
+From bdec8845b077c781ee8e23953b92fd4e71c1620e Mon Sep 17 00:00:00 2001
+From: wmzy <wmzy@example.com>
+Date: Tue, 10 Mar 2026 09:35:35 +0800
+Subject: [PATCH] feat: support React 19
+
+---
+ package.json | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/package.json b/package.json
+index cf65a9d..d5623b5 100644
+--- a/package.json
++++ b/package.json
+@@ -42,8 +42,8 @@
+   "author": "wmzy",
+   "license": "ISC",
+   "peerDependencies": {
+-    "react": "^16.8.0  || ^17.0.0 || ^18.0.0",
+-    "react-dom": "^16.8.0  || ^17.0.0 || ^18.0.0"
++    "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0",
++    "react-dom": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0"
+   },
+   "sideEffects": false,
+   "devDependencies": {
+@@ -58,8 +58,8 @@
+     "@testing-library/react": "^14.0.0",
+     "@types/mocha": "^10.0.1",
+     "@types/node": "^20.2.5",
+-    "@types/react": "^18.2.7",
+-    "@types/react-dom": "^18.2.4",
++    "@types/react": "^19.0.0",
++    "@types/react-dom": "^19.0.0",
+     "@types/sinon": "^10.0.15",
+     "@typescript-eslint/eslint-plugin": "^8.56.1",
+     "@typescript-eslint/parser": "^8.56.1",
+@@ -90,8 +90,8 @@
+     "native-router-react": "^0.8.2",
+     "nyc": "^15.1.0",
+     "prettier": "^2.8.8",
+-    "react": "^18.2.0",
+-    "react-dom": "^18.2.0",
++    "react": "^19.0.0",
++    "react-dom": "^19.0.0",
+     "should": "^13.2.3",
+     "should-sinon": "0.0.6",
+     "sinon": "^15.1.0",
+-- 
+2.53.0
+

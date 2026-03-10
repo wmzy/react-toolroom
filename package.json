@@ -55,7 +55,7 @@
     "@linaria/babel-preset": "^4.4.5",
     "@linaria/core": "^4.2.10",
     "@linaria/vite": "^4.2.11",
-    "@testing-library/react": "^14.0.0",
+    "@testing-library/react": "^16.0.0",
     "@types/mocha": "^10.0.1",
     "@types/node": "^20.2.5",
     "@types/react": "^19.0.0",
