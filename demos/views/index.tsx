@@ -36,7 +36,6 @@ export default function App() {
     return (
       <HashRouter
         routes={routes}
-        // eslint-disable-next-line react/no-unstable-nested-components
         errorHandler={(e) => <RouterError error={e} />}
       >
         <View />
