@@ -10,10 +10,10 @@ export default function RouterError({error}: Props) {
     <section>
       <h1>Error</h1>
       <pre>{error.stack}</pre>
-      <button type="button" onClick={() => refresh(router)}>
+      <button type='button' onClick={() => refresh(router)}>
         Refresh
       </button>
-      <Link to="/">home</Link>
+      <Link to='/'>home</Link>
     </section>
   );
 }

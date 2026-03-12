@@ -1,5 +1,11 @@
 import {css} from '@linaria/core';
-import {type CSSProperties, type ReactPortal, useMemo, useEffect, useState} from 'react';
+import {
+  type CSSProperties,
+  type ReactPortal,
+  useMemo,
+  useEffect,
+  useState
+} from 'react';
 import {createPortal} from 'react-dom';
 import {cancel, useLoading, useRouter} from 'native-router-react';
 
@@ -15,7 +21,6 @@ export default function Loading(): ReactPortal | null {
     setPercent(0);
   }, [key]);
 
-  // eslint-disable-next-line consistent-return
   useEffect(() => {
     const remove = () => {
       if (el.parentElement) document.body.removeChild(el);
@@ -47,9 +52,9 @@ export default function Loading(): ReactPortal | null {
 
   return createPortal(
     <button
-      data-testid="loading"
-      type="button"
-      title="Click to cancel!"
+      data-testid='loading'
+      type='button'
+      title='Click to cancel!'
       onClick={() => cancel(router)}
       className={css`
         position: fixed;
