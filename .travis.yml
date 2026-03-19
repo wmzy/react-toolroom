@@ -1,11 +1,25 @@
 language: node_js
 
+# React 19 is the default (specified in devDependencies)
+# peerDependencies supports React 16.8+, 17, 18, and 19
 node_js:
-  - "node"
-  - "lts/*"
+  - 'node'
+  - 'lts/*'
 
 cache:
   directories:
-    - "node_modules"
+    - 'node_modules'
+
+# Ensure React 19 is used for testing
+env:
+  - REACT_VERSION=19
+
+install:
+  - npm install -g pnpm
+  - pnpm install
+
+script:
+  - pnpm test
+
 after_script:
   - npm run coverage
