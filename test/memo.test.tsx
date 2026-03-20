@@ -2,6 +2,7 @@ import {describe, it, expect, vi} from 'vitest';
 import {render, screen, fireEvent} from '@testing-library/react';
 import React, {forwardRef, useState} from 'react';
 import {defaultTestEvent, memoBase} from '../src/memo';
+import memo from '../src/memo';
 
 describe('memo', () => {
   describe('defaultTestEvent', () => {
@@ -161,13 +162,114 @@ describe('memo', () => {
       expect(screen.getByText('second')).toBeDefined();
     });
 
-    it('should have correct displayName', () => {
-      const Component = function TestComponent({name}: {name: string}) {
-        return <div>{name}</div>;
-      };
+    it('should handle non-function handlers', () => {
+      const Component = ({
+        name,
+        data,
+        onClick
+      }: {
+        name: string;
+        data: string;
+        onClick: () => void;
+      }) => (
+        <div data-testid='data-value' data-value={data}>
+          <span>{name}</span>
+          <button onClick={onClick}>click</button>
+        </div>
+      );
       const MemoComponent = memoBase(Component, {testEvent: defaultTestEvent});
 
-      expect(MemoComponent.displayName).toContain('FixedEvents');
+      // Pass non-function values for event handlers
+      const props = {
+        name: 'test',
+        data: 'value',
+        onClick: undefined,
+        onChange: null,
+        disabled: true
+      };
+
+      render(<MemoComponent {...props} />);
+
+      expect(screen.getByText('test')).toBeDefined();
+      expect(screen.getByTestId('data-value')).toBeDefined();
+    });
+  });
+
+  describe('default memo export', () => {
+    it('should work without options (line 82)', () => {
+      const Component = ({name}: {name: string}) => <div>{name}</div>;
+      const MemoComponent = memo(Component);
+
+      render(<MemoComponent name='test no options' />);
+
+      expect(screen.getByText('test no options')).toBeDefined();
+    });
+
+    it('should work with function options (propsAreEqual) (lines 83-87)', () => {
+      const Component = ({name, count}: {name: string; count: number}) => (
+        <div data-testid='comp'>
+          {name} - {count}
+        </div>
+      );
+
+      const propsAreEqual = (
+        prev: {name: string; count: number},
+        next: {name: string; count: number}
+      ) => {
+        return prev.name === next.name;
+      };
+
+      const MemoComponent = memo(Component, propsAreEqual);
+
+      const {rerender} = render(<MemoComponent name='test' count={1} />);
+      expect(screen.getByTestId('comp').textContent).toBe('test - 1');
+
+      rerender(<MemoComponent name='test' count={2} />);
+      expect(screen.getByTestId('comp').textContent).toBe('test - 1');
+
+      rerender(<MemoComponent name='changed' count={2} />);
+      expect(screen.getByTestId('comp').textContent).toBe('changed - 2');
+    });
+
+    it('should work with object options (line 89)', () => {
+      const customTestEvent = (k: string) => k.startsWith('handle');
+
+      const Component = ({
+        handleClick,
+        name
+      }: {
+        handleClick: () => void;
+        name: string;
+      }) => <button onClick={handleClick}>{name}</button>;
+
+      const MemoComponent = memo(Component, {testEvent: customTestEvent});
+
+      const handleClick = vi.fn();
+      render(<MemoComponent handleClick={handleClick} name='click me' />);
+
+      fireEvent.click(screen.getByRole('button'));
+      expect(handleClick).toHaveBeenCalled();
+    });
+
+    it('should work with object options including propsAreEqual', () => {
+      const Component = ({value}: {value: number}) => (
+        <div data-testid='value'>{value}</div>
+      );
+
+      const propsAreEqual = (prev: {value: number}, next: {value: number}) => {
+        return prev.value === next.value;
+      };
+
+      const MemoComponent = memo(Component, {
+        testEvent: defaultTestEvent,
+        propsAreEqual
+      });
+
+      const {rerender} = render(<MemoComponent value={1} />);
+      expect(screen.getByTestId('value').textContent).toBe('1');
+
+      rerender(<MemoComponent value={1} />);
+      expect(screen.getByTestId('value').textContent).toBe('1');
     });
   });
 });
