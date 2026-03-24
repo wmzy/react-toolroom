@@ -28,9 +28,6 @@
     "deploy": "npm run doc:gen && npm run build:demo && gh-pages -d dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "preversion": "npm run build",
-    "postversion": "npm publish",
-    "postpublish": "git push --follow-tags && npm run deploy",
     "serve": "vite preview"
   },
   "keywords": [

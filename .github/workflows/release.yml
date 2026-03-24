@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "src/**"
-      - "package.json"
-      - ".github/workflows/release.yml"
+      - 'src/**'
+      - 'package.json'
+      - 'README.md'
+      - 'README-zh_CN.md'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: write
