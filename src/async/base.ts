@@ -5,7 +5,8 @@ import {useEffect, useState} from 'react';
 export function useLoading() {
   const [count, setCount] = useState(0);
   const withLoading = <P extends Promise<any>>(p: P) => (
-    setCount((c) => c + 1), p.finally(() => setCount((c) => c - 1))
+    setCount((c) => c + 1),
+    p.finally(() => setCount((c) => c - 1))
   );
   return [Boolean(count), withLoading] as const;
 }

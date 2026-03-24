@@ -22,7 +22,7 @@ export default function create<T, K extends any[]>({
 }): CacheProvider<T, K> {
   const map = new Map<string, [T, number]>();
   let useCount = 0;
-  let timer: string | number | NodeJS.Timeout | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   return {
     get(key: K) {
       const k = hash(key);

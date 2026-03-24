@@ -47,13 +47,16 @@ export function memoBase<P extends object>(
     const memoEvents = memoEventsRef.current;
     const newMemoEvents = Object.keys(props)
       .filter(testEvent)
-      .reduce((me, k) => {
-        const handler = props[k as keyof P];
-        if (typeof handler !== 'function') {
-          return me;
-        }
-        return {...me, [k]: fixEventHandler(memoEvents[k], handler)};
-      }, {} as Record<string, any>);
+      .reduce(
+        (me, k) => {
+          const handler = props[k as keyof P];
+          if (typeof handler !== 'function') {
+            return me;
+          }
+          return {...me, [k]: fixEventHandler(memoEvents[k], handler)};
+        },
+        {} as Record<string, any>
+      );
 
     memoEventsRef.current = newMemoEvents;
 

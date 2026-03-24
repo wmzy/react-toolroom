@@ -50,7 +50,16 @@ module.exports = [
       'no-use-before-define': ['error', {functions: false}],
       'import/no-extraneous-dependencies': [
         'error',
-        {devDependencies: ['demos/**/*', 'test/**/*']}
+        {
+          devDependencies: [
+            'demos/**/*',
+            'test/**/*',
+            '*.config.ts',
+            '*.config.js',
+            'vite.config.*',
+            'vitest.config.*'
+          ]
+        }
       ],
       'no-console': process.env.NODE_ENV === 'production' ? 'error' : 'warn',
       'no-debugger': process.env.NODE_ENV === 'production' ? 'error' : 'off'
