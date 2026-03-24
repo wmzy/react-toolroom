@@ -61,13 +61,12 @@ export default defineConfig({
     open: '/demos/'
   },
   plugins: [
-    {
-      apply: buildDemo ? 'build' : 'serve',
-      ...linaria({
-        sourceMap: true,
-        exclude: ['node_modules/**']
-      })
-    } as PluginOption,
+    buildDemo
+      ? null
+      : (linaria({
+          sourceMap: true,
+          exclude: ['node_modules/**']
+        }) as PluginOption),
     react({
       exclude: ['node_modules/**'],
       babel: {
@@ -75,5 +74,5 @@ export default defineConfig({
         babelrc: true
       }
     })
-  ]
+  ].filter((p): p is PluginOption => p !== null)
 });
