@@ -32,6 +32,9 @@ importers:
       '@linaria/vite':
         specifier: ^5.0.4
         version: 5.0.4(typescript@5.9.3)(vite@8.0.2(@types/node@25.5.0)(jiti@2.6.1)(terser@5.46.1)(yaml@2.8.3))
+      '@native-router/react':
+        specifier: ^1.0.2
+        version: 1.1.2(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       '@testing-library/dom':
         specifier: ^10.4.1
         version: 10.4.1
@@ -110,9 +113,6 @@ importers:
       lint-staged:
         specifier: ^16.4.0
         version: 16.4.0
-      native-router-react:
-        specifier: ^0.12.0
-        version: 0.12.0(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       prettier:
         specifier: ^3.8.1
         version: 3.8.1
@@ -924,6 +924,17 @@ packages:
 
   '@napi-rs/wasm-runtime@1.1.1':
     resolution: {integrity: sha512-p64ah1M1ld8xjWv3qbvFwHiFVWrq1yFvV4f7w+mzaqiR4IlSgkqhcRdHwsGgomwzBH51sRY4NEowLxnaBjcW/A==}
+
+  '@native-router/core@1.1.0':
+    resolution: {integrity: sha512-g7a2oalnnKD5rRNq520zKkToiNpciZLYNQoBRV+40SqdKjuPe+p6XWF98u9fZDOb8+oidzKy+Y760riM5IoTrQ==}
+    engines: {node: '>=14'}
+
+  '@native-router/react@1.1.2':
+    resolution: {integrity: sha512-+/iVfQNY5Mpu8pvL+EFU7p2+PKF4/22HzSeKZLsQsCiPK55bo4d/WoyFgP9ske1vtX+6jCsYLQf0RMAvIQVutQ==}
+    engines: {node: '>=14'}
+    peerDependencies:
+      react: ^17.0.0 || ^18.0.0 || ^19.0.0
+      react-dom: ^17.0.0 || ^18.0.0 || ^19.0.0
 
   '@nodelib/fs.scandir@2.1.5':
     resolution: {integrity: sha512-vq24Bq3ym5HEQm2NKCr3yXDwjc7vTsEThRDnkp2DK9p1uqLR+DHurm/NOTo0KG7HYHU7eppKZj3MyqYuMBf62g==}
@@ -2893,13 +2904,6 @@ packages:
     engines: {node: ^12.20.0 || ^14.18.0 || >=16.0.0}
     hasBin: true
 
-  native-router-react@0.12.0:
-    resolution: {integrity: sha512-iw5wcMZETaW1CIqsXWv6PTHR2EoD2qt00QgdC6ldctv8jJhUgBg7zIIKBcvy1re+yn8iTS94jA5lkCm3sruARw==}
-    engines: {node: '>=14'}
-    peerDependencies:
-      react: ^17.0.0 || ^18.0.0
-      react-dom: ^17.0.0 || ^18.0.0
-
   natural-compare@1.4.0:
     resolution: {integrity: sha512-OWND8ei3VtNC9h7V60qff3SVobHr996CTwgxubgyQYEpg290h9J0buyECNNJexkFm5sOajh5G116RYA1c8ZMSw==}
 
@@ -4868,6 +4872,18 @@ snapshots:
       '@emnapi/runtime': 1.9.1
       '@tybys/wasm-util': 0.10.1
     optional: true
+
+  '@native-router/core@1.1.0':
+    dependencies:
+      history: 5.3.0
+      path-to-regexp: 6.3.0
+
+  '@native-router/react@1.1.2(react-dom@19.2.4(react@19.2.4))(react@19.2.4)':
+    dependencies:
+      '@native-router/core': 1.1.0
+      history: 5.3.0
+      react: 19.2.4
+      react-dom: 19.2.4(react@19.2.4)
 
   '@nodelib/fs.scandir@2.1.5':
     dependencies:
@@ -6964,13 +6980,6 @@ snapshots:
   nanoid@3.3.11: {}
 
   napi-postinstall@0.3.4: {}
-
-  native-router-react@0.12.0(react-dom@19.2.4(react@19.2.4))(react@19.2.4):
-    dependencies:
-      history: 5.3.0
-      path-to-regexp: 6.3.0
-      react: 19.2.4
-      react-dom: 19.2.4(react@19.2.4)
 
   natural-compare@1.4.0: {}
 

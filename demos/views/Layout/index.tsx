@@ -1,5 +1,5 @@
 import {css} from '@linaria/core';
-import {Link, View} from 'native-router-react';
+import {Link, View} from '@native-router/react';
 
 export default function Layout() {
   return (

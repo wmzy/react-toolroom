@@ -7,10 +7,9 @@ import {
   useState
 } from 'react';
 import {createPortal} from 'react-dom';
-import {cancel, useLoading, useRouter} from 'native-router-react';
+import {useLoading} from '@native-router/react';
 
 export default function Loading(): ReactPortal | null {
-  const router = useRouter();
   const [percent, setPercent] = useState<number>(0);
   const el = useMemo(() => document.createElement('div'), []);
 
@@ -54,8 +53,7 @@ export default function Loading(): ReactPortal | null {
     <button
       data-testid='loading'
       type='button'
-      title='Click to cancel!'
-      onClick={() => cancel(router)}
+      title='Loading...'
       className={css`
         position: fixed;
         top: 0;

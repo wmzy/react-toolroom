@@ -4,7 +4,7 @@ import {
   HashRouter,
   HistoryRouter as Router,
   Route
-} from 'native-router-react';
+} from '@native-router/react';
 import Loading from '@/components/Loading';
 import RouterError from '@/components/RouterError';
 
