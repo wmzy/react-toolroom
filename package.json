@@ -25,7 +25,7 @@
     "lint": "eslint --fix src test demos *.js --ext .js,.jsx,.ts,.tsx",
     "doc:gen": "typedoc",
     "build:demo": "cross-env BABEL_ENV=development BUILD_DEMO=true vite build",
-    "deploy": "npm run doc:gen && npm run build:demo && gh-pages -d dist",
+    "deploy:demo": "npm run doc:gen && npm run build:demo",
     "test": "vitest run",
     "test:watch": "vitest",
     "serve": "vite preview"
@@ -74,7 +74,6 @@
     "eslint-plugin-prettier": "^5.5.5",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
-    "gh-pages": "^6.3.0",
     "global-jsdom": "^29.0.0",
     "husky": "^9.1.7",
     "jsdom": "^29.0.1",
