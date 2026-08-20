@@ -1,5 +1,5 @@
 import {describe, it, expect, vi} from 'vitest';
-import {render, screen, waitFor, act} from '@testing-library/react';
+import {render, screen, waitFor, act, fireEvent} from '@testing-library/react';
 import {useState, useEffect} from 'react';
 import {
   useRun,
@@ -16,7 +16,7 @@ import {
   getInjectContext,
   useInject
 } from '../src/async';
-import {useLoadingFn, useResult as useResultBase} from '../src/async/base';
+import {useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
 
 describe('async hooks', () => {
@@ -287,6 +287,35 @@ describe('async hooks', () => {
 
       render(<TestComponent />);
       expect(screen.getByText('initial')).toBeDefined();
+    });
+
+    it('should ignore stale result when a newer call resolves first', async () => {
+      const fetchData = vi.fn(async (id: string) => {
+        await new Promise((r) => setTimeout(r, id === 'slow' ? 100 : 10));
+        return `data ${id}`;
+      });
+
+      function TestComponent({id}: {id: string}) {
+        const injectable = useInjectable(fetchData);
+        const result = useResult(injectable);
+
+        useRun(injectable, [id]);
+
+        return <div>{result ?? 'loading'}</div>;
+      }
+
+      const {rerender} = render(<TestComponent id='slow' />);
+      rerender(<TestComponent id='fast' />);
+
+      await waitFor(() => {
+        expect(screen.getByText('data fast')).toBeDefined();
+      });
+
+      // Wait past the slow call's resolution to prove it cannot overwrite
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 150));
+      });
+      expect(screen.getByText('data fast')).toBeDefined();
     });
   });
 
@@ -610,6 +639,237 @@ describe('async hooks', () => {
         {timeout: 10000}
       );
     });
+
+    it('should call fn only once when fn rejects on cache miss', async () => {
+      const fetchData = vi.fn((id: number) => {
+        return new Promise<string>((_, reject) => {
+          setTimeout(() => reject(new Error('fetch failed')), 5);
+        });
+      });
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 1000);
+        const result = useResult(injectable);
+
+        useEffect(() => {
+          injectable(1).catch(() => {});
+        }, [injectable]);
+
+        return <div data-testid='result'>{result ?? 'no result'}</div>;
+      }
+
+      render(<TestComponent />);
+
+      // wait long enough for a spurious second call to happen if the bug exists
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(fetchData).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep stale data without unhandled rejection when background refetch rejects', async () => {
+      const fetchData = vi.fn((id: number) => {
+        return new Promise<string>((_, reject) => {
+          setTimeout(() => reject(new Error('refetch failed')), 5);
+        });
+      });
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+      cache.set([1], 'stale data');
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 10);
+        const result = useResult(injectable);
+
+        useEffect(() => {
+          injectable(1);
+        }, [injectable]);
+
+        return <div data-testid='result'>{result ?? 'no result'}</div>;
+      }
+
+      // let the cached entry become stale before mounting
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandledRejection);
+
+      try {
+        render(<TestComponent />);
+
+        await waitFor(() => {
+          expect(screen.getByTestId('result').textContent).toBe('stale data');
+        });
+
+        // wait long enough for the background refetch to reject
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+        expect(screen.getByTestId('result').textContent).toBe('stale data');
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
+    });
+
+    it('should update stale reactively on stale cache hit and after background refetch', async () => {
+      let calls = 0;
+      let resolveRefetch: (v: string) => void;
+      const fetchData = vi.fn((id: number) => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve(`data ${id}`);
+        return new Promise<string>((resolve) => {
+          resolveRefetch = resolve;
+        });
+      });
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const isStale = useCache(injectable, cache, 10);
+        const result = useResult(injectable);
+
+        useEffect(() => {
+          injectable(1);
+        }, [injectable]);
+
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <span data-testid='stale'>{isStale ? 'stale' : 'fresh'}</span>
+            <button
+              data-testid='refetch'
+              type='button'
+              onClick={() => {
+                injectable(1);
+              }}
+            >
+              refetch
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1');
+      });
+      expect(screen.getByTestId('stale').textContent).toBe('fresh');
+
+      // let the cached entry become stale, then request again within cacheTime
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      fireEvent.click(screen.getByTestId('refetch'));
+
+      // the cached data is already on screen, so setResult bails out and no
+      // re-render is scheduled: only a reactive stale state can flip the UI
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('stale');
+      });
+      expect(screen.getByTestId('result').textContent).toBe('data 1');
+      expect(fetchData).toHaveBeenCalledTimes(2);
+
+      // background refetch completes: stale flips back to false in the UI
+      await act(async () => {
+        resolveRefetch!('data 1 updated');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 updated');
+      });
+      expect(screen.getByTestId('stale').textContent).toBe('fresh');
+    });
+
+    it('should keep stale true in the UI when background refetch rejects', async () => {
+      let calls = 0;
+      const fetchData = vi.fn((id: number) => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve(`data ${id}`);
+        return new Promise<string>((_, reject) => {
+          setTimeout(() => reject(new Error('refetch failed')), 5);
+        });
+      });
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const isStale = useCache(injectable, cache, 10);
+        const result = useResult(injectable);
+
+        useEffect(() => {
+          injectable(1);
+        }, [injectable]);
+
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <span data-testid='stale'>{isStale ? 'stale' : 'fresh'}</span>
+            <button
+              data-testid='refetch'
+              type='button'
+              onClick={() => {
+                injectable(1);
+              }}
+            >
+              refetch
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1');
+      });
+      expect(screen.getByTestId('stale').textContent).toBe('fresh');
+
+      // let the cached entry become stale before re-requesting
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandledRejection);
+
+      try {
+        fireEvent.click(screen.getByTestId('refetch'));
+
+        // stale must be reflected in the UI even though the displayed
+        // result data is unchanged (no setResult-driven re-render)
+        await waitFor(() => {
+          expect(screen.getByTestId('stale').textContent).toBe('stale');
+        });
+
+        // wait long enough for the background refetch to reject
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        });
+
+        expect(fetchData).toHaveBeenCalledTimes(2);
+        expect(unhandled).toEqual([]);
+        expect(screen.getByTestId('stale').textContent).toBe('stale');
+        expect(screen.getByTestId('result').textContent).toBe('data 1');
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
+    });
   });
 
   describe('getInjectContext', () => {
@@ -650,81 +910,6 @@ describe('async hooks', () => {
 
       render(<TestComponent />);
       expect(screen.getByTestId('loading').textContent).toBe('idle');
-    });
-  });
-
-  describe('useResultBase (from base)', () => {
-    it('should return result with initial value', async () => {
-      const fetchData = vi.fn(async () => 'fetched');
-
-      function TestComponent() {
-        const [result, wrapped] = useResultBase(fetchData, 'initial');
-
-        return <div data-testid='result'>{result}</div>;
-      }
-
-      render(<TestComponent />);
-      expect(screen.getByTestId('result').textContent).toBe('initial');
-    });
-
-    it('should update result when wrapped function is called (thru callback line 34)', async () => {
-      const fetchData = vi.fn(async (value: string) => `result: ${value}`);
-
-      function TestComponent() {
-        const [result, wrapped] = useResultBase(fetchData);
-
-        useEffect(() => {
-          wrapped('test');
-        }, [wrapped]);
-
-        return <div data-testid='result'>{result ?? 'no result'}</div>;
-      }
-
-      render(<TestComponent />);
-      expect(screen.getByTestId('result').textContent).toBe('no result');
-
-      await waitFor(
-        () => {
-          expect(screen.getByTestId('result').textContent).toBe('result: test');
-        },
-        {timeout: 10000}
-      );
-    });
-
-    it('should update result multiple times (thru callback)', async () => {
-      const fetchData = vi.fn(async (value: string) => `result: ${value}`);
-
-      function TestComponent({input}: {input: string}) {
-        const [result, wrapped] = useResultBase(fetchData);
-
-        useEffect(() => {
-          wrapped(input);
-        }, [wrapped, input]);
-
-        return <div data-testid='result'>{result ?? 'no result'}</div>;
-      }
-
-      const {rerender} = render(<TestComponent input='first' />);
-
-      await waitFor(
-        () => {
-          expect(screen.getByTestId('result').textContent).toBe(
-            'result: first'
-          );
-        },
-        {timeout: 10000}
-      );
-
-      rerender(<TestComponent input='second' />);
-
-      await waitFor(
-        () => {
-          expect(screen.getByTestId('result').textContent).toBe(
-            'result: second'
-          );
-        },
-        {timeout: 10000}
-      );
     });
   });
 

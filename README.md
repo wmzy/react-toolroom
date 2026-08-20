@@ -39,17 +39,28 @@ import {
   useRun, 
   useInjectable, 
   useError,
-  useCache 
+  useCache,
+  createMemoryCacheProvider 
 } from 'react-toolroom/async';
 
-// Create a data fetcher
-const fetchUsers = useInjectable(async () => {
-  const res = await fetch('/api/users');
-  return res.json();
+type User = { id: number; name: string };
+
+// Create a shared cache (createMemoryCacheProvider is not a hook,
+// so it can live at module scope)
+const cache = createMemoryCacheProvider<User[], any[]>({
+  cacheTime: 60000,
+  hash: (args) => JSON.stringify(args)
 });
 
 // Use in component
 function UserList() {
+  // Create a data fetcher. useInjectable is a hook, so it must be
+  // called inside the component, before the hooks that use it.
+  const fetchUsers = useInjectable(async (): Promise<User[]> => {
+    const res = await fetch('/api/users');
+    return res.json();
+  });
+
   const users = useResult(fetchUsers);
   const loading = useLoading(fetchUsers);
   const error = useError(fetchUsers);
@@ -59,12 +70,20 @@ function UserList() {
   if (loading) return <Spinner />;
   if (error) return <Error error={error} />;
   
-  return <ul>{users.map(u => <li>{u.name}</li>)}</ul>;
+  return <ul>{users?.map(u => <li key={u.id}>{u.name}</li>)}</ul>;
 }
 
 // With caching
 function CachedUserList() {
-  const stale = useCache(fetchUsers, cacheProvider, 60000);
+  const fetchUsers = useInjectable(async (): Promise<User[]> => {
+    const res = await fetch('/api/users');
+    return res.json();
+  });
+
+  const stale = useCache(fetchUsers, cache, 60000);
+  const users = useResult(fetchUsers, []);
+  
+  useRun(fetchUsers, []);
   // ...
 }
 ```

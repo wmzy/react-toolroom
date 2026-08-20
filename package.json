@@ -5,12 +5,10 @@
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
-      "require": "./dist/index.mjs",
       "import": "./dist/index.mjs"
     },
     "./async": {
       "types": "./dist/types/async/index.d.ts",
-      "require": "./dist/async.mjs",
       "import": "./dist/async.mjs"
     }
   },
@@ -37,7 +35,7 @@
     "react-query"
   ],
   "author": "wmzy",
-  "license": "ISC",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/wmzy/react-toolroom"

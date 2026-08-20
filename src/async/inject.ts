@@ -28,16 +28,32 @@ export function useInjectable<F extends Func>(fn: F): F {
 }
 
 export function getInjectContext<F extends Func>(fn: F) {
-  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[], any]>;
+  const ref = requireInjectableRef(fn, 'getInjectContext');
   return ref.current[2];
 }
 
 export function useInject<F extends Func>(fn: F, wrapper: Wrapper<F>) {
-  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[]]>;
+  const ref = requireInjectableRef(fn, 'useInject');
   ref.current[1].push(wrapper);
 }
 
 export function useInjectBefore<F extends Func>(fn: F, wrapper: Wrapper<F>) {
-  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[]]>;
+  const ref = map.get(fn) as MutableRefObject<[F, Wrapper<F>[], any]>;
   ref.current[1].unshift(wrapper);
+}
+
+function requireInjectableRef<F extends Func>(
+  fn: F,
+  hookName: string
+): MutableRefObject<[F, Wrapper<F>[], any]> {
+  const ref = map.get(fn) as
+    | MutableRefObject<[F, Wrapper<F>[], any]>
+    | undefined;
+  if (!ref) {
+    throw new Error(
+      `${hookName} expects a function returned by useInjectable(), got something else. ` +
+        `Get the injectable function from useInjectable() before calling ${hookName}.`
+    );
+  }
+  return ref;
 }

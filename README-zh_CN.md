@@ -39,17 +39,28 @@ import {
   useRun, 
   useInjectable, 
   useError,
-  useCache 
+  useCache,
+  createMemoryCacheProvider 
 } from 'react-toolroom/async';
 
-// 创建数据获取器
-const fetchUsers = useInjectable(async () => {
-  const res = await fetch('/api/users');
-  return res.json();
+type User = { id: number; name: string };
+
+// 创建共享缓存（createMemoryCacheProvider 不是 hook，
+// 可以放在模块顶层）
+const cache = createMemoryCacheProvider<User[], any[]>({
+  cacheTime: 60000,
+  hash: (args) => JSON.stringify(args)
 });
 
 // 在组件中使用
 function UserList() {
+  // 创建数据获取器。useInjectable 是 hook，必须在组件内调用，
+  // 且要先于使用它的其他 hooks。
+  const fetchUsers = useInjectable(async (): Promise<User[]> => {
+    const res = await fetch('/api/users');
+    return res.json();
+  });
+
   const users = useResult(fetchUsers);
   const loading = useLoading(fetchUsers);
   const error = useError(fetchUsers);
@@ -59,12 +70,20 @@ function UserList() {
   if (loading) return <Spinner />;
   if (error) return <Error error={error} />;
   
-  return <ul>{users.map(u => <li>{u.name}</li>)}</ul>;
+  return <ul>{users?.map(u => <li key={u.id}>{u.name}</li>)}</ul>;
 }
 
 // 带缓存
 function CachedUserList() {
-  const stale = useCache(fetchUsers, cacheProvider, 60000);
+  const fetchUsers = useInjectable(async (): Promise<User[]> => {
+    const res = await fetch('/api/users');
+    return res.json();
+  });
+
+  const stale = useCache(fetchUsers, cache, 60000);
+  const users = useResult(fetchUsers, []);
+  
+  useRun(fetchUsers, []);
   // ...
 }
 ```

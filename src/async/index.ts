@@ -67,7 +67,7 @@
 
 import {AsyncFunc, CacheProvider, CacheResult, Func, R} from '@@/types';
 import {useEffect, useRef, useState} from 'react';
-import {thru, thruError, thruSet} from '@@/util';
+import {noop, thru, thruError} from '@@/util';
 import {useInject, useInjectable, getInjectContext} from './inject';
 import {useLoadingFn} from './base';
 import createMemoryCacheProvider from './memory-cache-provider';
@@ -95,11 +95,20 @@ export function useResult<AF extends AsyncFunc>(
 ): R<AF> | undefined {
   type RAF = R<AF>;
   const [result, setResult] = useState<RAF | undefined>(init);
+  const seqRef = useRef(0);
   const context = getInjectContext(injectableFn);
   context[setResultKey] = setResult;
   useInject(
     injectableFn,
-    (f: AF) => ((...args) => f(...args).then(thruSet(setResult))) as AF
+    (f: AF) =>
+      ((...args) => {
+        const seq = ++seqRef.current;
+        return f(...args).then(
+          thru<RAF>((r) => {
+            if (seq === seqRef.current) setResult(() => r);
+          })
+        );
+      }) as AF
   );
   return result;
 }
@@ -121,7 +130,7 @@ export function useCache<AF extends AsyncFunc>(
   staleTime = 0
 ) {
   const context = getInjectContext(injectableFn);
-  const staleRef = useRef(false);
+  const [stale, setStale] = useState(false);
 
   useEffect(cacheProvider.use, []);
 
@@ -134,25 +143,29 @@ export function useCache<AF extends AsyncFunc>(
           f(...args).then((r) => {
             cacheProvider.set(args, r);
             setResult(r);
-            staleRef.current = false;
+            setStale(false);
             return r;
           });
         return new Promise<CacheResult<R<AF>>>((resolve) => {
           resolve(cacheProvider.get(args));
         })
+          .catch(() => undefined)
           .then((cached: CacheResult<R<AF>>) => {
             if (!cached) return refetch();
             const [data, cachedAt] = cached;
-            staleRef.current = Date.now() - cachedAt >= staleTime;
-            if (staleRef.current) {
-              refetch();
+            const isStale = Date.now() - cachedAt >= staleTime;
+            setStale(isStale);
+            if (isStale) {
+              // The background revalidation is fire-and-forget: failures are
+              // swallowed silently so the stale data stays on screen. A cache
+              // miss above still propagates refetch() rejections to the caller.
+              refetch().catch(noop);
             }
             return data;
-          })
-          .catch(refetch);
+          });
       }) as AF
   );
-  return staleRef.current;
+  return stale;
 }
 
 /**

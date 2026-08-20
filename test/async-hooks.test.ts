@@ -14,7 +14,7 @@ import {
   getInjectContext,
   useInject
 } from '../src/async';
-import {useLoadingFn, useResult as useResultBase} from '../src/async/base';
+import {useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
 
 describe('async hooks exports', () => {
@@ -89,16 +89,24 @@ describe('async/base exports', () => {
     expect(useLoadingFn).toBeDefined();
     expect(typeof useLoadingFn).toBe('function');
   });
-
-  it('should export useResultBase', () => {
-    expect(useResultBase).toBeDefined();
-    expect(typeof useResultBase).toBe('function');
-  });
 });
 
 describe('async/inject exports', () => {
   it('should export useInjectBefore', () => {
     expect(useInjectBefore).toBeDefined();
     expect(typeof useInjectBefore).toBe('function');
+  });
+
+  // Scenario: caller passes a plain (non-useInjectable) function — the WeakMap
+  // lookup misses and must fail with a clear error instead of an obscure
+  // "Cannot read properties of undefined" TypeError.
+  it('should throw a clear error when getInjectContext gets a plain function', () => {
+    const plain = () => 'not injectable';
+    expect(() => getInjectContext(plain)).toThrow(/useInjectable/);
+  });
+
+  it('should throw a clear error when useInject gets a plain function', () => {
+    const plain = () => 'not injectable';
+    expect(() => useInject(plain, (f) => f)).toThrow(/useInjectable/);
   });
 });
