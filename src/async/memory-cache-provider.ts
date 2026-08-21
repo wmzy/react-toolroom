@@ -1,25 +1,28 @@
 import {CacheProvider} from '@@/types';
-import {noop} from '@@/util';
+import {noop, stableHash} from '@@/util';
 
 /**
  * Returns a cache provider that stores key-value pairs in a map with an optional
  * expiration time.
  *
- * @param {number} cacheTime - The time in milliseconds for the cache to expire.
- * @param {(k: K) => string} hash - The hash function used to generate a unique key
- * for each value.
+ * @param {object} [options] - The cache provider options.
+ * @param {number} [options.cacheTime=Infinity] - The time in milliseconds for the cache
+ * to expire. Defaults to Infinity, meaning the cache never expires on its own.
+ * @param {(k: K) => string} [options.hash=stableHash] - The hash function used to generate
+ * a unique key for each value. Defaults to {@link stableHash}, which serializes keys
+ * deterministically (sorted object keys, structural recursion).
  * @template T - The type of the value to be stored in the cache.
  * @template K - The type of the key used to retrieve the value from the cache.
  * @returns {CacheProvider<T, K>} Returns an object with methods for getting, setting,
  * deleting, clearing, and managing the cache expiration.
  */
 export default function create<T, K extends any[]>({
-  cacheTime,
-  hash
+  cacheTime = Infinity,
+  hash = stableHash
 }: {
-  cacheTime: number;
-  hash: (k: K) => string;
-}): CacheProvider<T, K> {
+  cacheTime?: number;
+  hash?: (k: K) => string;
+} = {}): CacheProvider<T, K> {
   const map = new Map<string, [T, number]>();
   let useCount = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;

@@ -14,7 +14,8 @@ import {
   useRetry,
   useCache,
   getInjectContext,
-  useInject
+  useInject,
+  useDedup
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
@@ -476,6 +477,66 @@ describe('async hooks', () => {
         await new Promise((r) => setTimeout(r, 150));
       });
       expect(screen.getByText('data fast')).toBeDefined();
+    });
+    it('should broadcast result to every subscribed component', async () => {
+      const resolvers: ((v: string) => void)[] = [];
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            resolvers.push(resolve);
+          })
+      );
+
+      function Subscriber({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const result = useResult(injectable);
+        return <span data-testid={label}>{result ?? 'loading'}</span>;
+      }
+
+      function TestComponent({showThird}: {showThird: boolean}) {
+        const injectable = useInjectable(fetchData);
+        useRun(injectable, []);
+
+        return (
+          <div>
+            <Subscriber injectable={injectable} label='a' />
+            <Subscriber injectable={injectable} label='b' />
+            {showThird && <Subscriber injectable={injectable} label='c' />}
+          </div>
+        );
+      }
+
+      // StrictMode double-invokes render and effects; subscriptions stay
+      // deduplicated because Set#add is idempotent, so the effect fires twice
+      const {rerender} = render(
+        <StrictMode>
+          <TestComponent showThird={false} />
+        </StrictMode>
+      );
+      expect(fetchData).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId('a').textContent).toBe('loading');
+      expect(screen.getByTestId('b').textContent).toBe('loading');
+
+      await act(async () => {
+        for (const resolve of resolvers) resolve('shared data');
+      });
+      // both subscribers received the broadcast
+      expect(screen.getByTestId('a').textContent).toBe('shared data');
+      expect(screen.getByTestId('b').textContent).toBe('shared data');
+
+      // a late subscriber starts from the shared last result immediately
+      rerender(
+        <StrictMode>
+          <TestComponent showThird={true} />
+        </StrictMode>
+      );
+      expect(screen.getByTestId('c').textContent).toBe('shared data');
+      expect(fetchData).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -1030,6 +1091,85 @@ describe('async hooks', () => {
         process.off('unhandledRejection', onUnhandledRejection);
       }
     });
+
+    it('should broadcast cached data immediately on hit and updated data after background refetch', async () => {
+      let calls = 0;
+      let resolveRefetch!: (v: string) => void;
+      const fetchData = vi.fn(() => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve('v1');
+        return new Promise<string>((resolve) => {
+          resolveRefetch = resolve;
+        });
+      });
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      function Subscriber({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const result = useResult(injectable);
+        return <span data-testid={label}>{result ?? 'no result'}</span>;
+      }
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 10);
+        useRun(injectable, []);
+
+        return (
+          <div>
+            <Subscriber injectable={injectable} label='a' />
+            <Subscriber injectable={injectable} label='b' />
+            <button
+              data-testid='refetch'
+              type='button'
+              onClick={() => {
+                injectable();
+              }}
+            >
+              refetch
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('v1');
+        expect(screen.getByTestId('b').textContent).toBe('v1');
+      });
+
+      // let the cached entry become stale, then request again
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('refetch'));
+      });
+
+      // stale hit: the cached data is broadcast immediately, so both
+      // subscribers keep rendering it while the refetch is still pending
+      expect(screen.getByTestId('a').textContent).toBe('v1');
+      expect(screen.getByTestId('b').textContent).toBe('v1');
+      expect(fetchData).toHaveBeenCalledTimes(2);
+
+      // background refetch completes: the fresh data is broadcast to both
+      await act(async () => {
+        resolveRefetch!('v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('v2');
+        expect(screen.getByTestId('b').textContent).toBe('v2');
+      });
+    });
   });
 
   describe('getInjectContext', () => {
@@ -1117,6 +1257,243 @@ describe('async hooks', () => {
       );
 
       expect(order).toEqual(['useInjectBefore', 'useInject after', 'original']);
+    });
+  });
+
+  describe('useDedup', () => {
+    it('should execute the underlying fn once for concurrent calls with the same args and share the same result', async () => {
+      const data = {users: []};
+      let resolveFn!: (v: typeof data) => void;
+      const fetchData = vi.fn(
+        () =>
+          new Promise<typeof data>((resolve) => {
+            resolveFn = resolve;
+          })
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useDedup(injectable);
+        const [a, setA] = useState<typeof data>();
+        const [b, setB] = useState<typeof data>();
+
+        useEffect(() => {
+          injectable(1).then(setA);
+          injectable(1).then(setB);
+        }, [injectable]);
+
+        return (
+          <div>
+            <span data-testid='a'>{a ? 'done' : 'pending'}</span>
+            <span data-testid='b'>{b ? 'done' : 'pending'}</span>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // Both calls fired while the promise was in flight
+      await act(async () => {
+        resolveFn(data);
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('done');
+        expect(screen.getByTestId('b').textContent).toBe('done');
+      });
+
+      expect(fetchData).toHaveBeenCalledTimes(1);
+    });
+
+    it('should re-run after settle and allow retrying a failed call', async () => {
+      let fail = true;
+      let resolveFn!: (v: string) => void;
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            if (fail) reject(new Error('network down'));
+            else resolveFn = resolve;
+          })
+      );
+
+      let retry!: () => void;
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useDedup(injectable);
+        const [result, setResult] = useState<string | undefined>();
+
+        const run = () => {
+          injectable(1).then(setResult, () => setResult(undefined));
+        };
+        useEffect(run, [injectable]);
+        retry = () => {
+          fail = false;
+          run();
+        };
+
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <button type='button' data-testid='retry' onClick={retry}>
+              retry
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('no result');
+      });
+      // First call failed and settled — it must not stay in the map
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('retry'));
+      });
+      // The retry re-executed the underlying fn
+      expect(fetchData).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        resolveFn!('ok');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('ok');
+      });
+    });
+
+    it('should not dedupe calls with different args', async () => {
+      const fetchData = vi.fn(async (id: number) => `result ${id}`);
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useDedup(injectable);
+        const [results, setResults] = useState<string[]>([]);
+
+        useEffect(() => {
+          Promise.all([injectable(1), injectable(2)]).then((r) =>
+            setResults(r)
+          );
+        }, [injectable]);
+
+        return <div>{results.join(',')}</div>;
+      }
+
+      render(<TestComponent />);
+
+      await waitFor(() => {
+        expect(screen.getByText('result 1,result 2')).toBeDefined();
+      });
+      expect(fetchData).toHaveBeenCalledTimes(2);
+    });
+
+    it('should dedupe button double clicks combined with useRun/useResult', async () => {
+      const data = {value: 42};
+      let resolveFn!: (v: typeof data) => void;
+      const fetchData = vi.fn(
+        () =>
+          new Promise<typeof data>((resolve) => {
+            resolveFn = resolve;
+          })
+      );
+
+      function TestComponent() {
+        const fetchValue = useInjectable(fetchData);
+        useDedup(fetchValue);
+        const value = useResult(fetchValue);
+
+        return (
+          <div>
+            <span data-testid='value'>
+              {value ? String(value.value) : 'none'}
+            </span>
+            <button
+              type='button'
+              data-testid='fetch'
+              onClick={() => {
+                void fetchValue();
+                void fetchValue();
+              }}
+            >
+              fetch
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fetch'));
+      });
+      // A double click in the same tick shares one in-flight promise
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolveFn(data);
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('value').textContent).toBe('42');
+      });
+    });
+
+    it('should ignore the trailing AbortSignal when hashing args', async () => {
+      const data = {value: 7};
+      const signals: AbortSignal[] = [];
+      let resolveFn!: (v: typeof data) => void;
+      const fetchData = vi.fn(
+        (signal: AbortSignal) =>
+          new Promise<typeof data>((resolve) => {
+            signals.push(signal);
+            resolveFn = resolve;
+          })
+      );
+
+      function Child({fetchValue}: {fetchValue: any}) {
+        // Each useRun instance creates its own AbortController, so the two
+        // children run with distinct signals but identical call arguments.
+        useRun(fetchValue, [1], {signal: true});
+        return null;
+      }
+
+      function TestComponent() {
+        const fetchValue = useInjectable(fetchData);
+        useDedup(fetchValue);
+        const [extra, setExtra] = useState(false);
+        return (
+          <div>
+            <Child fetchValue={fetchValue} />
+            <Child fetchValue={fetchValue} />
+            <button
+              type='button'
+              data-testid='add'
+              onClick={() => setExtra(true)}
+            >
+              add
+            </button>
+            {extra && <Child fetchValue={fetchValue} />}
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // Both children's runs are in flight concurrently with the same args:
+      // they share one promise, so the fn runs once with one of the signals
+      // while the other is aborted by cleanup after its shared run settles.
+      await act(async () => {
+        resolveFn(data);
+      });
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(1);
+      });
+      expect(signals).toHaveLength(1);
+
+      // After settling, the entry is gone — a later run executes again
+      fireEvent.click(screen.getByTestId('add'));
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(2);
+      });
     });
   });
 });

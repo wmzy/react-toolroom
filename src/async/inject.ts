@@ -3,6 +3,9 @@ import {RefObject, useCallback, useEffect, useRef} from 'react';
 
 const map = new WeakMap();
 
+// `callContext` is a fresh object created for every single call, so a
+// wrapper may stash per-call metadata on it (e.g. the AbortSignal bridge
+// registered by `useRun`).
 type Wrapper<F extends Func> = (f: F, callContext: any) => F;
 type InjectableRef<F extends Func> = [F, Wrapper<F>[], any];
 
@@ -70,7 +73,8 @@ export function useInject<F extends Func>(fn: F, wrapper: Wrapper<F>) {
 
 /**
  * Like {@link useInject}, but the wrapper is inserted at the head of the
- * wrapper list, so it runs before previously registered wrappers.
+ * wrapper list, so it is applied before previously registered wrappers and
+ * ends up as the innermost layer, closest to the original function.
  *
  * @param {F} fn - An injectable function returned by `useInjectable`.
  * @param {Wrapper<F>} wrapper - The wrapper to register.

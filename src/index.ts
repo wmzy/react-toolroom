@@ -4,3 +4,4 @@
  */
 
 export {default as memo, memoBase, defaultTestEvent} from './memo';
+export {stableHash} from './util';
