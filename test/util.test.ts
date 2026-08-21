@@ -5,7 +5,8 @@ import {
   thruError,
   noop,
   getDisplayName,
-  stableHash
+  stableHash,
+  isAbortSignal
 } from '../src/util';
 
 describe('util', () => {
@@ -261,6 +262,41 @@ describe('util', () => {
         stableHash(new Set([3, 2, 1]))
       );
       expect(stableHash(new Set([1, 2]))).not.toBe(stableHash(new Set([1, 3])));
+    });
+  });
+
+  describe('isAbortSignal', () => {
+    it('should return true for a real AbortSignal', () => {
+      expect(isAbortSignal(new AbortController().signal)).toBe(true);
+    });
+
+    it('should return true for a duck-typed signal from another realm', () => {
+      // A plain object standing in for a signal whose realm is not this one
+      // (e.g. an iframe's AbortSignal): `instanceof` would fail here.
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+      expect(isAbortSignal(foreignSignal)).toBe(true);
+    });
+
+    it('should return false for non-signals', () => {
+      expect(isAbortSignal(undefined)).toBe(false);
+      expect(isAbortSignal(null)).toBe(false);
+      expect(isAbortSignal({})).toBe(false);
+      expect(isAbortSignal({aborted: false})).toBe(false);
+      expect(isAbortSignal(() => {})).toBe(false);
+    });
+
+    it('should let stableHash hash a duck-typed signal as #sig', () => {
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+      expect(stableHash(foreignSignal)).toBe('#sig');
+      expect(stableHash({signal: foreignSignal})).toBe(
+        stableHash({signal: new AbortController().signal})
+      );
     });
   });
 });

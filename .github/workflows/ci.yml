@@ -23,3 +23,27 @@ jobs:
       - run: pnpm run build
       - run: pnpm run size
       - run: pnpm run test
+
+  # React 16.8/17 are intentionally not in the matrix: @testing-library/react 16
+  # only supports React 18/19, and downgrading the test stack costs more than it
+  # pays. 16.8-17 compatibility is guaranteed at the source level (no 18+-only
+  # APIs; useSyncExternalStore is used through a runtime fallback shim, so the
+  # React 16.8-17 peer range keeps working).
+  peer-compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        react: ["18.3.1", "19.2.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm add -D react@${{ matrix.react }} react-dom@${{ matrix.react }}
+      - run: pnpm run test

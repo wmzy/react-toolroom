@@ -1,7 +1,7 @@
 {
   "name": "react-toolroom",
   "version": "0.4.0",
-  "description": "A toolset for react developers.",
+  "description": "Zero-dependency React toolset: runtime memoization without useCallback, and composable data-fetching hooks without a Provider.",
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
@@ -34,8 +34,13 @@
   "keywords": [
     "react",
     "hooks",
-    "util",
-    "react-query"
+    "react-hooks",
+    "react-query",
+    "data-fetching",
+    "swr",
+    "stale-while-revalidate",
+    "middleware",
+    "memo"
   ],
   "author": "wmzy",
   "license": "MIT",

@@ -4,11 +4,13 @@ import {
   type FocusStat,
   type LogEntry,
   type MetricChannel,
+  type ProbeStat,
   type Report,
   type Ticker
 } from '@/types/metrics';
 
-// —— 服务端视角的事件日志：把"真实发出的请求"广播给订阅它的组件 ——
+// —— 事件日志：服务端记录真实发出的请求；客户端 wrapper 层（洋葱模型 demo）
+// 也写入同一日志，订阅它的组件可以对照各层的执行顺序 ——
 let logSeq = 0;
 const listeners = new Map<MetricChannel, Set<(entry: LogEntry) => void>>();
 
@@ -24,7 +26,7 @@ export function subscribeMetrics(
   };
 }
 
-function log(channel: MetricChannel, text: string) {
+export function logMetric(channel: MetricChannel, text: string) {
   const entry = {id: ++logSeq, text};
   listeners.get(channel)?.forEach((fn) => fn(entry));
 }
@@ -38,7 +40,7 @@ let reportCount = 0;
 
 export async function fetchReport(): Promise<Report> {
   reportCount++;
-  log('dedup', `真实请求发出，共计第 ${reportCount} 次`);
+  logMetric('dedup', `真实请求发出，共计第 ${reportCount} 次`);
   await sleep(2000);
   return {count: reportCount, at: now()};
 }
@@ -69,12 +71,22 @@ export async function fetchDetail(
   signal: AbortSignal
 ): Promise<Detail> {
   const seq = ++detailSeq;
-  log('abort', `请求 #${seq}（商品 ${id}）发出`);
+  logMetric('abort', `请求 #${seq}（商品 ${id}）发出`);
   await sleep(3000);
   if (signal.aborted) {
-    log('abort', `请求 #${seq}（商品 ${id}）已取消`);
+    logMetric('abort', `请求 #${seq}（商品 ${id}）已取消`);
     throw new DOMException('The request was aborted.', 'AbortError');
   }
-  log('abort', `请求 #${seq}（商品 ${id}）完成`);
+  logMetric('abort', `请求 #${seq}（商品 ${id}）完成`);
   return {id, at: now()};
+}
+
+// —— 洋葱模型演示：耗时 1 秒的探测接口 ——
+let probeSeq = 0;
+
+export async function fetchProbeStat(): Promise<ProbeStat> {
+  const seq = ++probeSeq;
+  logMetric('inject', `原始函数执行（真实请求 #${seq}）`);
+  await sleep(1000);
+  return {seq, at: now()};
 }

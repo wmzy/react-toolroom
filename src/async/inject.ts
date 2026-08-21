@@ -6,8 +6,8 @@ const map = new WeakMap();
 // `callContext` is a fresh object created for every single call, so a
 // wrapper may stash per-call metadata on it (e.g. the AbortSignal bridge
 // registered by `useRun`).
-type Wrapper<F extends Func> = (f: F, callContext: any) => F;
-type InjectableRef<F extends Func> = [F, Wrapper<F>[], any];
+export type InjectWrapper<F extends Func> = (f: F, callContext: any) => F;
+type InjectableRef<F extends Func> = [F, InjectWrapper<F>[], any];
 
 /**
  * A registration slot owned by a single `useInject` hook instance.
@@ -16,8 +16,8 @@ type InjectableRef<F extends Func> = [F, Wrapper<F>[], any];
  * forwards to the most recent closure.
  */
 type Cell<F extends Func> = {
-  stable: Wrapper<F>;
-  latest: Wrapper<F>;
+  stable: InjectWrapper<F>;
+  latest: InjectWrapper<F>;
 };
 
 /**
@@ -57,6 +57,11 @@ export function getInjectContext<F extends Func>(fn: F) {
   return ref.current[2];
 }
 
+/** Returns true when fn is a function returned by useInjectable(). */
+export function isInjectable<F extends Func>(fn: F): boolean {
+  return map.has(fn);
+}
+
 /**
  * Registers a wrapper onto an injectable function. Each hook instance owns one
  * registration slot: the wrapper is registered exactly once (re-renders,
@@ -65,9 +70,9 @@ export function getInjectContext<F extends Func>(fn: F) {
  * unmounts, so a gone component's wrapper stops firing.
  *
  * @param {F} fn - An injectable function returned by `useInjectable`.
- * @param {Wrapper<F>} wrapper - The wrapper to register.
+ * @param {InjectWrapper<F>} wrapper - The wrapper to register.
  */
-export function useInject<F extends Func>(fn: F, wrapper: Wrapper<F>) {
+export function useInject<F extends Func>(fn: F, wrapper: InjectWrapper<F>) {
   useInjectCell(fn, 'useInject', wrapper, (list, stable) => list.push(stable));
 }
 
@@ -77,19 +82,48 @@ export function useInject<F extends Func>(fn: F, wrapper: Wrapper<F>) {
  * ends up as the innermost layer, closest to the original function.
  *
  * @param {F} fn - An injectable function returned by `useInjectable`.
- * @param {Wrapper<F>} wrapper - The wrapper to register.
+ * @param {InjectWrapper<F>} wrapper - The wrapper to register.
  */
-export function useInjectBefore<F extends Func>(fn: F, wrapper: Wrapper<F>) {
+export function useInjectBefore<F extends Func>(
+  fn: F,
+  wrapper: InjectWrapper<F>
+) {
   useInjectCell(fn, 'useInjectBefore', wrapper, (list, stable) =>
     list.unshift(stable)
   );
 }
 
+/**
+ * Registers a wrapper onto an injectable function without a hook — the
+ * imperative counterpart of {@link useInject}. The wrapper is pushed onto
+ * the tail of the wrapper list, so a later registration ends up as an outer
+ * layer wrapping everything registered before it. Unlike `useInject` no
+ * trampoline is installed: the caller already holds a stable wrapper
+ * reference, so keeping it fresh is the caller's job.
+ *
+ * @param {F} fn - An injectable function returned by `useInjectable`.
+ * @param {InjectWrapper<F>} wrapper - The wrapper to register.
+ * @return {() => void} A function that removes the wrapper again. Removal
+ *   is identity-checked, so it only ever drops its own registration and is
+ *   safe to call more than once.
+ */
+export function addWrapper<F extends Func>(
+  fn: F,
+  wrapper: InjectWrapper<F>
+): () => void {
+  const list = requireInjectableRef(fn, 'addWrapper').current[1];
+  list.push(wrapper);
+  return () => {
+    const i = list.indexOf(wrapper);
+    if (i !== -1) list.splice(i, 1);
+  };
+}
+
 function useInjectCell<F extends Func>(
   fn: F,
   hookName: string,
-  wrapper: Wrapper<F>,
-  insert: (list: Wrapper<F>[], stable: Wrapper<F>) => void
+  wrapper: InjectWrapper<F>,
+  insert: (list: InjectWrapper<F>[], stable: InjectWrapper<F>) => void
 ) {
   const ref = requireInjectableRef(fn, hookName);
   const cellRef = useRef<Cell<F>>(undefined);

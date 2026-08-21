@@ -1,4 +1,4 @@
-export type MetricChannel = 'dedup' | 'abort';
+export type MetricChannel = 'dedup' | 'abort' | 'inject';
 
 export type LogEntry = {
   id: number;
@@ -22,5 +22,10 @@ export type FocusStat = {
 
 export type Detail = {
   id: number;
+  at: string;
+};
+
+export type ProbeStat = {
+  seq: number;
   at: string;
 };

@@ -1,5 +1,5 @@
 import {AsyncFunc, Func} from '@@/types';
-import {useEffect, useState} from 'react';
+import {useCallback, useEffect, useSyncExternalStore, useState} from 'react';
 import {getInjectContext} from './inject';
 
 export function useLoadingFn() {
@@ -12,6 +12,13 @@ export function useLoadingFn() {
     ((...args: Parameters<AF>) => withLoading(fn(...args))) as AF;
   return [Boolean(count), wrap] as const;
 }
+
+// Subscription protocol: the stores' `listeners` sets hold the
+// `onStoreChange` callbacks handed over by useSyncExternalStore (see
+// useStoreValue below) instead of per-consumer value listeners. The
+// `emitResult`/`emitLoading` broadcast semantics are unchanged — every
+// listener is still invoked with the new value; the uSES callbacks ignore
+// the argument and let React re-read the snapshot.
 
 /**
  * Broadcast store holding the latest successful result of an injectable. It
@@ -34,10 +41,21 @@ export type LoadingStore = {
   listeners: Set<(count: number) => void>;
 };
 
+/**
+ * Broadcast store holding the staleness flag of an injectable. Like the
+ * result store it lives on the injectable's context and is shared by every
+ * consumer.
+ */
+export type StaleStore = {
+  stale: boolean;
+  listeners: Set<(stale: boolean) => void>;
+};
+
 // Module-private store keys. The symbols are intentionally not exported:
 // stores must only be reached through the helpers below.
 const resultKey = Symbol('result store');
 const loadingKey = Symbol('loading store');
+const staleKey = Symbol('stale store');
 
 // Per-store call sequencing: the result of an older call must never
 // overwrite the result of a newer one, no matter which wrapper emits it or
@@ -75,6 +93,17 @@ export function getLoadingStore(fn: Func): LoadingStore {
   return store;
 }
 
+/** Lazily creates and returns the shared stale store of an injectable. */
+export function getStaleStore(fn: Func): StaleStore {
+  const context = getInjectContext(fn);
+  let store = context[staleKey] as StaleStore | undefined;
+  if (!store) {
+    store = {listeners: new Set(), stale: false};
+    context[staleKey] = store;
+  }
+  return store;
+}
+
 /**
  * Reserves the call ticket handed to {@link emitResult}. Tickets are given
  * out in call order, one per emitting wrapper per call.
@@ -107,30 +136,78 @@ export function emitLoading(store: LoadingStore, count: number) {
   for (const listener of store.listeners) listener(count);
 }
 
-/**
- * Subscribes `listener` to a store's broadcasts using a render-safe
- * protocol: the listener is added during render (`Set#add` is idempotent,
- * so repeated and StrictMode double renders never duplicate the entry),
- * re-added inside an effect, and removed on cleanup so an unmounted
- * component stops receiving broadcasts.
- *
- * `listener` must be referentially stable across renders — a `useState`
- * setter qualifies.
- *
- * @param store the store to subscribe to
- * @param listener a stable callback invoked with every broadcast value
- */
-export function useBroadcast<T>(
-  store: {listeners: Set<(value: T) => void>},
-  listener: (value: T) => void
+/** Updates the stale flag and broadcasts it to every subscriber. */
+export function emitStale(store: StaleStore, stale: boolean) {
+  store.stale = stale;
+  for (const listener of store.listeners) listener(stale);
+}
+
+// React 18+ exports useSyncExternalStore; React 16.8–17 peers do not, and
+// under CommonJS interop the named import resolves to `undefined` instead
+// of throwing, so older peers fall back to the shim below. The shim has no
+// tearing protection, but its subscriptions live in effects — which only
+// run for committed renders — so discarded concurrent renders can no longer
+// leak listeners either.
+const useSES =
+  (useSyncExternalStore as ((s: any, g: () => any) => any) | undefined) ??
+  useSESFallback;
+
+function useSESFallback(
+  subscribe: (onStoreChange: () => void) => () => void,
+  getSnapshot: () => any
 ) {
-  store.listeners.add(listener);
+  // The lazy initializer captures the first-frame snapshot.
+  const [snapshot, setSnapshot] = useState(getSnapshot);
   useEffect(() => {
-    store.listeners.add(listener);
-    return () => {
-      store.listeners.delete(listener);
+    let mounted = true;
+    const check = () => {
+      if (mounted) setSnapshot(getSnapshot());
     };
-    // Both are stable: the store lives on the injectable's context and the
-    // listener is required to be a stable reference.
-  }, [store, listener]);
+    // Stores mutate before broadcasting, so a change landing between the
+    // render that read the snapshot and this effect needs one synchronous
+    // catch-up check on top of the subscription.
+    check();
+    const unsubscribe = subscribe(check);
+    return () => {
+      // The unsubscribe alone removes `check` from the store; `mounted`
+      // additionally guards the unmount batch itself, where a broadcast
+      // must not resurrect a setState on a dead component.
+      mounted = false;
+      unsubscribe();
+    };
+  }, [subscribe, getSnapshot]);
+  return snapshot;
+}
+
+/**
+ * Reads a value out of a shared store through `useSyncExternalStore`, so
+ * React owns the subscription lifecycle: committed renders are tearing-safe
+ * and discarded concurrent renders never leave listeners behind.
+ *
+ * `getSnapshot` must return a value that stays referentially equal until
+ * the store broadcasts — plain store fields such as `count`, `hasResult`,
+ * or `lastResult` qualify, since `emitResult`/`emitLoading` swap them in
+ * place before notifying. Callers must memoize `getSnapshot` (e.g. with
+ * `useCallback`) to avoid resubscribing on every render.
+ *
+ * @param store the store to read from
+ * @param getSnapshot a stable callback returning the current store value
+ */
+export function useStoreValue<T>(
+  store: {listeners: Set<(value: any) => void>},
+  getSnapshot: () => T
+): T {
+  // The store lives on the injectable's context, so it is referentially
+  // stable for the lifetime of the consumer, and so is this `subscribe`
+  // callback — uSES therefore subscribes exactly once per store.
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => {
+      store.listeners.add(onStoreChange);
+      return () => {
+        store.listeners.delete(onStoreChange);
+      };
+    },
+    [store]
+  );
+  return useSES(subscribe, getSnapshot);
 }

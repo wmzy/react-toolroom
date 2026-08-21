@@ -2,6 +2,7 @@ import {css} from '@linaria/core';
 import AbortSignalDemo from './AbortSignalDemo';
 import Dedup from './Dedup';
 import Focus from './Focus';
+import Inject from './Inject';
 import Polling from './Polling';
 import UserList from './UserList';
 
@@ -20,6 +21,7 @@ export default function Async() {
       <Polling />
       <Focus />
       <AbortSignalDemo />
+      <Inject />
     </div>
   );
 }

@@ -1,21 +1,34 @@
 import {describe, it, expect, vi} from 'vitest';
 import {render, screen, waitFor, act, fireEvent} from '@testing-library/react';
-import {memo, StrictMode, useState, useEffect} from 'react';
+import {
+  memo,
+  StrictMode,
+  Suspense,
+  useState,
+  useEffect,
+  startTransition
+} from 'react';
 import {
   useRun,
   useInjectable,
   createMemoryCacheProvider,
   useResult,
+  useSuspenseResult,
   useLoading,
+  useInitialLoading,
   useError,
   useFailureCount,
   useCatch,
   useFinally,
   useRetry,
   useCache,
+  useInvalidate,
   getInjectContext,
   useInject,
-  useDedup
+  useDedup,
+  usePolling,
+  useFocusRevalidate,
+  stableHash
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
@@ -47,6 +60,94 @@ describe('async hooks', () => {
 
       rerender(<TestComponent deps={[2]} />);
       expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not re-run when a hash reports structurally unchanged args', () => {
+      const fn = vi.fn((query: {page: number}) => Promise.resolve('ok'));
+
+      function TestComponent({page}: {page: number}) {
+        // Fresh array/object literals on every render: without `hash` the
+        // reference comparison would re-run the effect on each rerender.
+        useRun(fn, [{page}], {hash: stableHash});
+        return null;
+      }
+
+      const {rerender} = render(<TestComponent page={1} />);
+      expect(fn).toHaveBeenCalledTimes(1);
+      expect(fn).toHaveBeenCalledWith({page: 1});
+
+      // Same structure, new references → no rerun.
+      rerender(<TestComponent page={1} />);
+      rerender(<TestComponent page={1} />);
+      expect(fn).toHaveBeenCalledTimes(1);
+
+      // Structural change (page) → rerun with the args of that render.
+      rerender(<TestComponent page={2} />);
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(fn).toHaveBeenLastCalledWith({page: 2});
+    });
+
+    it('should support plain (non-injectable) functions with the signal option', () => {
+      const received: {id: number; signal: AbortSignal}[] = [];
+      // Deliberately NOT wrapped in useInjectable: useRun must detect it
+      // via isInjectable and run it without the injection bridge.
+      const fn = (id: number, signal: AbortSignal) => {
+        received.push({id, signal});
+        return Promise.resolve('ok');
+      };
+
+      function TestComponent({id}: {id: number}) {
+        useRun(fn, [id], {signal: true});
+        return null;
+      }
+
+      const {rerender} = render(<TestComponent id={1} />);
+      expect(received.length).toBe(1);
+      expect(received[0]!.signal).toBeInstanceOf(AbortSignal);
+      expect(received[0]!.signal.aborted).toBe(false);
+
+      rerender(<TestComponent id={2} />);
+      expect(received.length).toBe(2);
+      // the dependency change aborted the previous run's signal
+      expect(received[0]!.signal.aborted).toBe(true);
+      expect(received[1]!.signal.aborted).toBe(false);
+    });
+
+    it('should bridge a duck-typed (cross-realm) signal onto the callContext', async () => {
+      const observed: unknown[] = [];
+      const fetchData = vi.fn(async (id: number) => `result ${id}`);
+      // A plain object standing in for a signal from another realm (e.g. an
+      // iframe's AbortSignal): `instanceof` fails, duck-typing must not.
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+
+      let fetchValue!: ReturnType<typeof useInjectable>;
+      function TestComponent() {
+        fetchValue = useInjectable(fetchData);
+        // Registers the attachSignal bridge (bridge registration happens
+        // regardless of the `signal` option).
+        useRun(fetchValue, [1]);
+        useInject(fetchValue, (f, callContext) => (...args: any[]) => {
+          const result = f(...args);
+          // The bridge layer runs inside `f`, so `signal` (if bridged)
+          // is already on the shared callContext by the time we look.
+          observed.push(callContext.signal);
+          return result;
+        });
+        return null;
+      }
+
+      render(<TestComponent />);
+      // The mount run passes no trailing signal, so nothing is bridged.
+      expect(observed).toEqual([undefined]);
+
+      await act(async () => {
+        await fetchValue(1, foreignSignal);
+      });
+      expect(observed[1]).toBe(foreignSignal);
+      expect(fetchData).toHaveBeenCalledWith(1, foreignSignal);
     });
   });
 
@@ -538,6 +639,64 @@ describe('async hooks', () => {
       expect(screen.getByTestId('c').textContent).toBe('shared data');
       expect(fetchData).toHaveBeenCalledTimes(2);
     });
+
+    it('should keep subscribers consistent when a result lands during a transition', async () => {
+      const resolvers: ((v: string) => void)[] = [];
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            resolvers.push(resolve);
+          })
+      );
+
+      function Subscriber({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const result = useResult(injectable);
+        return <span data-testid={label}>{result ?? 'loading'}</span>;
+      }
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const [showSecond, setShowSecond] = useState(false);
+        useRun(injectable, []);
+
+        return (
+          <div>
+            <button
+              type='button'
+              onClick={() => startTransition(() => setShowSecond(true))}
+            >
+              show
+            </button>
+            <Subscriber injectable={injectable} label='a' />
+            {showSecond && <Subscriber injectable={injectable} label='b' />}
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByTestId('a').textContent).toBe('loading');
+
+      // Mount a second subscriber at transition priority, then resolve the
+      // in-flight call: uSES-driven updates at transition priority must not
+      // tear — both subscribers observe the same store snapshot.
+      fireEvent.click(screen.getByText('show'));
+      await act(async () => {
+        startTransition(() => {
+          for (const resolve of resolvers) resolve('shared');
+        });
+        // flush the promise chain inside act
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId('a').textContent).toBe('shared');
+      expect(screen.getByTestId('b').textContent).toBe('shared');
+    });
   });
 
   describe('useLoading', () => {
@@ -567,6 +726,48 @@ describe('async hooks', () => {
       await act(async () => {
         resolveFn!('result');
       });
+    });
+
+    it('should stay loading until every concurrent call settles', async () => {
+      const resolvers: ((v: string) => void)[] = [];
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            resolvers.push(resolve);
+          })
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const loading = useLoading(injectable);
+
+        return (
+          <div>
+            <button type='button' onClick={() => injectable()}>
+              run
+            </button>
+            <div>{loading ? 'loading' : 'done'}</div>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      // two overlapping calls: the shared count goes 0 → 1 → 2
+      fireEvent.click(screen.getByText('run'));
+      fireEvent.click(screen.getByText('run'));
+      expect(screen.getByText('loading')).toBeDefined();
+
+      // the first call settles; the count must drop to 1, not 0
+      await act(async () => {
+        resolvers[0]!('first');
+      });
+      expect(screen.getByText('loading')).toBeDefined();
+
+      // the second call settles; the count returns to exactly 0
+      await act(async () => {
+        resolvers[1]!('second');
+      });
+      expect(screen.getByText('done')).toBeDefined();
     });
   });
 
@@ -1170,6 +1371,243 @@ describe('async hooks', () => {
         expect(screen.getByTestId('b').textContent).toBe('v2');
       });
     });
+
+    it('should share one stale flag across useCache consumers of the same injectable', async () => {
+      let calls = 0;
+      let resolveRefetch!: (v: string) => void;
+      const fetchData = vi.fn(() => {
+        calls += 1;
+        if (calls === 1) return Promise.resolve('v1');
+        return new Promise<string>((resolve) => {
+          resolveRefetch = resolve;
+        });
+      });
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      function Consumer({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const isStale = useCache(injectable, cache, 10);
+        return <span data-testid={label}>{isStale ? 'stale' : 'fresh'}</span>;
+      }
+
+      function TestComponent() {
+        const [showB, setShowB] = useState(false);
+        const injectable = useInjectable(fetchData);
+        useRun(injectable, []);
+
+        return (
+          <div>
+            <Consumer injectable={injectable} label='a' />
+            {showB && <Consumer injectable={injectable} label='b' />}
+            <button
+              data-testid='refetch'
+              type='button'
+              onClick={() => {
+                injectable();
+              }}
+            >
+              refetch
+            </button>
+            <button
+              data-testid='mount-b'
+              type='button'
+              onClick={() => {
+                setShowB(true);
+              }}
+            >
+              mount b
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // initial fetch: the single consumer is fresh
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('fresh');
+      });
+
+      // let the cached entry become stale, then request again: consumer a
+      // flips to stale while the background refetch is held pending
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('refetch'));
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('stale');
+      });
+
+      // a second consumer mounting mid-refetch reads the same shared stale
+      // flag instead of starting from a local false
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('mount-b'));
+      });
+      expect(screen.getByTestId('b').textContent).toBe('stale');
+
+      // background refetch completes: both consumers flip back together
+      await act(async () => {
+        resolveRefetch!('v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('fresh');
+        expect(screen.getByTestId('b').textContent).toBe('fresh');
+      });
+    });
+  });
+
+  describe('useInvalidate', () => {
+    it('should be defined', () => {
+      expect(useInvalidate).toBeDefined();
+    });
+
+    it('should delete the cached key and refetch on invalidate', async () => {
+      const resolveQueue: Array<(v: string) => void> = [];
+      const fetchData = vi.fn(
+        (id: number) =>
+          new Promise<string>((resolve) => {
+            resolveQueue.push(resolve);
+          })
+      );
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+      const invalidateRefs: Array<unknown> = [];
+
+      function TestComponent() {
+        const [tick, setTick] = useState(0);
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const result = useResult(injectable);
+        const invalidate = useInvalidate(injectable, cache);
+        invalidateRefs.push(invalidate);
+
+        useEffect(() => {
+          injectable(1);
+        }, [injectable]);
+
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <button
+              data-testid='invalidate'
+              type='button'
+              onClick={() => invalidate(1)}
+            >
+              invalidate
+            </button>
+            <button
+              data-testid='rerender'
+              type='button'
+              onClick={() => setTick(tick + 1)}
+            >
+              rerender
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // first call populates the cache and the result
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(1);
+      });
+      await act(async () => {
+        resolveQueue[0]('data 1 v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 v1');
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+      expect(cache.get([1])).toEqual(['data 1 v1', expect.any(Number)]);
+
+      // rerender: the invalidate reference stays stable
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('rerender'));
+      });
+      expect(new Set(invalidateRefs).size).toBe(1);
+
+      // invalidate deletes the entry before the call starts, so the second
+      // call is a hard cache miss and fn runs again
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('invalidate'));
+      });
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(2);
+      });
+      expect(cache.get([1])).toBeUndefined();
+      expect(fetchData).toHaveBeenLastCalledWith(1);
+
+      // subscribers see the fresh result once the new call resolves
+      await act(async () => {
+        resolveQueue[1]('data 1 v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 v2');
+      });
+      expect(cache.get([1])).toEqual(['data 1 v2', expect.any(Number)]);
+    });
+
+    it('should only delete the cache entry for the given args', async () => {
+      const resolveQueue: Array<(v: string) => void> = [];
+      const fetchData = vi.fn(
+        (id: number) =>
+          new Promise<string>((resolve) => {
+            resolveQueue.push(resolve);
+          })
+      );
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      cache.set([1], 'one');
+      cache.set([2], 'two');
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const invalidate = useInvalidate(injectable, cache);
+
+        return (
+          <button
+            data-testid='invalidate'
+            type='button'
+            onClick={() => invalidate(1)}
+          >
+            invalidate
+          </button>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('invalidate'));
+      });
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(1);
+      });
+
+      // only the [1] entry is gone and refetched; [2] survives untouched
+      expect(cache.get([1])).toBeUndefined();
+      expect(cache.get([2])).toEqual(['two', expect.any(Number)]);
+      expect(fetchData).toHaveBeenCalledTimes(1);
+      expect(fetchData).toHaveBeenCalledWith(1);
+      expect(fetchData).not.toHaveBeenCalledWith(2);
+    });
   });
 
   describe('getInjectContext', () => {
@@ -1493,6 +1931,329 @@ describe('async hooks', () => {
       fireEvent.click(screen.getByTestId('add'));
       await waitFor(() => {
         expect(fetchData).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
+
+  describe('usePolling', () => {
+    it('should spread args into every tick', async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+        function TestComponent() {
+          const injectable = useInjectable(fetchUser);
+          usePolling(injectable, 1000, {args: [42]});
+          return null;
+        }
+        render(<TestComponent />);
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(fetchUser).toHaveBeenCalledTimes(3);
+        expect(fetchUser.mock.calls[0]).toEqual([42]);
+        expect(fetchUser.mock.calls[2]).toEqual([42]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('should re-arm the timer with the new args when an arg changes', async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+        function TestComponent({id}: {id: number}) {
+          const injectable = useInjectable(fetchUser);
+          usePolling(injectable, 1000, {args: [id]});
+          return null;
+        }
+        const {rerender} = render(<TestComponent id={1} />);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(fetchUser).toHaveBeenCalledTimes(2);
+        expect(fetchUser.mock.calls[1]).toEqual([1]);
+        rerender(<TestComponent id={2} />);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(fetchUser).toHaveBeenCalledTimes(3);
+        expect(fetchUser.mock.calls[2]).toEqual([2]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('useFocusRevalidate', () => {
+    it('should spread args into the focus revalidation', () => {
+      const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+      function TestComponent() {
+        const injectable = useInjectable(fetchUser);
+        useFocusRevalidate(injectable, {args: [42]});
+        return null;
+      }
+      render(<TestComponent />);
+      fireEvent(window, new Event('focus'));
+      expect(fetchUser).toHaveBeenCalledTimes(1);
+      expect(fetchUser.mock.calls[0]).toEqual([42]);
+    });
+  });
+
+  describe('useSuspenseResult', () => {
+    function SuspenseReader({fetchValue}: {fetchValue: () => Promise<string>}) {
+      const data = useSuspenseResult(fetchValue);
+      return <div>{data}</div>;
+    }
+
+    it('should suspend with the fallback until the first result resolves', async () => {
+      let resolveFn!: (value: string) => void;
+      const fetchData = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      // StrictMode double-render on top: the hook order must stay stable
+      // even though the suspended render throws after its hooks.
+      function Owner() {
+        const fetchValue = useInjectable(fetchData);
+        // The driver sits outside the Suspense boundary: a subtree
+        // suspended on its initial mount never commits, so its own
+        // effects would never fire and the fetch would never start.
+        useRun(fetchValue, []);
+        return (
+          <Suspense fallback={<div>loading…</div>}>
+            <SuspenseReader fetchValue={fetchValue} />
+          </Suspense>
+        );
+      }
+
+      render(
+        <StrictMode>
+          <Owner />
+        </StrictMode>
+      );
+
+      expect(screen.getByText('loading…')).toBeDefined();
+      await act(async () => {
+        resolveFn('first data');
+      });
+      expect(await screen.findByText('first data')).toBeDefined();
+      expect(screen.queryByText('loading…')).toBeNull();
+    });
+
+    it('should update in place when a background refresh delivers a new result', async () => {
+      let resolveFn!: (value: string) => void;
+      const fetchData = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      function Owner() {
+        const fetchValue = useInjectable(fetchData);
+        return (
+          <>
+            <button type='button' onClick={() => void fetchValue()}>
+              refresh
+            </button>
+            <Suspense fallback={<div>loading…</div>}>
+              <SuspenseReader fetchValue={fetchValue} />
+            </Suspense>
+          </>
+        );
+      }
+
+      render(<Owner />);
+
+      // Nothing is in flight while the reader renders, so it suspends on
+      // the promise resolved by the first result published to the store.
+      expect(screen.getByText('loading…')).toBeDefined();
+      fireEvent.click(screen.getByText('refresh'));
+      await act(async () => {
+        resolveFn('v1');
+      });
+      expect(await screen.findByText('v1')).toBeDefined();
+      expect(screen.queryByText('loading…')).toBeNull();
+
+      // A background refresh keeps the old value on screen — no fallback
+      // re-show — and swaps in the new result when it settles.
+      fireEvent.click(screen.getByText('refresh'));
+      expect(screen.getByText('v1')).toBeDefined();
+      expect(screen.queryByText('loading…')).toBeNull();
+      await act(async () => {
+        resolveFn('v2');
+      });
+      expect(await screen.findByText('v2')).toBeDefined();
+      expect(screen.queryByText('loading…')).toBeNull();
+    });
+
+    it('should suspend on the in-flight promise when the call already started', async () => {
+      let resolveFn!: (value: string) => void;
+      const fetchData = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      // The wrapper that records the in-flight promise is registered by a
+      // useSuspenseResult render, so the first reader mounts (and stays
+      // suspended) before the call starts; the second reader then mounts
+      // with the call in flight and must throw that very promise.
+      function Owner() {
+        const fetchValue = useInjectable(fetchData);
+        const [phase, setPhase] = useState(0);
+        return (
+          <>
+            <button type='button' onClick={() => setPhase(phase + 1)}>
+              next
+            </button>
+            {phase >= 1 && (
+              <Suspense fallback={<div>first loading…</div>}>
+                <SuspenseReader fetchValue={fetchValue} />
+              </Suspense>
+            )}
+            {phase >= 2 && (
+              <button type='button' onClick={() => void fetchValue()}>
+                start
+              </button>
+            )}
+            {phase >= 3 && (
+              <Suspense fallback={<div>second loading…</div>}>
+                <SuspenseReader fetchValue={fetchValue} />
+              </Suspense>
+            )}
+          </>
+        );
+      }
+
+      render(<Owner />);
+
+      // Phase 1: the reader suspends with nothing in flight (wake path).
+      fireEvent.click(screen.getByText('next'));
+      expect(screen.getByText('first loading…')).toBeDefined();
+
+      // Phase 2: start the call, phase 3 mounts the second reader while
+      // the promise is pending — it suspends on the in-flight promise.
+      fireEvent.click(screen.getByText('next'));
+      fireEvent.click(screen.getByText('start'));
+      fireEvent.click(screen.getByText('next'));
+      expect(screen.getByText('first loading…')).toBeDefined();
+      expect(screen.getByText('second loading…')).toBeDefined();
+
+      await act(async () => {
+        resolveFn('started earlier');
+      });
+      // Both readers unsuspend on the same shared result.
+      expect(await screen.findAllByText('started earlier')).toHaveLength(2);
+      expect(screen.queryByText('first loading…')).toBeNull();
+      expect(screen.queryByText('second loading…')).toBeNull();
+    });
+  });
+
+  describe('keepPreviousData', () => {
+    it('should keep the previous page on screen while the next one loads', async () => {
+      let resolvePage2!: (v: string) => void;
+      const fetchPage = vi.fn((page: number) =>
+        page === 1
+          ? Promise.resolve('page 1')
+          : new Promise<string>((resolve) => (resolvePage2 = resolve))
+      );
+
+      function TestComponent({page}: {page: number}) {
+        const loadPage = useInjectable(fetchPage);
+        useRun(loadPage, [page]);
+        const data = useResult(loadPage);
+        const loading = useLoading(loadPage);
+        const initialLoading = useInitialLoading(loadPage);
+        return (
+          <div>
+            <span data-testid='result'>{data ?? 'no result'}</span>
+            <span data-testid='loading'>{loading ? 'loading' : 'idle'}</span>
+            <span data-testid='initial'>
+              {initialLoading ? 'initial' : 'settled'}
+            </span>
+          </div>
+        );
+      }
+
+      const {rerender} = render(<TestComponent page={1} />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('page 1');
+      });
+      expect(screen.getByTestId('loading').textContent).toBe('idle');
+      expect(screen.getByTestId('initial').textContent).toBe('settled');
+
+      // page 1 → 2: the new call hangs forever until resolved, yet the old
+      // page must stay on screen instead of flashing back to undefined.
+      rerender(<TestComponent page={2} />);
+      await waitFor(() => {
+        expect(screen.getByTestId('loading').textContent).toBe('loading');
+      });
+      expect(fetchPage).toHaveBeenCalledTimes(2);
+      expect(fetchPage).toHaveBeenLastCalledWith(2);
+      expect(screen.getByTestId('result').textContent).toBe('page 1');
+      // A result exists, so the pending call is a background one — no
+      // full-screen initial loading again.
+      expect(screen.getByTestId('initial').textContent).toBe('settled');
+
+      // The new result lands and replaces the old one everywhere.
+      await act(async () => {
+        resolvePage2!('page 2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('page 2');
+      });
+      expect(screen.getByTestId('loading').textContent).toBe('idle');
+    });
+
+    it('should broadcast the cached page instantly and refresh stale data in the background', async () => {
+      let resolveRefetch!: (v: string) => void;
+      const fetchPage = vi.fn((page: number) =>
+        page === 1
+          ? Promise.resolve('page 1')
+          : new Promise<string>((resolve) => (resolveRefetch = resolve))
+      );
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000
+      });
+      // A previously visited page 2 sits in the cache.
+      cache.set([2], 'cached page 2');
+
+      function TestComponent() {
+        const [page, setPage] = useState(1);
+        const loadPage = useInjectable(fetchPage);
+        // staleTime 0: every cache hit revalidates in the background.
+        useCache(loadPage, cache);
+        useRun(loadPage, [page]);
+        const data = useResult(loadPage);
+        const initialLoading = useInitialLoading(loadPage);
+        return (
+          <div>
+            <span data-testid='result'>{data ?? 'no result'}</span>
+            <span data-testid='initial'>
+              {initialLoading ? 'initial' : 'settled'}
+            </span>
+            <button
+              data-testid='next'
+              type='button'
+              onClick={() => setPage(page + 1)}
+            >
+              next
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('page 1');
+      });
+
+      // page 1 → 2 hits the cache: the cached value is broadcast at once —
+      // no loading flash, the background refetch is already running.
+      fireEvent.click(screen.getByTestId('next'));
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('cached page 2');
+      });
+      expect(fetchPage).toHaveBeenCalledTimes(2);
+      expect(fetchPage).toHaveBeenLastCalledWith(2);
+      expect(screen.getByTestId('initial').textContent).toBe('settled');
+
+      // The background refresh lands and replaces the stale cache.
+      await act(async () => {
+        resolveRefetch!('page 2 fresh');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('page 2 fresh');
       });
     });
   });

@@ -6,6 +6,7 @@ import {
   useInjectable,
   createMemoryCacheProvider,
   useResult,
+  useSuspenseResult,
   useLoading,
   useInitialLoading,
   useError,
@@ -14,13 +15,16 @@ import {
   useFinally,
   useRetry,
   useCache,
+  useInvalidate,
   getInjectContext,
   useInject,
   usePolling,
-  useFocusRevalidate
+  useFocusRevalidate,
+  isInjectable,
+  subscribeInjectEvents
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
-import {useInjectBefore} from '../src/async/inject';
+import {addWrapper, useInjectBefore} from '../src/async/inject';
 
 describe('async hooks exports', () => {
   it('should export useRun', () => {
@@ -41,6 +45,11 @@ describe('async hooks exports', () => {
   it('should export useResult', () => {
     expect(useResult).toBeDefined();
     expect(typeof useResult).toBe('function');
+  });
+
+  it('should export useSuspenseResult', () => {
+    expect(useSuspenseResult).toBeDefined();
+    expect(typeof useSuspenseResult).toBe('function');
   });
 
   it('should export useLoading', () => {
@@ -83,6 +92,11 @@ describe('async hooks exports', () => {
     expect(typeof useCache).toBe('function');
   });
 
+  it('should export useInvalidate', () => {
+    expect(useInvalidate).toBeDefined();
+    expect(typeof useInvalidate).toBe('function');
+  });
+
   it('should export getInjectContext', () => {
     expect(getInjectContext).toBeDefined();
     expect(typeof getInjectContext).toBe('function');
@@ -93,6 +107,11 @@ describe('async hooks exports', () => {
     expect(typeof useInject).toBe('function');
   });
 
+  it('should export isInjectable', () => {
+    expect(isInjectable).toBeDefined();
+    expect(typeof isInjectable).toBe('function');
+  });
+
   it('should export usePolling', () => {
     expect(usePolling).toBeDefined();
     expect(typeof usePolling).toBe('function');
@@ -101,6 +120,11 @@ describe('async hooks exports', () => {
   it('should export useFocusRevalidate', () => {
     expect(useFocusRevalidate).toBeDefined();
     expect(typeof useFocusRevalidate).toBe('function');
+  });
+
+  it('should export subscribeInjectEvents', () => {
+    expect(subscribeInjectEvents).toBeDefined();
+    expect(typeof subscribeInjectEvents).toBe('function');
   });
 });
 
@@ -117,6 +141,11 @@ describe('async/inject exports', () => {
     expect(typeof useInjectBefore).toBe('function');
   });
 
+  it('should export addWrapper', () => {
+    expect(addWrapper).toBeDefined();
+    expect(typeof addWrapper).toBe('function');
+  });
+
   // Scenario: caller passes a plain (non-useInjectable) function — the WeakMap
   // lookup misses and must fail with a clear error instead of an obscure
   // "Cannot read properties of undefined" TypeError.
@@ -128,6 +157,21 @@ describe('async/inject exports', () => {
   it('should throw a clear error when useInject gets a plain function', () => {
     const plain = () => 'not injectable';
     expect(() => useInject(plain, (f) => f)).toThrow(/useInjectable/);
+  });
+
+  it('should return false for a plain function', () => {
+    expect(isInjectable(() => 'plain')).toBe(false);
+  });
+
+  it('should return true for a function returned by useInjectable', () => {
+    let injectable: () => any;
+    function TestComponent() {
+      injectable = useInjectable(() => 'ok');
+      return null;
+    }
+
+    render(createElement(TestComponent));
+    expect(isInjectable(injectable!)).toBe(true);
   });
 });
 
@@ -460,5 +504,127 @@ describe('useFocusRevalidate', () => {
     fireEvent(window, new Event('focus'));
     fireEvent(document, new Event('visibilitychange'));
     expect(fetchData).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe('subscribeInjectEvents', () => {
+  // The API is hook-free, but its input must come from useInjectable, so a
+  // tiny component renders the injectable and hands it to the test.
+  function renderInjectable<AF extends (...args: any[]) => Promise<any>>(
+    fn: AF
+  ): AF {
+    let injectable!: AF;
+    function TestComponent() {
+      injectable = useInjectable(fn);
+      return null;
+    }
+    render(createElement(TestComponent));
+    return injectable;
+  }
+
+  it('should emit onCall with args and onSettle with result and duration', async () => {
+    const injectable = renderInjectable(async (x: number) => `ok ${x}`);
+    const calls: number[][] = [];
+    const settles: any[] = [];
+    const unsubscribe = subscribeInjectEvents(injectable, {
+      onCall: (args) => calls.push([...args]),
+      onSettle: (info) => settles.push(info)
+    });
+
+    let resolved!: string;
+    await act(async () => {
+      resolved = await injectable(7);
+    });
+
+    expect(resolved).toBe('ok 7');
+    expect(calls).toEqual([[7]]);
+    expect(settles.length).toBe(1);
+    expect(settles[0].args).toEqual([7]);
+    expect(settles[0].result).toBe('ok 7');
+    expect(settles[0].error).toBeUndefined();
+    expect(settles[0].duration).toBeGreaterThanOrEqual(0);
+
+    unsubscribe();
+  });
+
+  it('should report a rejection on the error field', async () => {
+    const injectable = renderInjectable(async () => {
+      throw new Error('boom');
+    });
+    const settles: any[] = [];
+    const unsubscribe = subscribeInjectEvents(injectable, {
+      onSettle: (info) => settles.push(info)
+    });
+
+    await act(async () => {
+      await expect(injectable()).rejects.toThrow('boom');
+    });
+
+    expect(settles.length).toBe(1);
+    expect(settles[0].error).toBeInstanceOf(Error);
+    expect(settles[0].error.message).toBe('boom');
+    expect(settles[0].result).toBeUndefined();
+    expect(settles[0].duration).toBeGreaterThanOrEqual(0);
+
+    unsubscribe();
+  });
+
+  it('should stop emitting after unsubscribing', async () => {
+    const injectable = renderInjectable(async () => 'ok');
+    const calls: any[][] = [];
+    const settles: any[] = [];
+    const unsubscribe = subscribeInjectEvents(injectable, {
+      onCall: (args) => calls.push(args),
+      onSettle: (info) => settles.push(info)
+    });
+
+    await act(async () => {
+      await injectable();
+    });
+    expect(calls.length).toBe(1);
+    expect(settles.length).toBe(1);
+
+    unsubscribe();
+    await act(async () => {
+      await injectable();
+    });
+    // neither handler fires once the observer is removed
+    expect(calls.length).toBe(1);
+    expect(settles.length).toBe(1);
+  });
+
+  it('should observe from outside wrappers registered earlier', async () => {
+    let injectable!: () => Promise<string>;
+    function TestComponent() {
+      injectable = useInjectable(async () => 'ok');
+      // Registered during render, i.e. before the observer below subscribes.
+      useInject(
+        injectable,
+        (f: any) =>
+          ((...args: any[]) =>
+            new Promise((resolve) =>
+              setTimeout(() => resolve(f(...args)), 50)
+            )) as any
+      );
+      return null;
+    }
+    render(createElement(TestComponent));
+
+    const settles: any[] = [];
+    const unsubscribe = subscribeInjectEvents(injectable, {
+      onSettle: (info) => settles.push(info)
+    });
+
+    await act(async () => {
+      await injectable();
+    });
+
+    // The observer is the outermost layer, so its duration spans the whole
+    // chain underneath — including the hook-registered wrapper's 50ms sleep.
+    expect(settles.length).toBe(1);
+    expect(settles[0].result).toBe('ok');
+    expect(settles[0].duration).toBeGreaterThanOrEqual(50);
+
+    unsubscribe();
   });
 });

@@ -25,7 +25,17 @@ const functionHashIds = new WeakMap<object, string>();
 let functionHashId = 0;
 const circularGuard = new WeakSet<object>();
 
-function isAbortSignal(value: any): boolean {
+/**
+ * Check whether a value is an `AbortSignal`.
+ *
+ * The `instanceof` fast path covers same-realm signals. The duck-typing
+ * fallback — a non-null object with an `aborted` property and an
+ * `addEventListener` function — keeps the check working for signals that
+ * cross a realm boundary (created inside an iframe or by a separate test
+ * environment, where `instanceof` fails) and for environments without a
+ * global `AbortSignal` at all.
+ */
+export function isAbortSignal(value: any): boolean {
   if (typeof AbortSignal !== 'undefined' && value instanceof AbortSignal) {
     return true;
   }
