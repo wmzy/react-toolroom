@@ -35,7 +35,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | mutation 联动失效缓存 | `useInvalidate` | `invalidateQueries` | 手动 `mutate` | 手动 |
 | 无限加载 | ✗ | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
 | key 变化时保留旧数据 | **默认行为** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
-| DevTools | `subscribeInjectEvents`（观察 API） | ✅ | 社区版 | ✗ |
+| DevTools | ✅ `InjectDevTools` 面板（独立入口） | ✅ | 社区版 | ✗ |
 | SSR / hydration | ✗ | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
@@ -44,6 +44,21 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 ¹ 均为 minified + 压缩后、只算入口的体积。react-toolroom 的数字是 CI 强制约束的精确值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
 **选 react-toolroom**：中小型应用、嵌进组件库发布、或者只想按需挑几个能力且把代价压到最小的场景。**选 TanStack Query**：需要完整的服务端状态管理——托管式 mutation 与乐观更新、按 query-key 谓词全缓存失效、无限查询、SSR hydration、DevTools 面板的时候。
+
+## 一次性写好你项目的 query hook
+
+React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。这是刻意为之：把原子 hooks 已经直接表达的东西重新编码成一张选项表，维护成本与组合本身相当，还会在你最需要看清机制的时刻把它藏起来。正确姿势是：**一次性**写好你项目的 query hook，然后到处使用——之后调整这段组合，代价并不比改配置对象高。
+
+[`recipes/`](./recipes/) 目录提供了可复制、可定制的起点模板：
+
+| 模板 | 组合方式 |
+| --- | --- |
+| [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | 基础版：`useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`。 |
+| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | 加 `useCache(staleTime)`（模块级缓存实例）+ `useFocusRevalidate`。 |
+| [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | 加固定间隔的 `usePolling`。 |
+| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | 按键运行的 `useRun(fn, [{page}], {hash: stableHash})`，默认保留旧数据；`useLoading` 做小刷新指示器，`useInitialLoading` 做首屏骨架。 |
+
+复制最贴近你场景的一份，替换成你的 fetcher，再按每个文件头列出的常见定制点调整：`staleTime`、错误上报、缓存实例、返回形状。一个 hook 让所有屏幕共用同一套 loading/error 契约——并且只有一处需要修改。
 
 ## 快速上手
 
@@ -104,6 +119,15 @@ function UserList() {
     </ul>
   );
 }
+```
+
+### DevTools：挂一个调用轨迹面板
+
+```tsx
+import {InjectDevTools} from 'react-toolroom/devtools';
+
+// 仅开发环境，挂在树里任意位置——独立入口、内联样式、零依赖。
+<InjectDevTools injectables={[fetchUsers]} />
 ```
 
 ## `memo` 与 React Compiler 的关系
@@ -289,6 +313,70 @@ function UserList() {
 
 与 stale-while-revalidate 的后台 refetch 不同——后者在刷新期间继续供旧值——`useInvalidate` 是硬失效：先删除给定参数下的缓存条目，再立刻用同样的参数重跑 injectable，订阅者看到的是全新的 loading → result 周期，而不是 mutation 前的旧数据。键联动与 `useCache` 一致：同一个 `cacheProvider` 加同一个参数元组寻址同一条目（`useInvalidate(fetchUser, userCache)(userId)` 删掉的就是 `useRun(fetchUser, [userId])` 填充的那条）。返回的函数引用稳定、resolve 为新结果，mutation 处理器里 `await` 它之后再关掉 toast 即可。
 
+### 乐观更新 — `useOptimistic`
+
+```tsx
+function TodoList() {
+  const fetchTodos = useInjectable(fetchAllTodos);
+  const saveTodo = useInjectable((todo: Todo) => api.save(todo));
+
+  // 与 mutation 本身同一个 injectable：快照由当前结果和调用参数推导。
+  useOptimistic(saveTodo, (draft, todo) => ({
+    ...draft,
+    items: [...draft.items, todo] // 乐观追加
+  }));
+  const todos = useResult(fetchTodos);
+  useRun(fetchTodos, []);
+
+  const error = useError(saveTodo); // 回滚后错误依然可见
+
+  async function handleAdd(todo: Todo) {
+    await saveTodo(todo); // resolve 为服务端真相
+  }
+
+  // ……渲染 `todos`，把 `handleAdd` 接到输入框上……
+}
+```
+
+`useOptimistic` 做的是乐观 UI：被包裹的 injectable 每次调用都会立即把「由更新器从当前结果和调用参数算出的快照」发布到 result store，然后放行真实调用——成功时服务端真相经由正常的结果广播覆盖快照，失败时回滚为调用前的值，同时拒绝继续向上传递（`useError` 照样能捕获）。与 `useInvalidate` 的分工：本地可预测的编辑（勾选、追加、重命名——即时反馈、零额外请求）用乐观快照；自己算不出来的数据（mutation 会重塑别处渲染的列表）用硬失效。更新器请返回**新值**：返回空会保留旧值，原地修改 `draft` 既不会触发重渲染，也不会留下可回滚的快照。
+
+### SSR：dehydrate 与 hydrate
+
+```tsx
+const userCache = createMemoryCacheProvider<User, [string]>({cacheTime: 60000});
+
+// 服务端：预取时写入缓存，再把缓存序列化进 HTML。
+userCache.set([id], await fetchUser(id));
+const payload = userCache.dehydrate(); // 纯净的 JSON 安全对象
+// 例如 `<script id="cache" type="application/json">${JSON.stringify(payload)}</script>`
+
+// 客户端：首屏渲染前恢复。
+userCache.hydrate(JSON.parse(document.getElementById('cache')!.textContent!));
+
+function User({id}: {id: string}) {
+  const fetchUser = useInjectable((signal) => api.user(id, signal));
+  const isStale = useCache(fetchUser, userCache, 5000);
+  useRun(fetchUser, [id]);
+  // ……
+}
+```
+
+`dehydrate()` 把内部 map 展开成普通的 `{[hashedKey]: [value, timestamp]}` 对象——可直接 `JSON.stringify`，因此能随 HTML、props 或自建 RPC 传输。客户端在**首屏渲染前**调用 `hydrate(payload)`：组件第一次 `useCache` 查询即为缓存命中、立即渲染；超过 `staleTime` 的条目照常在后台重新验证，与普通的过期命中完全一致。`hydrate` 是**合并**语义——绝不清空客户端已有的条目——且时间戳原样保留，过期计算因此保持正确。
+
+### 按前缀批量失效
+
+```tsx
+// 哈希约定：给每类实体的键加命名空间前缀。
+const cache = createMemoryCacheProvider<unknown, any[]>({
+  hash: (args) => 'user:' + stableHash(args)
+});
+
+// 一行删掉所有 user 条目——且只删 user 条目。
+cache.deletePrefix('user:');
+```
+
+`delete(key)` 与 `useInvalidate` 只会精确命中单条。`deletePrefix(prefix)` 是批量版：遍历哈希键，删除所有以 `prefix` 开头的条目。配合 `hash` 约定（`'user:' + stableHash(args)`），一个可能影响大量缓存用户的 mutation——比如给整个团队改权限——就能整体作废 `user:` 命名空间，而不动 `post:` 等其它前缀。
+
 ### `useLoading` 与 `useInitialLoading` 的区别
 
 ```tsx
@@ -357,6 +445,38 @@ function UserList() {
 
 `page` 变化时，旧一页会一直留在屏幕上，直到新结果落地：共享的 result store 在调用之间从不重置，且每次调用持有的序号票券会丢弃任何比最新已应用结果更旧的写入——慢请求无法覆盖新调用已经交付的数据。TanStack Query 需要配置 `placeholderData: keepPreviousData`、SWR 需要 `keepPreviousData: true` 才能得到这个行为；本库中它是默认行为，无需任何选项。首次加载配合 `useInitialLoading`（整页 skeleton），重访页面配合 `useCache`（命中缓存立即渲染、后台重新验证）。
 
+### 无限加载 — `useInfinite`
+
+```tsx
+function ProjectFeed() {
+  // fetcher 接收单个 pageParam，返回一页数据。
+  const fetchPages = useInjectable((cursor?: number) => api.projects(cursor));
+
+  const {pages, fetchNextPage, isFetchingNextPage, hasNextPage} = useInfinite(
+    fetchPages,
+    {getNextPageParam: (lastPage) => lastPage.nextCursor}
+  );
+  useRun(fetchPages, [undefined]); // 首页，与任何普通查询一样
+
+  return (
+    <>
+      {pages.flatMap((page) => page.items).map((p) => (
+        <Card key={p.id} item={p} />
+      ))}
+      <button
+        type='button'
+        disabled={!hasNextPage || isFetchingNextPage}
+        onClick={() => void fetchNextPage()}
+      >
+        {isFetchingNextPage ? '加载中…' : hasNextPage ? '加载更多' : '到底了'}
+      </button>
+    </>
+  );
+}
+```
+
+该 hook 把已取到的页聚合为数组并发布到 injectable 的 result store；请从它的返回值读取 pages，而不是 `useResult`（store 里存的是整个数组，不是单页）。返回形状是 TanStack `useInfiniteQuery` 的子集——`{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` 语义一致——去掉了所有预设 query-client 的部分。只有经 `fetchNextPage()` 发起的调用会追加；其它任何调用（`useRun` 重跑、手动调用、焦点重验证）都会把 `pages` 重置为该次结果，因此 refetch 天然从头开始。`getNextPageParam(lastPage, allPages)` 返回 `undefined` 即到末尾（`hasNextPage` 变为 `false`）。
+
 ### 观察每一次调用 — `subscribeInjectEvents`
 
 ```tsx
@@ -403,15 +523,27 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。 |
 | `useCatch(fn, catcher)` | 通过 `catcher(e) => result` 把 rejection 转为兜底值。 |
 | `useFinally(fn, handler)` | 调用落定时执行 `handler`，无论成败。 |
-| `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。 |
+| `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。 |
 | `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useDedup`/`useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——该标志是同一 injectable 所有 `useCache` 消费者共享的广播状态，一起更新（最后一次判定生效）。 |
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
+| `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
+| `useInfinite(fn, {getNextPageParam})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}`——TanStack `useInfiniteQuery` 的子集。只有 `fetchNextPage()` 发起的调用会追加；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）与 `deletePrefix`（按哈希键前缀批量失效）；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
 | `useDedup(fn, {hash = stableHash}?)` | 同键并发调用共享同一个 in-flight promise；落定即删条目，失败可重试。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache`/`useDedup` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。 |
 | `stableHash(value)` | 此处为便捷再导出——见上方核心表。 |
+
+### DevTools — `react-toolroom/devtools`
+
+独立入口：不导入它，核心与 async 两个包就不会多出一个字节。
+
+| API | 说明 |
+| --- | --- |
+| `<InjectDevTools injectables, limit?, title?>` | 零依赖调用轨迹面板。经 `subscribeInjectEvents` 订阅每个 injectable，把最近 `limit`（默认 50）条 settle 事件渲染成内联样式表格——时间、函数名、状态、耗时、参数/结果摘要——卸载时退订。`injectables` 请传引用稳定的数组（模块常量或 `useMemo`）。 |
+| `useInjectLog(fn, limit?)` | 面板背后的无头引擎：返回 `{events, clear}`，携带同样格式的 `InjectLogEvent[]`——用它搭建自己的面板 UI。 |
+| `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}`——`duration` 覆盖观察者之下的整条洋葱链；`name` 取 `fn.name`，`useInjectable` 返回的匿名 wrapper 显示为 `'anonymous'`。 |
 
 编写自定义 wrapper 和 cache provider 所需的类型同样从两个入口导出：`react-toolroom/async` 提供 `AsyncFunc`、`Func`、`R<AF>`、`CacheProvider<R, Args>`、`CacheResult<R>`；核心入口提供 `Func`。
 
@@ -426,7 +558,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 ## 示例
 
-见 [demos](./demos/)：`memo`、请求去重、轮询、焦点重验证、SWR 缓存、`AbortSignal` 取消、跨组件注入（洋葱模型）等可运行示例。
+见 [demos](./demos/)：`memo`、请求去重、轮询、焦点重验证、SWR 缓存、`AbortSignal` 取消、跨组件注入（洋葱模型）等可运行示例。可复制、可定制的 query hook 模板见 [recipes](./recipes/)。
 
 ## 文档
 

@@ -70,7 +70,7 @@
 
 import {AsyncFunc, CacheProvider, CacheResult, Func, R} from '@@/types';
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {isAbortSignal, noop, thru, thruError} from '@@/util';
+import {isAbortSignal, noop, stableHash, thru, thruError} from '@@/util';
 import {
   useInject,
   useInjectBefore,
@@ -96,6 +96,8 @@ export {useInject, useInjectBefore, getInjectContext, isInjectable};
 export type {AsyncFunc, Func, R, CacheProvider, CacheResult} from '@@/types';
 
 export {useDedup} from './dedup';
+export {useOptimistic} from './optimistic';
+export {useInfinite} from './infinite';
 
 export {subscribeInjectEvents} from './devtools';
 
@@ -469,17 +471,91 @@ export function useFailureCount<AF extends AsyncFunc>(injectableFn: AF) {
   return count;
 }
 
+// Base delay (ms) of the preset backoff strategies of useRetry.
+const retryBaseDelay = 1000;
+
+/**
+ * Builds the `shouldRetry` callback of a preset useRetry configuration:
+ * retry while `failureCount < retries`, waiting the backoff delay between
+ * attempts (`exponential`: base·2^attempt, `linear`: base·(attempt+1),
+ * or a custom `(attempt) => ms`). The wait reuses the existing
+ * promise-based mechanism — returning a `Promise` from `shouldRetry`
+ * delays the retry until it resolves.
+ */
+function presetShouldRetry(
+  options: {
+    retries?: number;
+    backoff?: 'exponential' | 'linear' | ((attempt: number) => number);
+  },
+  retries = options.retries ?? 3,
+  backoff = options.backoff ?? 'exponential'
+): (failureCount: number, e: any) => boolean | Promise<any> {
+  return (failureCount, e) => {
+    if (failureCount >= retries) return false;
+    const delay =
+      typeof backoff === 'function'
+        ? backoff(failureCount)
+        : backoff === 'linear'
+          ? retryBaseDelay * (failureCount + 1)
+          : retryBaseDelay * 2 ** failureCount;
+    // A zero delay skips the timer entirely (also keeps tests fast).
+    if (delay <= 0) return true;
+    return new Promise<boolean>((resolve) =>
+      setTimeout(() => resolve(true), delay)
+    );
+  };
+}
+
 /**
  * Calls an asynchronous function with retry logic until a condition is met.
  *
- * @param {AsyncFunc} injectableFn - The asynchronous function to call.
+ * Two signatures share one mechanism:
+ *
+ * - `useRetry(fn, shouldRetry)` — full control: retry while
+ *   `shouldRetry(failureCount, e)` returns `true`; returning a `Promise`
+ *   waits for it, then retries (that promise is how backoff is expressed).
+ * - `useRetry(fn, options)` — the preset shorthand:
+ *   `{retries?: number = 3, backoff?: 'exponential' | 'linear' |
+ *   ((attempt: number) => number) = 'exponential'}` retries up to
+ *   `retries` times after the initial failure, waiting between attempts
+ *   (`'exponential'`: 1s, 2s, 4s…; `'linear'`: 1s, 2s, 3s…; a custom
+ *   function receives the 0-based attempt index and returns the delay in
+ *   ms).
+ *
+ * @param {AF} injectableFn - The asynchronous function to call.
  * @param {(failureCount: number, e: any) => boolean | Promise<any>} shouldRetry - A function that determines whether to retry or not.
  * @return {void} This function does not return anything.
+ * @example
+ * ```tsx
+ * const fetchFlaky = useInjectable(api.flaky);
+ * // Up to 5 attempts (1 initial + 4 retries), 1s/2s/4s/8s between them:
+ * useRetry(fetchFlaky, {retries: 4});
+ * // Custom jittered backoff:
+ * useRetry(fetchFlaky, {retries: 3, backoff: (n) => 500 * 2 ** n + Math.random() * 100});
+ * ```
  */
 export function useRetry<AF extends AsyncFunc>(
   injectableFn: AF,
   shouldRetry: (failureCount: number, e: any) => boolean | Promise<any>
+): void;
+export function useRetry<AF extends AsyncFunc>(
+  injectableFn: AF,
+  options: {
+    retries?: number;
+    backoff?: 'exponential' | 'linear' | ((attempt: number) => number);
+  }
+): void;
+export function useRetry<AF extends AsyncFunc>(
+  injectableFn: AF,
+  retry:
+    | ((failureCount: number, e: any) => boolean | Promise<any>)
+    | {
+        retries?: number;
+        backoff?: 'exponential' | 'linear' | ((attempt: number) => number);
+      }
 ) {
+  const shouldRetry =
+    typeof retry === 'function' ? retry : presetShouldRetry(retry);
   useInject(
     injectableFn,
     (f: AF) =>
@@ -627,6 +703,38 @@ export function useRun<F extends Func>(
   options?: {signal?: boolean; hash?: (args: any[]) => string}
 ) {
   const {signal = false, hash} = options ?? {};
+  // Dev-only inline-args warning. Without `hash`, the raw argument
+  // references live in the effect dependencies, so an inline object/array
+  // literal in `args` re-runs the effect on every render even when the
+  // structure never changed. The check remembers the previous render's
+  // args by reference and by stableHash: a changed reference with an
+  // unchanged hash is exactly that footgun.
+  //
+  // The `process.env.NODE_ENV !== 'production'` guard is what React
+  // itself ships: every bundler replaces that member expression
+  // statically (Vite/webpack, dev and prod builds alike), so the whole
+  // block — the stableHash computation included — is dead-code-eliminated
+  // from production bundles. It is deliberately NOT `import.meta.env`:
+  // this package typechecks under `module: NodeNext` without
+  // `"type": "module"`, where any `import.meta` usage is a compile error.
+  // The ref hook itself runs unconditionally to keep the hook order
+  // identical in both modes.
+  const prevArgsRef = useRef<{args: any[]; hash: string} | undefined>(
+    undefined
+  );
+  if (!hash && process.env.NODE_ENV !== 'production') {
+    const prev = prevArgsRef.current;
+    const key = stableHash(args);
+    if (prev && prev.args !== args && prev.hash === key) {
+      // eslint-disable-next-line no-console -- the dev warning IS the feature
+      console.warn(
+        'useRun: the args reference changed but stableHash(args) is unchanged — ' +
+          'the effect will re-run on every render. Pass {hash: stableHash} ' +
+          'to compare the args structurally instead.'
+      );
+    }
+    prevArgsRef.current = {args, hash: key};
+  }
   // Register the AbortSignal → callContext bridge. `useRun` also accepts
   // plain (non-`useInjectable`) functions; `isInjectable` probes for that
   // up front instead of relying on `useInject` throwing before consuming

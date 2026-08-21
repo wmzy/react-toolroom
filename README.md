@@ -35,7 +35,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | Invalidation linked to mutations | `useInvalidate` | `invalidateQueries` | manual `mutate` | manual |
 | Infinite loading | ✗ | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
 | Keep previous data on key change | **default** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
-| DevTools | `subscribeInjectEvents` (observation API) | ✅ | community | ✗ |
+| DevTools | ✅ `InjectDevTools` panel (separate entry) | ✅ | community | ✗ |
 | SSR / hydration | ✗ | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
@@ -44,6 +44,21 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 ¹ Minified + compressed, entry point only. react-toolroom numbers are exact and enforced by CI; competitor numbers are approximate and vary by version — check their docs.
 
 **Choose react-toolroom** for small-to-mid applications, for embedding inside a component library, or when you only want to cherry-pick a few capabilities at minimal cost. **Choose TanStack Query** when you need complete server-state management — managed mutations with optimistic updates, cache-wide invalidation by query-key predicates, infinite queries, SSR hydration, DevTools panels.
+
+## Write your project's query hook once
+
+React Toolroom ships no configurable preset hook — there is no `useQuery(options)`. That is deliberate: an options surface that re-encodes what the atomic hooks already express directly costs as much to maintain as the composition itself, and it hides the mechanism at exactly the moment you need to see it. Instead, write your project's query hook **once**, then use it everywhere — modifying that composition later is no more work than editing a config object.
+
+The [`recipes/`](./recipes/) directory holds copy-and-customize templates to start from:
+
+| Template | Composition |
+| --- | --- |
+| [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | The base: `useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`. |
+| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`. |
+| [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | Adds `usePolling` on a fixed interval. |
+| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
+
+Copy the one closest to your screen, swap in your fetcher, and adjust the common customization points each file header calls out: `staleTime`, error reporting, the cache instance, and the return shape. One hook gives every screen a single loading/error contract — and exactly one place to change it.
 
 ## Quick start
 
@@ -104,6 +119,15 @@ function UserList() {
     </ul>
   );
 }
+```
+
+### DevTools: mount a call-trace panel
+
+```tsx
+import {InjectDevTools} from 'react-toolroom/devtools';
+
+// Dev-only, anywhere in the tree — separate entry, inline styles, zero deps.
+<InjectDevTools injectables={[fetchUsers]} />
 ```
 
 ## `memo` and the React Compiler
@@ -289,6 +313,71 @@ function UserList() {
 
 Unlike a stale-while-revalidate background refetch — which keeps serving the old value while refreshing — `useInvalidate` is a hard invalidation: it deletes the cache entry under the given args, then immediately re-runs the injectable with them, so subscribers see a fresh loading → result cycle instead of the pre-mutation data. The key linkage mirrors `useCache`: the same `cacheProvider` plus the same args tuple address the same entry (`useInvalidate(fetchUser, userCache)(userId)` drops what `useRun(fetchUser, [userId])` populated). The returned function is referentially stable and resolves to the fresh result, so `await` it in the mutation handler before closing your toast.
 
+### Optimistic update — `useOptimistic`
+
+```tsx
+function TodoList() {
+  const fetchTodos = useInjectable(fetchAllTodos);
+  const saveTodo = useInjectable((todo: Todo) => api.save(todo));
+
+  // Same injectable as the mutation itself: the snapshot derives from the
+  // current result and the call args.
+  useOptimistic(saveTodo, (draft, todo) => ({
+    ...draft,
+    items: [...draft.items, todo] // optimistic append
+  }));
+  const todos = useResult(fetchTodos);
+  useRun(fetchTodos, []);
+
+  const error = useError(saveTodo); // rollbacks still surface the error
+
+  async function handleAdd(todo: Todo) {
+    await saveTodo(todo); // resolves to the server truth
+  }
+
+  // …render `todos`, wire `handleAdd` to the input…
+}
+```
+
+`useOptimistic` is optimistic UI: each call of the wrapped injectable immediately publishes a snapshot computed by the updater from the current result and the call args, then lets the real call run — success overwrites the snapshot with the server truth through the normal result broadcast, failure rolls the store back to the pre-call value while the rejection keeps flowing (`useError` still catches it). Pair it with `useInvalidate` for the split that matters: optimistic snapshots for edits you can predict locally (toggles, appends, renames — instant feedback, zero extra requests), hard invalidation for data you cannot compute yourself (a mutation that reshapes a list rendered elsewhere). Return a **new** value from the updater: returning nothing keeps the previous value, so mutating `draft` in place neither re-renders nor leaves anything to roll back to.
+
+### SSR: dehydrate and hydrate
+
+```tsx
+const userCache = createMemoryCacheProvider<User, [string]>({cacheTime: 60000});
+
+// Server: prime the cache during prefetch, then serialize it into the HTML.
+userCache.set([id], await fetchUser(id));
+const payload = userCache.dehydrate(); // plain, JSON-safe object
+// e.g. `<script id="cache" type="application/json">${JSON.stringify(payload)}</script>`
+
+// Client: restore before the first render.
+userCache.hydrate(JSON.parse(document.getElementById('cache')!.textContent!));
+
+function User({id}: {id: string}) {
+  const fetchUser = useInjectable((signal) => api.user(id, signal));
+  const isStale = useCache(fetchUser, userCache, 5000);
+  useRun(fetchUser, [id]);
+  // …
+}
+```
+
+`dehydrate()` flattens the internal map into a plain `{[hashedKey]: [value, timestamp]}` object — `JSON.stringify`-safe, so it can travel through HTML, props, or a hand-rolled RPC. On the client, call `hydrate(payload)` **before** the first render: the first `useCache` lookup is then a cache hit and paints immediately; entries older than `staleTime` are revalidated in the background, exactly like any normal stale hit. `hydrate` **merges** — it never clears entries the client already holds — and timestamps survive the trip, so staleness math stays correct.
+
+### Prefix invalidation
+
+```tsx
+// Hash convention: namespace each entity's keys with a prefix.
+const cache = createMemoryCacheProvider<unknown, any[]>({
+  hash: (args) => 'user:' + stableHash(args)
+});
+
+// One line drops every user entry — and only user entries.
+cache.deletePrefix('user:');
+```
+
+`delete(key)` and `useInvalidate` target exactly one entry. `deletePrefix(prefix)` batches: it walks the hashed keys and removes every one starting with `prefix`. Pair it with a `hash` convention (`'user:' + stableHash(args)`) and a mutation that can affect many cached users at once — say a role change for a whole team — invalidates the entire `user:` namespace without touching `post:` or any other prefix.
+
 ### `useLoading` vs `useInitialLoading`
 
 ```tsx
@@ -357,6 +446,38 @@ function UserList() {
 
 When `page` changes, the previous page stays on screen until the new result lands: the shared result store is never reset between calls, and a per-call sequence ticket drops the result of any call older than the latest applied one — a slow request can't clobber the data a newer call already delivered. TanStack Query needs `placeholderData: keepPreviousData` and SWR needs `keepPreviousData: true` for this; here it is the default, no option required. Pair it with `useInitialLoading` for the very first load (full-page skeleton) and `useCache` to revisit a page instantly from cache while it revalidates in the background.
 
+### Infinite loading — `useInfinite`
+
+```tsx
+function ProjectFeed() {
+  // The fetcher takes a single pageParam and returns one page.
+  const fetchPages = useInjectable((cursor?: number) => api.projects(cursor));
+
+  const {pages, fetchNextPage, isFetchingNextPage, hasNextPage} = useInfinite(
+    fetchPages,
+    {getNextPageParam: (lastPage) => lastPage.nextCursor}
+  );
+  useRun(fetchPages, [undefined]); // first page, like any other query
+
+  return (
+    <>
+      {pages.flatMap((page) => page.items).map((p) => (
+        <Card key={p.id} item={p} />
+      ))}
+      <button
+        type='button'
+        disabled={!hasNextPage || isFetchingNextPage}
+        onClick={() => void fetchNextPage()}
+      >
+        {isFetchingNextPage ? 'Loading…' : hasNextPage ? 'Load more' : 'End'}
+      </button>
+    </>
+  );
+}
+```
+
+The hook aggregates the fetched pages into an array and publishes that array to the injectable's result store; read pages from its return value instead of `useResult` (the store holds the whole array, not a single page). The returned shape is a subset of TanStack Query's `useInfiniteQuery` — `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` with the same meanings — minus everything that presupposes a query-client. Only calls issued through `fetchNextPage()` append; anything else (a `useRun` rerun, a manual call, a focus revalidation) resets `pages` to that single result, so a refetch naturally restarts the list. `getNextPageParam(lastPage, allPages)` returning `undefined` marks the end (`hasNextPage` turns `false`).
+
 ### Observe every call — `subscribeInjectEvents`
 
 ```tsx
@@ -403,15 +524,27 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success). |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
-| `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). |
+| `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). Preset shorthand: `useRetry(fn, {retries = 3, backoff = 'exponential'})` — `'exponential'` waits 1s/2s/4s…, `'linear'` 1s/2s/3s…, or pass `(attempt) => ms` for custom delays; both signatures share one mechanism. |
 | `useRun(fn, args, options?)` | Run `fn(...args)` on mount and whenever `args` change. `{signal: true}` appends an `AbortSignal` as the last argument and aborts it on change/unmount. `{hash}` (e.g. `stableHash`) replaces the reference comparison with a structural key, so unstable references in `args` only re-run on real changes — the same key semantics as `useDedup`/`useCache`. Plain (non-injectable) functions are detected via `isInjectable` and run as-is. |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR caching: cache hits broadcast immediately; stale entries revalidate in the background. Returns whether the current data is stale — a broadcast flag shared by every `useCache` consumer of the injectable, updating together (last verdict wins). |
 | `useInvalidate(fn, cacheProvider)` | Returns a stable `(...args) => Promise<R>` that deletes the cache entry under `args` and immediately re-runs the injectable with them — hard invalidation for mutation success paths. Keys link to `useCache` via the same provider and args tuple. |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`; idle-garbage-collects entries after `cacheTime` once unused. |
+| `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
+| `useInfinite(fn, {getNextPageParam})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` — a subset of TanStack's `useInfiniteQuery`. Only `fetchNextPage()` calls append; any direct call (e.g. a `useRun` rerun) resets `pages`. |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges) and `deletePrefix` (batch invalidation by hashed-key prefix); idle-garbage-collects entries after `cacheTime` once unused. |
 | `useDedup(fn, {hash = stableHash}?)` | Concurrent calls with the same key share one in-flight promise; the entry is dropped on settle, so failures are retryable. |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | Call `fn(...args)` every `interval` ms; skips ticks while the previous call is pending; pauses while the document is hidden unless `whenHidden`. Changing `interval` restarts the timer. `args` land on the same `useCache`/`useDedup` key as `useRun(fn, args)` — pass the keyed tuple when `useRun` uses one. |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | Refetch on window focus and on `visibilitychange` back to visible, throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. |
 | `stableHash(value)` | Re-exported here for convenience — see the core table above. |
+
+### DevTools — `react-toolroom/devtools`
+
+Separate entry: importing it never adds a byte to the core or async bundles.
+
+| API | Description |
+| --- | --- |
+| `<InjectDevTools injectables, limit?, title?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. Pass a referentially stable `injectables` array (module constant or `useMemo`). |
+| `useInjectLog(fn, limit?)` | The headless engine behind the panel: returns `{events, clear}` carrying the same `InjectLogEvent[]` — build your own panel UI on it. |
+| `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}` — `duration` covers the whole onion chain below the observer; `name` is `fn.name`, and shows `'anonymous'` for the unnamed wrappers `useInjectable` returns. |
 
 For custom wrappers and cache providers, the entries also export the types you need: `react-toolroom/async` ships `AsyncFunc`, `Func`, `R<AF>`, `CacheProvider<R, Args>`, and `CacheResult<R>`; the core entry ships `Func`.
 
@@ -426,7 +559,7 @@ For custom wrappers and cache providers, the entries also export the types you n
 
 ## Demos
 
-See [demos](./demos/) for runnable examples: `memo`, request deduplication, polling, focus revalidation, SWR caching, cancellation via `AbortSignal`, and cross-component injection (onion model).
+See [demos](./demos/) for runnable examples: `memo`, request deduplication, polling, focus revalidation, SWR caching, cancellation via `AbortSignal`, and cross-component injection (onion model). For copy-and-customize query-hook templates, see [recipes](./recipes/).
 
 ## Documentation
 

@@ -113,6 +113,18 @@ export function nextResultSeq(store: ResultStore): number {
 }
 
 /**
+ * Returns the latest ticket already applied to the store. Emitting with
+ * this value overwrites the current result WITHOUT raising the sequencing
+ * watermark, so a call that reserved a newer ticket with
+ * {@link nextResultSeq} still lands afterwards — which is exactly what an
+ * optimistic snapshot needs: it must never block the real result of its
+ * own call.
+ */
+export function currentResultSeq(store: ResultStore): number {
+  return seqOf(store).applied;
+}
+
+/**
  * Stores a successful result and broadcasts it to every subscriber. A
  * result whose ticket is older than the latest applied one is dropped, so a
  * slow call can never clobber the result of a newer call.

@@ -20,6 +20,8 @@ import {
   useInject,
   usePolling,
   useFocusRevalidate,
+  useOptimistic,
+  useInfinite,
   isInjectable,
   subscribeInjectEvents
 } from '../src/async';
@@ -626,5 +628,356 @@ describe('subscribeInjectEvents', () => {
     expect(settles[0].duration).toBeGreaterThanOrEqual(50);
 
     unsubscribe();
+  });
+});
+
+describe('useOptimistic', () => {
+  it('should publish the optimistic snapshot and let the real result overwrite it', async () => {
+    const resolvers: (() => void)[] = [];
+    const saveName = vi.fn(
+      (name: string) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`saved:${name}`))
+        )
+    );
+
+    function TestComponent() {
+      const injectable = useInjectable(saveName);
+      useOptimistic(
+        injectable,
+        (draft, name) => `saving:${name} (was ${draft ?? 'none'})`
+      );
+      const result = useResult(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, result ?? 'nothing'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void injectable('alice')},
+          'save'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    expect(screen.getByText('nothing')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('save'));
+    });
+    // the optimistic snapshot is on display before the promise settles
+    expect(screen.getByText('saving:alice (was none)')).toBeDefined();
+    expect(saveName).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvers[0]!();
+    });
+    // the real result overwrote the optimistic snapshot
+    expect(screen.getByText('saved:alice')).toBeDefined();
+  });
+
+  it('should roll back to the pre-call snapshot on failure while the error keeps flowing', async () => {
+    const resolvers: (() => void)[] = [];
+    const saveName = (name: string) =>
+      new Promise<string>((resolve, reject) =>
+        resolvers.push(() =>
+          name === 'bob' ? resolve(`saved:${name}`) : reject(new Error('boom'))
+        )
+      );
+
+    function TestComponent() {
+      const injectable = useInjectable(saveName);
+      useOptimistic(
+        injectable,
+        (draft, name) => `saving:${name} (was ${draft ?? 'none'})`
+      );
+      const result = useResult(injectable);
+      const error = useError<Error>(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, result ?? 'nothing'),
+        createElement('span', null, error ? error.message : 'no error'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void injectable('bob')},
+          'ok'
+        ),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () => injectable('alice').catch(() => {})
+          },
+          'fail'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    // establish the pre-call snapshot with a successful save
+    await act(async () => {
+      fireEvent.click(screen.getByText('ok'));
+    });
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('saved:bob')).toBeDefined();
+
+    // the failing call first shows its optimistic snapshot…
+    await act(async () => {
+      fireEvent.click(screen.getByText('fail'));
+    });
+    expect(screen.getByText('saving:alice (was saved:bob)')).toBeDefined();
+
+    // …then rolls back to the pre-call snapshot, and useError still fired
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('saved:bob')).toBeDefined();
+    expect(screen.getByText('boom')).toBeDefined();
+  });
+});
+
+describe('useInfinite', () => {
+  const nextCursor = (last: string, all: string[]) =>
+    all.length < 2 ? Number(last.slice(1)) + 1 : undefined;
+
+  it('should aggregate pages, expose the paging flags and stop at undefined', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage, isFetchingNextPage, hasNextPage} =
+        useInfinite(fetchPages, {getNextPageParam: nextCursor});
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `hasNext:${String(hasNextPage)}`),
+        createElement('span', null, `fetching:${String(isFetchingNextPage)}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    // first page in flight: no pages yet, and nothing to continue from
+    expect(screen.getByText('pages:')).toBeDefined();
+
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p0')).toBeDefined();
+    expect(screen.getByText('hasNext:true')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1]).toEqual([1]);
+    expect(screen.getByText('fetching:true')).toBeDefined();
+    expect(screen.getByText('pages:p0')).toBeDefined();
+
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    expect(screen.getByText('hasNext:false')).toBeDefined();
+    expect(screen.getByText('fetching:false')).toBeDefined();
+  });
+
+  it('should reset pages when the fetcher is re-run directly', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = (cursor: number) =>
+      new Promise<string>((resolve) =>
+        resolvers.push(() => resolve(`p${cursor}`))
+      );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor
+      });
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        ),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPages(0)},
+          'restart'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+
+    // a direct call (what a useRun rerun does) resets the aggregation
+    await act(async () => {
+      fireEvent.click(screen.getByText('restart'));
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p0')).toBeDefined();
+  });
+});
+
+describe('useRetry preset options', () => {
+  it('should retry up to `retries` times and then resolve with success', async () => {
+    let calls = 0;
+    const flaky = vi.fn(
+      () =>
+        new Promise<string>((resolve, reject) => {
+          calls++;
+          if (calls < 3) reject(new Error(`fail ${calls}`));
+          else resolve('ok');
+        })
+    );
+
+    function TestComponent() {
+      const injectable = useInjectable(flaky);
+      useRetry(injectable, {retries: 2, backoff: () => 0});
+      const result = useResult(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, result ?? 'nothing'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void injectable()},
+          'run'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      fireEvent.click(screen.getByText('run'));
+      // let the zero-backoff retry microtask chain settle
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    // 1 initial attempt + 2 retries
+    expect(flaky).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('ok')).toBeDefined();
+  });
+
+  it('should stop after `retries` retries and surface the error', async () => {
+    const flaky = vi.fn(async () => {
+      throw new Error('always fails');
+    });
+
+    function TestComponent() {
+      const injectable = useInjectable(flaky);
+      useRetry(injectable, {retries: 1, backoff: () => 0});
+      const error = useError<Error>(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, error ? error.message : 'no error'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => injectable().catch(() => {})},
+          'run'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      fireEvent.click(screen.getByText('run'));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    // 1 initial attempt + 1 retry, then the rejection wins
+    expect(flaky).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('always fails')).toBeDefined();
+  });
+});
+
+describe('useRun inline-args dev warning', () => {
+  function TestComponent({id}: {id: number}) {
+    const injectable = useInjectable(async (query: {id: number}) => query.id);
+    // a fresh object literal on every render: the classic footgun
+    useRun(injectable, [{id}]);
+    return null;
+  }
+
+  it('should warn when the args reference changed but stableHash is equal', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const {rerender} = render(createElement(TestComponent, {id: 1}));
+      expect(warn).not.toHaveBeenCalled();
+      // same structure, new reference → the effect would re-run for nothing
+      rerender(createElement(TestComponent, {id: 1}));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![0]).toContain('stableHash');
+      // a real change is never warned about
+      rerender(createElement(TestComponent, {id: 2}));
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('should stay silent when the hash option is in use', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      function Hashed() {
+        const injectable = useInjectable(
+          async (query: {id: number}) => query.id
+        );
+        useRun(injectable, [{id: 1}], {hash: (a) => JSON.stringify(a)});
+        return null;
+      }
+      const {rerender} = render(createElement(Hashed));
+      rerender(createElement(Hashed));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('should stay silent in production mode', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // The guard reads process.env.NODE_ENV live, exactly what bundlers
+    // replace statically in real production builds.
+    vi.stubEnv('NODE_ENV', 'production');
+    try {
+      const {rerender} = render(createElement(TestComponent, {id: 1}));
+      rerender(createElement(TestComponent, {id: 1}));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      warn.mockRestore();
+    }
   });
 });

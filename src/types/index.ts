@@ -15,4 +15,14 @@ export type CacheProvider<T, K extends any[]> = {
   delete: (k: K) => void;
   clear: () => void;
   use: () => () => void;
+  // The members below are optional so existing custom providers (localStorage,
+  // IndexedDB, no-op stubs, …) keep compiling and stay semantically valid —
+  // only the memory provider ships them. Callers must feature-detect
+  // (`if (provider.dehydrate) …`) instead of assuming they exist.
+  /** Serializes every entry into a JSON-safe plain object, for SSR transport. */
+  dehydrate?: () => Record<string, [T, number]>;
+  /** Merges entries produced by `dehydrate` back in; never clears existing ones. */
+  hydrate?: (data: Record<string, [T, number]>) => void;
+  /** Deletes every entry whose hashed key starts with `prefix`. */
+  deletePrefix?: (prefix: string) => void;
 };

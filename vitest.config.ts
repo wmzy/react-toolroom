@@ -17,6 +17,12 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      // Map the published entry names to source so recipe templates — which
+      // import 'react-toolroom/async' exactly as a user project would — are
+      // drift-tested against src/ instead of a stale dist build. Mirrors the
+      // same mappings in tsconfig.json "paths". More specific key first:
+      // string aliases also match their prefix.
+      'react-toolroom/async': path.resolve(__dirname, './src/async/index.ts'),
       '@@': path.resolve(__dirname, './src'),
       '@': path.resolve(__dirname, './demos')
     }

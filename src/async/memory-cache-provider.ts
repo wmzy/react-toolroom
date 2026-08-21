@@ -14,7 +14,15 @@ import {noop, stableHash} from '@@/util';
  * @template T - The type of the value to be stored in the cache.
  * @template K - The type of the key used to retrieve the value from the cache.
  * @returns {CacheProvider<T, K>} Returns an object with methods for getting, setting,
- * deleting, clearing, and managing the cache expiration.
+ * deleting, clearing, and managing the cache expiration, plus `dehydrate`/`hydrate`
+ * for serializing the cache across an SSR boundary and `deletePrefix` for batch
+ * invalidation by hashed-key prefix.
+ * @example
+ * ```tsx
+ * const userCache = createMemoryCacheProvider<User, any[]>({cacheTime: 10000});
+ * userCache.set([1], alice);
+ * userCache.get([1]); // [alice, <timestamp>]
+ * ```
  */
 export default function create<T, K extends any[]>({
   cacheTime = Infinity,
@@ -57,6 +65,29 @@ export default function create<T, K extends any[]>({
           }, cacheTime);
         }
       };
+    },
+    // SSR transport: `Object.fromEntries` flattens the Map into a plain object
+    // whose keys are the hashed strings and whose values are [value, timestamp]
+    // tuples — directly `JSON.stringify`-able for embedding in HTML/props.
+    dehydrate() {
+      return Object.fromEntries(map);
+    },
+    // Merge semantics on purpose: hydrating must never wipe entries the client
+    // has already populated (e.g. from an earlier micro-task), so we write each
+    // tuple as-is, preserving the server timestamps that staleness checks use.
+    hydrate(data) {
+      for (const k in data) {
+        map.set(k, data[k]);
+      }
+    },
+    // Deleting while iterating a Map is safe per spec (visited keys removed
+    // earlier are skipped, later ones still seen), so no intermediate array.
+    deletePrefix(prefix) {
+      for (const k of map.keys()) {
+        if (k.startsWith(prefix)) {
+          map.delete(k);
+        }
+      }
     }
   };
 }

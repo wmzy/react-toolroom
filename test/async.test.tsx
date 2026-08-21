@@ -512,6 +512,65 @@ describe('async hooks', () => {
 
       vi.useRealTimers();
     });
+
+    it('should round-trip dehydrate and hydrate with timestamps preserved', async () => {
+      const hash = (key: [string]) => JSON.stringify(key);
+      const server = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash
+      });
+
+      server.set(['a'], 'value a');
+      const [, timestamp] = (await server.get(['a']))!;
+
+      // Transport via JSON exactly like shipping cache state from server to
+      // client — the payload must stay a plain, JSON-serializable object.
+      const payload = JSON.parse(JSON.stringify(server.dehydrate!()));
+
+      const client = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash
+      });
+      client.hydrate!(payload);
+
+      expect(await client.get(['a'])).toEqual(['value a', timestamp]);
+    });
+
+    it('should delete only entries matching the prefix', async () => {
+      const provider = createMemoryCacheProvider<string, [string, string]>({
+        cacheTime: 60000,
+        hash: ([scope, id]) => scope + ':' + id
+      });
+
+      provider.set(['user', '1'], 'user 1');
+      provider.set(['user', '2'], 'user 2');
+      provider.set(['post', '1'], 'post 1');
+
+      provider.deletePrefix!('user:');
+
+      expect(await provider.get(['user', '1'])).toBeUndefined();
+      expect(await provider.get(['user', '2'])).toBeUndefined();
+      expect(await provider.get(['post', '1'])).toEqual([
+        'post 1',
+        expect.any(Number)
+      ]);
+    });
+
+    it('should merge hydrate data without clearing existing entries', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+
+      provider.set(['local'], 'local value');
+      provider.hydrate!({[JSON.stringify(['server'])]: ['server value', 123]});
+
+      expect(await provider.get(['server'])).toEqual(['server value', 123]);
+      expect(await provider.get(['local'])).toEqual([
+        'local value',
+        expect.any(Number)
+      ]);
+    });
   });
 
   describe('useResult', () => {

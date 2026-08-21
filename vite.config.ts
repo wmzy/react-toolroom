@@ -15,6 +15,10 @@ export default defineConfig({
         replacement: `${path.join(__dirname, 'src/async/index.ts')}`
       },
       {
+        find: 'react-toolroom/devtools',
+        replacement: `${path.join(__dirname, 'src/devtools/index.tsx')}`
+      },
+      {
         find: 'react-toolroom',
         replacement: `${path.join(__dirname, 'src/index.ts')}`
       },
@@ -50,7 +54,8 @@ export default defineConfig({
           name: 'react-toolroom',
           entry: {
             index: 'src/index.ts',
-            async: 'src/async/index.ts'
+            async: 'src/async/index.ts',
+            devtools: 'src/devtools/index.tsx'
           },
           formats: ['es']
         },

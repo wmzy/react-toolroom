@@ -12,6 +12,11 @@
       "types": "./dist/types/async/index.d.ts",
       "import": "./dist/async.mjs",
       "default": "./dist/async.mjs"
+    },
+    "./devtools": {
+      "types": "./dist/types/devtools/index.d.ts",
+      "import": "./dist/devtools.mjs",
+      "default": "./dist/devtools.mjs"
     }
   },
   "files": [
