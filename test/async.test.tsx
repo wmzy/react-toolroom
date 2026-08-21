@@ -1,6 +1,6 @@
 import {describe, it, expect, vi} from 'vitest';
 import {render, screen, waitFor, act, fireEvent} from '@testing-library/react';
-import {useState, useEffect} from 'react';
+import {memo, StrictMode, useState, useEffect} from 'react';
 import {
   useRun,
   useInjectable,
@@ -69,6 +69,166 @@ describe('async hooks', () => {
       await waitFor(() => {
         expect(screen.getByText('result 1')).toBeDefined();
       });
+    });
+
+    it('should not duplicate wrapper when injecting component re-renders', async () => {
+      const applied = vi.fn();
+      let holder!: (...args: any[]) => Promise<any>;
+      let bump!: () => void;
+
+      function Injector({fn}: {fn: any}) {
+        const [, setN] = useState(0);
+        bump = () => setN((n) => n + 1);
+        useInject(
+          fn,
+          (f: any) =>
+            ((...args: any[]) => {
+              applied();
+              return f(...args);
+            }) as any
+        );
+        return null;
+      }
+
+      function Owner() {
+        const f = useInjectable(async () => 'result');
+        holder = f;
+        return <Injector fn={f} />;
+      }
+
+      render(<Owner />);
+      // Injector 独自重渲染两次（Owner 不重渲染，注入列表不会被重置）
+      act(() => bump());
+      act(() => bump());
+      await act(async () => {
+        await holder();
+      });
+      expect(applied).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep injections when owner re-renders and injector is memoized', async () => {
+      const applied = vi.fn();
+      let holder!: (...args: any[]) => Promise<any>;
+
+      const Injector = memo(function Injector({fn}: {fn: any}) {
+        useInject(
+          fn,
+          (f: any) =>
+            ((...args: any[]) => {
+              applied();
+              return f(...args);
+            }) as any
+        );
+        return null;
+      });
+
+      function Owner() {
+        const f = useInjectable(async () => 'result');
+        holder = f;
+        const [, setN] = useState(0);
+        return (
+          <div>
+            <Injector fn={f} />
+            <button
+              type='button'
+              data-testid='rerender'
+              onClick={() => setN((n) => n + 1)}
+            />
+          </div>
+        );
+      }
+
+      render(<Owner />);
+      // Owner 重渲染会重置注入列表，但 memo 的 Injector 被跳过不会重新注册
+      fireEvent.click(screen.getByTestId('rerender'));
+      await act(async () => {
+        await holder();
+      });
+      expect(applied).toHaveBeenCalledTimes(1);
+    });
+
+    it('should remove wrapper when injecting component unmounts', async () => {
+      const applied = vi.fn();
+      const holderRef: {
+        current?: (...args: any[]) => Promise<any>;
+      } = {};
+      let toggle!: () => void;
+
+      function Injector() {
+        // MemoOwner 先于本组件渲染，此处 holderRef.current 必已赋值
+        useInject(
+          holderRef.current as any,
+          (f: any) =>
+            ((...args: any[]) => {
+              applied();
+              return f(...args);
+            }) as any
+        );
+        return null;
+      }
+
+      const MemoOwner = memo(function Owner() {
+        holderRef.current = useInjectable(async () => 'result');
+        return null;
+      });
+
+      function App() {
+        const [show, setS] = useState(true);
+        toggle = () => setS((v) => !v);
+        return (
+          <>
+            <MemoOwner />
+            {show && <Injector />}
+          </>
+        );
+      }
+
+      render(<App />);
+      const holder = holderRef.current!;
+      await act(async () => {
+        await holder();
+      });
+      expect(applied).toHaveBeenCalledTimes(1);
+      // 卸载 Injector 时 App 重渲染，但 memo 的 Owner 不重渲染（无重置掩蔽），
+      // 注入组件卸载后其包装器不应继续生效
+      act(() => toggle());
+      await act(async () => {
+        await holder();
+      });
+      expect(applied).toHaveBeenCalledTimes(1);
+    });
+
+    it('should apply wrapper exactly once under StrictMode', async () => {
+      const applied = vi.fn();
+      let holder!: (...args: any[]) => Promise<any>;
+
+      function Owner() {
+        const f = useInjectable(async () => 'result');
+        holder = f;
+        return <Injector fn={f} />;
+      }
+
+      function Injector({fn}: {fn: any}) {
+        useInject(
+          fn,
+          (f: any) =>
+            ((...args: any[]) => {
+              applied();
+              return f(...args);
+            }) as any
+        );
+        return null;
+      }
+
+      render(
+        <StrictMode>
+          <Owner />
+        </StrictMode>
+      );
+      await act(async () => {
+        await holder();
+      });
+      expect(applied).toHaveBeenCalledTimes(1);
     });
   });
 
