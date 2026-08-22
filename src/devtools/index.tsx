@@ -134,7 +134,40 @@ export type InjectDevToolsProps = {
   limit?: number;
   /** Panel heading, default `'InjectDevTools'`. */
   title?: string;
+  /** Caches (e.g. from `createMemoryCacheProvider`) to observe. Same
+   * identity caveat as `injectables`; providers without the optional
+   * `snapshot` member are silently skipped. */
+  caches?: readonly ObservableCache[];
 };
+
+/**
+ * The optional observation surface of a cache provider — feature-detected
+ * by the panel, implemented by `createMemoryCacheProvider`.
+ */
+export type ObservableCache = {
+  /** Shallow copy of every entry as `{key, value, cachedAt}`. */
+  snapshot?: () => {key: string; value: any; cachedAt: number}[];
+  /** Fires after any entry mutation; returns an unsubscribe. */
+  subscribe?: (listener: () => void) => () => void;
+};
+
+/**
+ * Re-renders the panel whenever any observed cache reports a mutation:
+ * subscribes once per cache (identity-keyed like `injectables`) and bumps
+ * a counter; the render pass then pulls fresh `snapshot()` data.
+ */
+function useCacheChanges(caches?: readonly ObservableCache[]) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!caches) return;
+    const unsubscribes = caches
+      .map((cache) => cache.subscribe?.(() => setTick((tick) => tick + 1)))
+      .filter((unsubscribe): unsubscribe is () => void => !!unsubscribe);
+    return () => {
+      unsubscribes.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [caches]);
+}
 
 const styles: Record<string, CSSProperties> = {
   panel: {
@@ -188,11 +221,14 @@ const styles: Record<string, CSSProperties> = {
  * A minimal call-trace panel for the injection system: it subscribes every
  * passed injectable via `subscribeInjectEvents` and renders the last
  * `limit` settle events — time, function name, status, duration and an
- * args/result summary — as an inline-styled table. Mount it on a dev-only
- * render path; it unsubscribes on unmount and stays out of production
- * bundles unless imported.
+ * args/result summary — as an inline-styled table. Each entry of the
+ * optional `caches` prop that implements `snapshot` additionally renders
+ * a cache-browsing table (key, age, value summary) that refreshes via the
+ * provider's `subscribe`. Mount it on a dev-only render path; it
+ * unsubscribes on unmount and stays out of production bundles unless
+ * imported.
  *
- * @param {InjectDevToolsProps} props - `injectables`, `limit`, `title`.
+ * @param {InjectDevToolsProps} props - `injectables`, `limit`, `title`, `caches`.
  * @example
  * ```tsx
  * import {InjectDevTools} from 'react-toolroom/devtools';
@@ -206,7 +242,9 @@ const styles: Record<string, CSSProperties> = {
  *   return (
  *     <>
  *       <UserTable users={users} />
- *       {import.meta.env.DEV && <InjectDevTools injectables={watched} />}
+ *       {import.meta.env.DEV && (
+ *         <InjectDevTools injectables={watched} caches={[userCache]} />
+ *       )}
  *     </>
  *   );
  * }
@@ -215,9 +253,11 @@ const styles: Record<string, CSSProperties> = {
 export function InjectDevTools({
   injectables,
   limit = 50,
-  title = 'InjectDevTools'
+  title = 'InjectDevTools',
+  caches
 }: InjectDevToolsProps) {
   const {events, clear} = useInjectEvents(injectables, limit);
+  useCacheChanges(caches);
 
   return (
     <section aria-label={title} style={styles.panel}>
@@ -265,6 +305,28 @@ export function InjectDevTools({
           </tbody>
         </table>
       )}
+      {caches?.map((cache, index) =>
+        cache.snapshot ? (
+          <table key={index} style={{...styles.table, marginTop: 6}}>
+            <thead>
+              <tr>
+                <th style={styles.th}>Key</th>
+                <th style={styles.th}>Age</th>
+                <th style={styles.th}>Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {cache.snapshot().map((entry) => (
+                <tr key={entry.key}>
+                  <td style={styles.td}>{entry.key}</td>
+                  <td style={styles.td}>{formatAge(entry.cachedAt)}</td>
+                  <td style={styles.td}>{summarize(entry.value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : null
+      )}
     </section>
   );
 }
@@ -299,4 +361,10 @@ function formatTime(at: number): string {
 
 function formatDuration(ms: number): string {
   return `${Math.round(ms)}ms`;
+}
+
+// Whole seconds since the entry was cached — cache browsing granularity,
+// sub-second jitter would just flicker.
+function formatAge(cachedAt: number): string {
+  return `${Math.round((Date.now() - cachedAt) / 1000)}s`;
 }

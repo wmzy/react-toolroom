@@ -79,14 +79,18 @@ import {
   isInjectable
 } from './inject';
 import {
+  ErrorStore,
   LoadingStore,
   ResultStore,
+  emitError,
   emitLoading,
   emitResult,
   emitStale,
+  getErrorStore,
   getLoadingStore,
   getResultStore,
   getStaleStore,
+  nextErrorSeq,
   nextResultSeq,
   useStoreValue
 } from './base';
@@ -432,43 +436,63 @@ export function useFinally<AF extends AsyncFunc>(
 }
 
 /**
+ * Injects a wrapper that publishes every failure and success of the
+ * injectable on its shared error store and returns that store.
+ */
+function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
+  const store = getErrorStore(injectableFn);
+  useInject(
+    injectableFn,
+    (f: AF) =>
+      ((...args) => {
+        const seq = nextErrorSeq(store);
+        return f(...args)
+          .then(thru(() => emitError(store, undefined, seq)))
+          .catch(thruError((e: any) => emitError(store, e, seq)));
+      }) as AF
+  );
+  return store;
+}
+
+/**
  * A hook that accepts an async function and returns any errors thrown.
+ *
+ * The error lives on a store shared by every consumer of the injectable
+ * (injectable-level broadcast, like {@link useResult}): all subscribed
+ * components update together, components mounting after a call failed
+ * start from the shared error, and the failure of a slow old call never
+ * clobbers the success of a newer call. A success clears the error.
  *
  * @param {AsyncFunc} injectableFn - The async function to be executed.
  * @return {Error} The error thrown by the async function.
  */
 export function useError<AF extends AsyncFunc, E extends Error>(
   injectableFn: AF
-) {
-  const [error, setError] = useState<E>();
-  useInject(
-    injectableFn,
-    (f: AF) =>
-      ((...args) =>
-        f(...args)
-          .then(thru(() => setError(undefined)))
-          .catch(thruError<E>(setError))) as AF
+): E | undefined {
+  const store = useErrorWrapper(injectableFn);
+  // Plain store field swapped in place by emitError — a stable snapshot.
+  return useStoreValue(
+    store,
+    useCallback(() => store.error, [store])
   );
-  return error;
 }
 
 /**
  * Returns a count of the number of times the provided async function has failed.
  *
+ * The count lives on the shared error store of the injectable, so every
+ * consumer reads the same tally and components mounting late start from
+ * its current value. A success resets it to 0.
+ *
  * @param {AF} injectableFn - the async function to inject and count failures of
  * @return {number} the count of failures
  */
 export function useFailureCount<AF extends AsyncFunc>(injectableFn: AF) {
-  const [count, setCount] = useState(0);
-  useInject(
-    injectableFn,
-    (f: AF) =>
-      ((...args) =>
-        f(...args)
-          .then(thru(() => setCount(0)))
-          .catch(thruError(() => setCount((n) => n + 1)))) as AF
+  const store = useErrorWrapper(injectableFn);
+  return useStoreValue(
+    store,
+    useCallback(() => store.failureCount, [store])
   );
-  return count;
 }
 
 // Base delay (ms) of the preset backoff strategies of useRetry.
@@ -769,7 +793,11 @@ export function useRun<F extends Func>(
   );
 }
 
-export {usePolling, useFocusRevalidate} from './polling';
+export {
+  usePolling,
+  useFocusRevalidate,
+  useReconnectRevalidate
+} from './polling';
 
 export {useInjectable, createMemoryCacheProvider};
 export {stableHash, isAbortSignal} from '@@/util';

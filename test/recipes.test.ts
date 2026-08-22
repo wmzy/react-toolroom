@@ -10,13 +10,15 @@
  * timing through the mocks.
  */
 
-import {describe, it, expect, vi, beforeEach} from 'vitest';
+import {describe, it, expect, vi, beforeEach, afterEach} from 'vitest';
 import {act, fireEvent, render, screen, waitFor} from '@testing-library/react';
 import {createElement, useState} from 'react';
 import {useProjectQuery} from '../recipes/useProjectQuery';
 import {useProjectSWRQuery} from '../recipes/useProjectSWRQuery';
 import {useProjectPollingQuery} from '../recipes/useProjectPollingQuery';
 import {useProjectPaginatedQuery} from '../recipes/useProjectPaginatedQuery';
+import {useProjectMutation} from '../recipes/useProjectMutation';
+import {createLocalCacheProvider} from '../recipes/createLocalCacheProvider';
 
 const {fetchListMock, fetchTickerMock} = vi.hoisted(() => ({
   fetchListMock: vi.fn(),
@@ -208,5 +210,172 @@ describe('recipes/useProjectPaginatedQuery', () => {
     expect(screen.getByText('user 11')).toBeTruthy();
     expect(screen.queryByText('user 1')).toBeNull();
     expect(screen.queryByText('refreshing')).toBeNull();
+  });
+});
+
+// The mutation template (recipes/useProjectMutation.ts): the hook is
+// generic over the wrapped mutation, so these tests drive it with inline
+// functions instead of a mocked service module.
+describe('recipes/useProjectMutation', () => {
+  function MutationView({
+    save,
+    onSuccess,
+    onError
+  }: {
+    save: (name: string) => Promise<string>;
+    onSuccess?: (...args: any[]) => void;
+    onError?: (...args: any[]) => void;
+  }) {
+    const [mutate, {isMutating, error, failureCount}] = useProjectMutation(
+      save,
+      {onSuccess, onError}
+    );
+    return createElement(
+      'div',
+      null,
+      createElement('p', null, isMutating ? 'mutating' : 'idle'),
+      ...(error ? [createElement('p', null, error.message)] : []),
+      createElement('p', null, `failures ${failureCount}`),
+      // Fire-and-forget call: rejections propagate out of `mutate`, so
+      // callers that read `error` instead of awaiting append a catch.
+      createElement(
+        'button',
+        {type: 'button', onClick: () => mutate('alpha').catch(() => {})},
+        'rename'
+      )
+    );
+  }
+
+  it('should flip isMutating around the call and fire onSuccess with result and args', async () => {
+    const onSuccess = vi.fn();
+    const first = deferred<string>();
+
+    render(
+      createElement(MutationView, {
+        save: () => first.promise,
+        onSuccess
+      })
+    );
+    expect(screen.getByText('idle')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('mutating')).toBeTruthy();
+
+    await act(async () => {
+      first.resolve('saved');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+    expect(screen.queryByText('mutating')).toBeNull();
+    expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha');
+    expect(screen.getByText('failures 0')).toBeTruthy();
+  });
+
+  it('should surface the error, count failures, then reset both on success', async () => {
+    const onSuccess = vi.fn();
+    const onError = vi.fn();
+    let fail = true;
+    const save = (name: string) =>
+      fail ? Promise.reject(new Error('boom')) : Promise.resolve('saved');
+
+    render(createElement(MutationView, {save, onSuccess, onError}));
+
+    fireEvent.click(screen.getByText('rename'));
+    await waitFor(() => expect(screen.getByText('boom')).toBeTruthy());
+    expect(screen.getByText('failures 1')).toBeTruthy();
+    expect(screen.getByText('idle')).toBeTruthy(); // not stuck mutating
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), 'alpha');
+    expect(onSuccess).not.toHaveBeenCalled();
+
+    fail = false;
+    fireEvent.click(screen.getByText('rename'));
+    await waitFor(() =>
+      expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha')
+    );
+    // a success clears the shared error and resets the failure tally
+    await waitFor(() => {
+      expect(screen.queryByText('boom')).toBeNull();
+      expect(screen.getByText('failures 0')).toBeTruthy();
+    });
+  });
+});
+
+// The localStorage cache provider factory
+// (recipes/createLocalCacheProvider.ts). test/setup.ts replaces the jsdom
+// localStorage with no-op vi.fn()s, so this suite swaps in a real
+// in-memory Storage on the global for the persistence path; write failures
+// are simulated by making that instance's setItem throw (quota/privacy).
+describe('recipes/createLocalCacheProvider', () => {
+  // A minimal spec-compliant Storage, so the persistence path runs against
+  // a store that actually reads back what was written.
+  function memoryStorage(): Storage {
+    const map = new Map<string, string>();
+    return {
+      get length() {
+        return map.size;
+      },
+      clear: () => map.clear(),
+      getItem: (k) => (map.has(k) ? map.get(k)! : null),
+      key: (i) => [...map.keys()][i] ?? null,
+      removeItem: (k) => void map.delete(k),
+      setItem: (k, v) => void map.set(k, String(v))
+    } as Storage;
+  }
+
+  const setupStorage = globalThis.localStorage;
+  let storage: Storage;
+
+  beforeEach(() => {
+    storage = memoryStorage();
+    globalThis.localStorage = storage;
+  });
+
+  afterEach(() => {
+    globalThis.localStorage = setupStorage;
+    vi.restoreAllMocks();
+  });
+
+  it('should refill a fresh provider from localStorage with timestamps intact', () => {
+    const a = createLocalCacheProvider<string, any[]>({key: 'rt:test:refill'});
+    a.set(['x'], 'hello');
+    const stored = a.get(['x']);
+    expect(storage.getItem('rt:test:refill')).toBeTruthy();
+
+    const b = createLocalCacheProvider<string, any[]>({key: 'rt:test:refill'});
+    expect(b.get(['x'])).toEqual(stored); // value AND cachedAt survived
+
+    // deletions persist too — the next provider starts without the entry
+    a.delete(['x']);
+    const c = createLocalCacheProvider<string, any[]>({key: 'rt:test:refill'});
+    expect(c.get(['x'])).toBeUndefined();
+  });
+
+  it('should degrade to the plain memory provider when storage never works', () => {
+    const spy = vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota exceeded', 'QuotaExceededError');
+    });
+
+    const a = createLocalCacheProvider<string, any[]>({key: 'rt:test:quota'});
+    expect(() => a.set(['x'], 'hello')).not.toThrow();
+    expect(a.get(['x'])).toEqual(['hello', expect.any(Number)]);
+
+    spy.mockRestore();
+    const b = createLocalCacheProvider<string, any[]>({key: 'rt:test:quota'});
+    expect(b.get(['x'])).toBeUndefined(); // nothing ever hit the disk
+  });
+
+  it('should keep serving from memory when writes fail after creation', () => {
+    const a = createLocalCacheProvider<string, any[]>({key: 'rt:test:late'});
+    a.set(['x'], 'hello'); // healthy write
+
+    const spy = vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota exceeded', 'QuotaExceededError');
+    });
+    expect(() => a.set(['y'], 'world')).not.toThrow(); // silent degradation
+    expect(a.get(['y'])).toEqual(['world', expect.any(Number)]); // memory wins
+
+    spy.mockRestore();
+    const b = createLocalCacheProvider<string, any[]>({key: 'rt:test:late'});
+    expect(b.get(['x'])).toEqual(['hello', expect.any(Number)]); // last good write
+    expect(b.get(['y'])).toBeUndefined(); // the failed write did not persist
   });
 });

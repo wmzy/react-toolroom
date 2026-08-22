@@ -853,6 +853,156 @@ describe('async hooks', () => {
         expect(screen.getByText('test error')).toBeDefined();
       });
     });
+
+    it('should share the error with a component mounting after the failure', async () => {
+      const fetchData = vi.fn(async () => {
+        throw new Error('shared failure');
+      });
+
+      function Watcher({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const error = useError<Error>(injectable);
+        return (
+          <span data-testid={label}>{error ? error.message : 'no error'}</span>
+        );
+      }
+
+      function TestComponent({showLate}: {showLate: boolean}) {
+        const injectable = useInjectable(fetchData);
+        useEffect(() => {
+          injectable().catch(() => {});
+        }, [injectable]);
+        return (
+          <div>
+            <Watcher injectable={injectable} label='early' />
+            {showLate && <Watcher injectable={injectable} label='late' />}
+          </div>
+        );
+      }
+
+      const {rerender} = render(<TestComponent showLate={false} />);
+      await waitFor(() => {
+        expect(screen.getByTestId('early').textContent).toBe('shared failure');
+      });
+
+      // Behavior change: the error now lives on the injectable-level
+      // shared store, so a component mounting after the failure starts
+      // from the shared error instead of a fresh local `undefined`.
+      rerender(<TestComponent showLate={true} />);
+      expect(screen.getByTestId('late').textContent).toBe('shared failure');
+    });
+
+    it('should broadcast the error to every subscribed component', async () => {
+      const rejecters: ((e: Error) => void)[] = [];
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((_resolve, reject) => {
+            rejecters.push(reject);
+          })
+      );
+
+      function Watcher({
+        injectable,
+        label
+      }: {
+        injectable: () => Promise<string>;
+        label: string;
+      }) {
+        const error = useError<Error>(injectable);
+        return (
+          <span data-testid={label}>{error ? error.message : 'no error'}</span>
+        );
+      }
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        return (
+          <div>
+            <Watcher injectable={injectable} label='a' />
+            <Watcher injectable={injectable} label='b' />
+            <button
+              type='button'
+              onClick={() => void injectable().catch(() => {})}
+            >
+              run
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByTestId('a').textContent).toBe('no error');
+      expect(screen.getByTestId('b').textContent).toBe('no error');
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+        rejecters[0]!(new Error('boom'));
+      });
+      // both subscribers received the broadcast together
+      expect(screen.getByTestId('a').textContent).toBe('boom');
+      expect(screen.getByTestId('b').textContent).toBe('boom');
+    });
+
+    it('should not let a slow old failure clobber a newer success', async () => {
+      const deferred: {
+        resolve: (v: string) => void;
+        reject: (e: Error) => void;
+      }[] = [];
+      const fetchData = vi.fn(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            deferred.push({resolve, reject});
+          })
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const error = useError<Error>(injectable);
+        const count = useFailureCount(injectable);
+        return (
+          <div>
+            <span>{error ? error.message : 'no error'}</span>
+            <span>failures: {count}</span>
+            <button
+              type='button'
+              onClick={() => void injectable().catch(() => {})}
+            >
+              run
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      // two overlapping calls; the older one is still pending
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+
+      // the newer call succeeds first
+      await act(async () => {
+        deferred[1]!.resolve('fresh');
+      });
+      expect(screen.getByText('no error')).toBeDefined();
+      expect(screen.getByText('failures: 0')).toBeDefined();
+
+      // …then the older call fails: dropped by the seq watermark.
+      // Behavior change: the old per-component setState had no such guard,
+      // the late failure used to overwrite the newer success.
+      await act(async () => {
+        deferred[0]!.reject(new Error('stale failure'));
+      });
+      expect(screen.getByText('no error')).toBeDefined();
+      expect(screen.getByText('failures: 0')).toBeDefined();
+    });
   });
 
   describe('useFailureCount', () => {
@@ -875,6 +1025,47 @@ describe('async hooks', () => {
       await waitFor(() => {
         expect(screen.getByText('failures: 1')).toBeDefined();
       });
+    });
+
+    it('should reset the count and clear the error on success', async () => {
+      let fail = true;
+      const fetchData = vi.fn(async () => {
+        if (fail) throw new Error('flaky');
+        return 'ok';
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        const error = useError<Error>(injectable);
+        const count = useFailureCount(injectable);
+        return (
+          <div>
+            <span>{error ? error.message : 'no error'}</span>
+            <span>failures: {count}</span>
+            <button
+              type='button'
+              onClick={() => void injectable().catch(() => {})}
+            >
+              run
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+      expect(screen.getByText('flaky')).toBeDefined();
+      expect(screen.getByText('failures: 1')).toBeDefined();
+
+      fail = false;
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+      // a success clears the shared error and resets the tally to 0
+      expect(screen.getByText('no error')).toBeDefined();
+      expect(screen.getByText('failures: 0')).toBeDefined();
     });
   });
 

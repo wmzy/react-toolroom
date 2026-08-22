@@ -57,7 +57,13 @@ export default defineConfig({
             async: 'src/async/index.ts',
             devtools: 'src/devtools/index.tsx'
           },
-          formats: ['es']
+          formats: ['es', 'cjs'],
+          // Without a "type" field in package.json Vite names cjs outputs
+          // `.js` (resolveOutputJsExtension); pin extensions per format so
+          // CommonJS artifacts are `.cjs`, unambiguous under any future
+          // `"type"` setting. Chunks follow the same rule via their defaults.
+          fileName: (format, entryName) =>
+            format === 'cjs' ? `${entryName}.cjs` : `${entryName}.mjs`
         },
         rollupOptions: {
           external: (id) =>

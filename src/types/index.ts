@@ -25,4 +25,8 @@ export type CacheProvider<T, K extends any[]> = {
   hydrate?: (data: Record<string, [T, number]>) => void;
   /** Deletes every entry whose hashed key starts with `prefix`. */
   deletePrefix?: (prefix: string) => void;
+  /** Notifies `listener` after any entry mutation; returns an unsubscribe. */
+  subscribe?: (listener: () => void) => () => void;
+  /** Shallow-copies every entry as {key, value, cachedAt} for read-only observation. */
+  snapshot?: () => {key: string; value: T; cachedAt: number}[];
 };

@@ -8,7 +8,7 @@
  */
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {act, render, screen} from '@testing-library/react';
-import {useInjectable} from '../src/async';
+import {useInjectable, createMemoryCacheProvider} from '../src/async';
 import {InjectDevTools, useInjectLog} from '../src/devtools';
 import type {InjectLogEvent} from '../src/devtools';
 
@@ -133,6 +133,42 @@ describe('InjectDevTools', () => {
       await call(2);
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders observed cache entries and refreshes on mutation', () => {
+    const cache = createMemoryCacheProvider<{id: number}, [number]>();
+    render(<InjectDevTools injectables={[]} caches={[cache]} />);
+
+    // Header-only table before any entry lands in the cache.
+    expect(screen.getByText('Key', {selector: 'th'})).toBeTruthy();
+
+    act(() => {
+      cache.set([1], {id: 1});
+    });
+
+    // stableHash([1]) is '[number:1]'; the value cell goes through
+    // summarize, the age cell is whole seconds since `cachedAt`.
+    expect(screen.getByText('[number:1]', {selector: 'td'})).toBeTruthy();
+    expect(screen.getByText('{"id":1}', {selector: 'td'})).toBeTruthy();
+    expect(screen.getByText('0s', {selector: 'td'})).toBeTruthy();
+
+    act(() => {
+      cache.delete([1]);
+    });
+
+    // The subscribe-driven re-render pulled a fresh snapshot.
+    expect(screen.queryByText('[number:1]', {selector: 'td'})).toBeNull();
+    expect(screen.queryByText('{"id":1}', {selector: 'td'})).toBeNull();
+  });
+
+  it('skips caches without snapshot and renders without errors', () => {
+    render(<InjectDevTools injectables={[]} caches={[{} as any]} />);
+
+    // No cache table headers, and the panel is otherwise intact.
+    expect(screen.queryByText('Key', {selector: 'th'})).toBeNull();
+    expect(
+      screen.getByText(/no calls settled yet/i, {selector: 'p'})
+    ).toBeTruthy();
   });
 });
 

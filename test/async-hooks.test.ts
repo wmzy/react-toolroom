@@ -20,6 +20,7 @@ import {
   useInject,
   usePolling,
   useFocusRevalidate,
+  useReconnectRevalidate,
   useOptimistic,
   useInfinite,
   isInjectable,
@@ -505,6 +506,87 @@ describe('useFocusRevalidate', () => {
     unmount();
     fireEvent(window, new Event('focus'));
     fireEvent(document, new Event('visibilitychange'));
+    expect(fetchData).toHaveBeenCalledTimes(0);
+  });
+
+  const setOnline = (onLine: boolean) =>
+    Object.defineProperty(navigator, 'onLine', {
+      configurable: true,
+      get: () => onLine
+    });
+  const restoreOnline = () => delete (navigator as any).onLine;
+
+  it('should revalidate on reconnect', () => {
+    const fetchData = vi.fn(async () => 'ok');
+    function TestComponent() {
+      const injectable = useInjectable(fetchData);
+      useReconnectRevalidate(injectable);
+      return null;
+    }
+    render(createElement(TestComponent));
+    expect(fetchData).toHaveBeenCalledTimes(0);
+    setOnline(true);
+    fireEvent(window, new Event('online'));
+    expect(fetchData).toHaveBeenCalledTimes(1);
+    // no throttle by default: every online event revalidates
+    fireEvent(window, new Event('online'));
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    restoreOnline();
+  });
+
+  it('should not revalidate on reconnect while navigator reports offline', () => {
+    const fetchData = vi.fn(async () => 'ok');
+    function TestComponent() {
+      const injectable = useInjectable(fetchData);
+      useReconnectRevalidate(injectable);
+      return null;
+    }
+    render(createElement(TestComponent));
+    try {
+      setOnline(false);
+      fireEvent(window, new Event('online'));
+      expect(fetchData).toHaveBeenCalledTimes(0);
+    } finally {
+      restoreOnline();
+    }
+  });
+
+  it('should throttle reconnect events within the window', () => {
+    const fetchData = vi.fn(async () => 'ok');
+    function TestComponent() {
+      const injectable = useInjectable(fetchData);
+      useReconnectRevalidate(injectable, {interval: 5000});
+      return null;
+    }
+    render(createElement(TestComponent));
+    fireEvent(window, new Event('online'));
+    fireEvent(window, new Event('online'));
+    fireEvent(window, new Event('online'));
+    expect(fetchData).toHaveBeenCalledTimes(1);
+  });
+
+  it('should spread args into the revalidation', () => {
+    const fetchData = vi.fn(async (id: string) => id);
+    function TestComponent() {
+      const injectable = useInjectable(fetchData);
+      useReconnectRevalidate(injectable, {args: ['user-1']});
+      return null;
+    }
+    render(createElement(TestComponent));
+    fireEvent(window, new Event('online'));
+    expect(fetchData).toHaveBeenCalledWith('user-1');
+  });
+
+  it('should stop revalidating on reconnect after unmount', () => {
+    const fetchData = vi.fn(async () => 'ok');
+    function TestComponent() {
+      const injectable = useInjectable(fetchData);
+      useReconnectRevalidate(injectable);
+      return null;
+    }
+    const {unmount} = render(createElement(TestComponent));
+    unmount();
+    fireEvent(window, new Event('online'));
     expect(fetchData).toHaveBeenCalledTimes(0);
   });
 });

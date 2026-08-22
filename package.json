@@ -5,16 +5,19 @@
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
+      "require": "./dist/index.cjs",
       "import": "./dist/index.mjs",
       "default": "./dist/index.mjs"
     },
     "./async": {
       "types": "./dist/types/async/index.d.ts",
+      "require": "./dist/async.cjs",
       "import": "./dist/async.mjs",
       "default": "./dist/async.mjs"
     },
     "./devtools": {
       "types": "./dist/types/devtools/index.d.ts",
+      "require": "./dist/devtools.cjs",
       "import": "./dist/devtools.mjs",
       "default": "./dist/devtools.mjs"
     }

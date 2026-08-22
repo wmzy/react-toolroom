@@ -6,12 +6,12 @@
 
 ## 特性
 
-- **零依赖、体积极小** — `react-toolroom` 1.4 kB，`react-toolroom/async` 3.02 kB（minified + brotli，含共享 chunk），由 CI 的 2 kB / 4 kB 预算强制约束。
+- **零依赖、体积极小** — `react-toolroom` 1.4 kB，`react-toolroom/async` 3.74 kB（minified + brotli，含共享 chunk），由 CI 的 2 kB / 4 kB 预算强制约束。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
 - **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `useDedup` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
 - **React 16.8 – 19** — 一套代码路径，覆盖广谱版本。
-- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；162 个测试。
+- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；199 个测试。
 
 ## 安装
 
@@ -23,7 +23,7 @@ npm i react-toolroom
 
 ## 什么时候选这个库
 
-React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、取消——用不到 4 kB、无 Provider 的代价交付给你。下面是一份诚实的对比：
+React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、断网重连重验证、取消——用不到 4 kB、无 Provider 的代价交付给你。下面是一份诚实的对比：
 
 | 能力 | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
@@ -32,14 +32,15 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | 请求去重 | `useDedup` | 内置 | 内置 | ✗（只有防抖/节流） |
 | 轮询 | `usePolling` | `refetchInterval` | `refreshInterval` | `pollingInterval` |
 | 焦点时重新请求 | `useFocusRevalidate` | `refetchOnWindowFocus` | `revalidateOnFocus` | `refreshOnWindowFocus` |
+| 网络恢复时重新请求 | `useReconnectRevalidate` | 内置 | 内置 | ✗ |
 | mutation 联动失效缓存 | `useInvalidate` | `invalidateQueries` | 手动 `mutate` | 手动 |
-| 无限加载 | ✗ | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
+| 无限加载 | ✅ `useInfinite` | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
 | key 变化时保留旧数据 | **默认行为** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
 | DevTools | ✅ `InjectDevTools` 面板（独立入口） | ✅ | 社区版 | ✗ |
-| SSR / hydration | ✗ | ✅ | ✅ | 有限支持 |
+| SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **1.4 kB** + **3.02 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **1.4 kB** + **3.74 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、只算入口的体积。react-toolroom 的数字是 CI 强制约束的精确值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -54,11 +55,15 @@ React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。
 | 模板 | 组合方式 |
 | --- | --- |
 | [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | 基础版：`useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`。 |
+| [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | 写操作侧：mutation hook 模板，把共享 store 串成同一份契约——生命周期标志、`error`、`onMutate` / `onSuccess` / `onError` / `onSettled` 回调——`useOptimistic` 与 `useInvalidate` 则是与之分工协作的可组合件。 |
 | [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | 加 `useCache(staleTime)`（模块级缓存实例）+ `useFocusRevalidate`。 |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | 加固定间隔的 `usePolling`。 |
 | [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | 按键运行的 `useRun(fn, [{page}], {hash: stableHash})`，默认保留旧数据；`useLoading` 做小刷新指示器，`useInitialLoading` 做首屏骨架。 |
+| [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | 把条目持久化到 `localStorage` 的 `CacheProvider`——面向应当挺过页面刷新、而非每次从零重建的缓存。 |
 
 复制最贴近你场景的一份，替换成你的 fetcher，再按每个文件头列出的常见定制点调整：`staleTime`、错误上报、缓存实例、返回形状。一个 hook 让所有屏幕共用同一套 loading/error 契约——并且只有一处需要修改。
+
+至于服务端的部分——在 App Router 中预热缓存、hydration、以及 React Server Components 里哪些能用哪些不能用——见 [Next.js / RSC 集成指南](./docs/nextjs-rsc.md)。
 
 ## 快速上手
 
@@ -519,8 +524,8 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。首个结果后，更新与 `useResult` 完全一致地流入。 |
 | `useLoading(fn)` | 任意调用进行中为 `true`。 |
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
-| `useError(fn)` | 最近一次抛出的错误；成功时清空。 |
-| `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。 |
+| `useError(fn)` | 最近一次抛出的错误；成功时清空。错误状态挂在 injectable 级的共享广播 store 上：晚挂载的组件直接从共享快照读到上一次错误，多个消费者同步更新；写入带序号保护，慢的旧调用失败不会覆盖新调用的成功状态。 |
+| `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。与 `useError` 共用 injectable 级的共享广播 store，晚挂载的组件同样从共享快照起步。 |
 | `useCatch(fn, catcher)` | 通过 `catcher(e) => result` 把 rejection 转为兜底值。 |
 | `useFinally(fn, handler)` | 调用落定时执行 `handler`，无论成败。 |
 | `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。 |
@@ -529,10 +534,11 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
 | `useInfinite(fn, {getNextPageParam})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}`——TanStack `useInfiniteQuery` 的子集。只有 `fetchNextPage()` 发起的调用会追加；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）与 `deletePrefix`（按哈希键前缀批量失效）；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）与 `deletePrefix`（按哈希键前缀批量失效）；还实现了可观察接口 `subscribe`/`snapshot`——`set`/`delete`/`clear`/`deletePrefix`/GC 均会通知监听者，`snapshot()` 返回 `{key, value, cachedAt}[]` 条目列表，供 DevTools 等外部工具订阅驱动刷新；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
 | `useDedup(fn, {hash = stableHash}?)` | 同键并发调用共享同一个 in-flight promise；落定即删条目，失败可重试。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache`/`useDedup` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。 |
+| `useReconnectRevalidate(fn, {interval = 0, args = []}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
 | `stableHash(value)` | 此处为便捷再导出——见上方核心表。 |
 
 ### DevTools — `react-toolroom/devtools`
@@ -541,20 +547,28 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 | API | 说明 |
 | --- | --- |
-| `<InjectDevTools injectables, limit?, title?>` | 零依赖调用轨迹面板。经 `subscribeInjectEvents` 订阅每个 injectable，把最近 `limit`（默认 50）条 settle 事件渲染成内联样式表格——时间、函数名、状态、耗时、参数/结果摘要——卸载时退订。`injectables` 请传引用稳定的数组（模块常量或 `useMemo`）。 |
+| `<InjectDevTools injectables, caches?, limit?, title?>` | 零依赖调用轨迹面板。经 `subscribeInjectEvents` 订阅每个 injectable，把最近 `limit`（默认 50）条 settle 事件渲染成内联样式表格——时间、函数名、状态、耗时、参数/结果摘要——卸载时退订。可选 `caches` 传入实现了 `snapshot` 的 cache provider（如 `createMemoryCacheProvider()` 实例），面板会在第二张订阅驱动的表格里渲染缓存条目——key、age、value。`injectables` / `caches` 请传引用稳定的数组（模块常量或 `useMemo`）。 |
 | `useInjectLog(fn, limit?)` | 面板背后的无头引擎：返回 `{events, clear}`，携带同样格式的 `InjectLogEvent[]`——用它搭建自己的面板 UI。 |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}`——`duration` 覆盖观察者之下的整条洋葱链；`name` 取 `fn.name`，`useInjectable` 返回的匿名 wrapper 显示为 `'anonymous'`。 |
 
-编写自定义 wrapper 和 cache provider 所需的类型同样从两个入口导出：`react-toolroom/async` 提供 `AsyncFunc`、`Func`、`R<AF>`、`CacheProvider<R, Args>`、`CacheResult<R>`；核心入口提供 `Func`。
+编写自定义 wrapper 和 cache provider 所需的类型同样从入口导出：`react-toolroom/async` 提供 `AsyncFunc`、`Func`、`R<AF>`、`CacheProvider<R, Args>`、`CacheResult<R>`；核心入口提供 `Func`；`react-toolroom/devtools` 提供 `ObservableCache`（`caches` prop 读取的可选 `snapshot`/`subscribe` 接口）。
+
+## API 稳定性与 1.0 路线
+
+承重面已冻结——签名与语义按契约对待，改动它需要出现关键性 bug 才行：注入核心（`useInjectable`、`useInject`、`useInjectBefore`、`getInjectContext`、`addWrapper`）、`useRun`、`useCache` / `useInvalidate` / `createMemoryCacheProvider`、`useDedup`，以及状态 hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`。
+
+仍在演进、欢迎反馈：`useOptimistic`、`useInfinite`、`useSuspenseResult` 与 DevTools 面板。
+
+0.x 阶段，破坏性变更随 semver **minor** 版本发布，并在 CHANGELOG 中逐条说明——1.0 冻结上述全部内容。
 
 ## 工程事实
 
-- **仅 ESM** — `exports` 映射提供 `types` / `import` / `default` 条件，指向 `.mjs` 文件；没有 CJS 产物。若需直接跑在 CJS/Node 上，请先自行打包。
-- **CI 体积预算** — [size-limit](./.size-limit.json) 约束 `react-toolroom` 小于 2 kB、`react-toolroom/async` 小于 4 kB（brotli，入口 + 共享 chunk）。当前实测 1.4 kB / 3.02 kB。
+- **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
+- **CI 体积预算** — [size-limit](./.size-limit.json) 约束 `react-toolroom` 小于 2 kB、`react-toolroom/async` 小于 4 kB（brotli，入口 + 共享 chunk）。当前实测 1.4 kB / 3.74 kB。
 - **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量依赖买单。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。
-- **测试覆盖** — 162 个测试（vitest + Testing Library）。
+- **测试覆盖** — 199 个测试（vitest + Testing Library）。
 
 ## 示例
 

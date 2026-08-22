@@ -6,12 +6,12 @@
 
 ## Highlights
 
-- **Zero dependencies, tiny footprint** — `react-toolroom` is 1.4 kB and `react-toolroom/async` is 3.02 kB (minified + brotli, including the shared chunk), enforced by CI budgets of 2 kB / 4 kB.
+- **Zero dependencies, tiny footprint** — `react-toolroom` is 1.4 kB and `react-toolroom/async` is 3.74 kB (minified + brotli, including the shared chunk), enforced by CI budgets of 2 kB / 4 kB.
 - **No Provider, no Context** — every hook works standalone; state lives on the functions you pass in, so there is nothing to mount at the app root.
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
 - **React 16.8 – 19** — one code path, broad peer range.
-- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 162 tests.
+- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 199 tests.
 
 ## Install
 
@@ -23,7 +23,7 @@ Two entries: `react-toolroom` (core: `memo`, `stableHash`) and `react-toolroom/a
 
 ## When to choose this library
 
-React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus revalidation, cancellation — in under 4 kB with no Provider. This is an honest comparison:
+React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus and reconnect revalidation, cancellation — in under 4 kB with no Provider. This is an honest comparison:
 
 | Capability | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
@@ -32,14 +32,15 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | Request deduplication | `useDedup` | built-in | built-in | ✗ (debounce/throttle only) |
 | Polling | `usePolling` | `refetchInterval` | `refreshInterval` | `pollingInterval` |
 | Refetch on focus | `useFocusRevalidate` | `refetchOnWindowFocus` | `revalidateOnFocus` | `refreshOnWindowFocus` |
+| Refetch on reconnect | `useReconnectRevalidate` | built-in | built-in | ✗ |
 | Invalidation linked to mutations | `useInvalidate` | `invalidateQueries` | manual `mutate` | manual |
-| Infinite loading | ✗ | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
+| Infinite loading | ✅ `useInfinite` | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
 | Keep previous data on key change | **default** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
 | DevTools | ✅ `InjectDevTools` panel (separate entry) | ✅ | community | ✗ |
-| SSR / hydration | ✗ | ✅ | ✅ | limited |
+| SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
-| Bundle size¹ | **1.4 kB** + **3.02 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| Bundle size¹ | **1.4 kB** + **3.74 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ Minified + compressed, entry point only. react-toolroom numbers are exact and enforced by CI; competitor numbers are approximate and vary by version — check their docs.
 
@@ -54,11 +55,15 @@ The [`recipes/`](./recipes/) directory holds copy-and-customize templates to sta
 | Template | Composition |
 | --- | --- |
 | [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | The base: `useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`. |
+| [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | The write side: a mutation hook template wiring the shared stores into one contract — lifecycle flags, `error`, `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks — with `useOptimistic` and `useInvalidate` as the composable pieces it divides labor with. |
 | [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`. |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | Adds `usePolling` on a fixed interval. |
 | [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
+| [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | A `CacheProvider` that persists entries to `localStorage` — for caches that should survive a page reload instead of rebuilding from scratch. |
 
 Copy the one closest to your screen, swap in your fetcher, and adjust the common customization points each file header calls out: `staleTime`, error reporting, the cache instance, and the return shape. One hook gives every screen a single loading/error contract — and exactly one place to change it.
+
+For the server side of the story — priming caches in the App Router, hydration, and what does and does not work inside React Server Components — see the [Next.js / RSC integration guide](./docs/nextjs-rsc.md).
 
 ## Quick start
 
@@ -520,8 +525,8 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
-| `useError(fn)` | The last thrown error; cleared on success. |
-| `useFailureCount(fn)` | Number of failures since the last success (reset on success). |
+| `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
+| `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
 | `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). Preset shorthand: `useRetry(fn, {retries = 3, backoff = 'exponential'})` — `'exponential'` waits 1s/2s/4s…, `'linear'` 1s/2s/3s…, or pass `(attempt) => ms` for custom delays; both signatures share one mechanism. |
@@ -530,10 +535,11 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useInvalidate(fn, cacheProvider)` | Returns a stable `(...args) => Promise<R>` that deletes the cache entry under `args` and immediately re-runs the injectable with them — hard invalidation for mutation success paths. Keys link to `useCache` via the same provider and args tuple. |
 | `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
 | `useInfinite(fn, {getNextPageParam})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` — a subset of TanStack's `useInfiniteQuery`. Only `fetchNextPage()` calls append; any direct call (e.g. a `useRun` rerun) resets `pages`. |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges) and `deletePrefix` (batch invalidation by hashed-key prefix); idle-garbage-collects entries after `cacheTime` once unused. |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges), `deletePrefix` (batch invalidation by hashed-key prefix), and `subscribe`/`snapshot` — a read-only observation interface for the DevTools panel or your own (fires after every entry mutation; snapshots every entry as `{key, value, cachedAt}`); idle-garbage-collects entries after `cacheTime` once unused. |
 | `useDedup(fn, {hash = stableHash}?)` | Concurrent calls with the same key share one in-flight promise; the entry is dropped on settle, so failures are retryable. |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | Call `fn(...args)` every `interval` ms; skips ticks while the previous call is pending; pauses while the document is hidden unless `whenHidden`. Changing `interval` restarts the timer. `args` land on the same `useCache`/`useDedup` key as `useRun(fn, args)` — pass the keyed tuple when `useRun` uses one. |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | Refetch on window focus and on `visibilitychange` back to visible, throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. |
+| `useReconnectRevalidate(fn, {interval = 0, args = []}?)` | Refetch when the network connection comes back (window `online` event), guarded by `navigator.onLine` and throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. The equivalent of TanStack's `refetchOnReconnect` / SWR's `revalidateOnReconnect`. |
 | `stableHash(value)` | Re-exported here for convenience — see the core table above. |
 
 ### DevTools — `react-toolroom/devtools`
@@ -542,20 +548,28 @@ Separate entry: importing it never adds a byte to the core or async bundles.
 
 | API | Description |
 | --- | --- |
-| `<InjectDevTools injectables, limit?, title?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. Pass a referentially stable `injectables` array (module constant or `useMemo`). |
+| `<InjectDevTools injectables, caches?, limit?, title?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table. Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
 | `useInjectLog(fn, limit?)` | The headless engine behind the panel: returns `{events, clear}` carrying the same `InjectLogEvent[]` — build your own panel UI on it. |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}` — `duration` covers the whole onion chain below the observer; `name` is `fn.name`, and shows `'anonymous'` for the unnamed wrappers `useInjectable` returns. |
 
-For custom wrappers and cache providers, the entries also export the types you need: `react-toolroom/async` ships `AsyncFunc`, `Func`, `R<AF>`, `CacheProvider<R, Args>`, and `CacheResult<R>`; the core entry ships `Func`.
+For custom wrappers and cache providers, the entries also export the types you need: `react-toolroom/async` ships `AsyncFunc`, `Func`, `R<AF>`, `CacheProvider<R, Args>`, and `CacheResult<R>`; the core entry ships `Func`; `react-toolroom/devtools` ships `ObservableCache` (the optional `snapshot`/`subscribe` surface the `caches` prop reads).
+
+## API stability (roadmap to 1.0)
+
+The load-bearing surface is frozen — signatures and semantics are treated as contracts, and changes there would require a critical bug: the injection core (`useInjectable`, `useInject`, `useInjectBefore`, `getInjectContext`, `addWrapper`), `useRun`, `useCache` / `useInvalidate` / `createMemoryCacheProvider`, `useDedup`, and the state hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`.
+
+Still evolving, with feedback welcome: `useOptimistic`, `useInfinite`, `useSuspenseResult`, and the DevTools panel.
+
+During 0.x, breaking changes ship as semver **minor** bumps and are called out in the CHANGELOG — 1.0 freezes everything listed above.
 
 ## Package facts
 
-- **ESM-only** — the `exports` map ships `types` / `import` / `default` conditions pointing at `.mjs` files; there is no CJS build. If you target CJS/Node directly, bundle first.
-- **CI size budgets** — [size-limit](./.size-limit.json) keeps `react-toolroom` under 2 kB and `react-toolroom/async` under 4 kB (brotli, entry + shared chunk). Currently 1.4 kB / 3.02 kB.
+- **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
+- **CI size budgets** — [size-limit](./.size-limit.json) keeps `react-toolroom` under 2 kB and `react-toolroom/async` under 4 kB (brotli, entry + shared chunk). Currently 1.4 kB / 3.74 kB.
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for little else.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
-- **Tested** — 162 tests (vitest + Testing Library).
+- **Tested** — 199 tests (vitest + Testing Library).
 
 ## Demos
 

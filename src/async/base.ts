@@ -51,22 +51,39 @@ export type StaleStore = {
   listeners: Set<(stale: boolean) => void>;
 };
 
+/**
+ * Broadcast store holding the latest error and failure count of an
+ * injectable. Like the result store it lives on the injectable's context
+ * and is shared by every consumer.
+ */
+export type ErrorStore = {
+  error: any | undefined;
+  failureCount: number;
+  listeners: Set<(value: any) => void>;
+};
+
 // Module-private store keys. The symbols are intentionally not exported:
 // stores must only be reached through the helpers below.
 const resultKey = Symbol('result store');
 const loadingKey = Symbol('loading store');
 const staleKey = Symbol('stale store');
+const errorKey = Symbol('error store');
 
 // Per-store call sequencing: the result of an older call must never
 // overwrite the result of a newer one, no matter which wrapper emits it or
-// in which order the calls settle.
-const resultSeqs = new WeakMap<ResultStore, {next: number; applied: number}>();
+// in which order the calls settle. Errors keep their own seq space so error
+// tickets never interleave with result tickets.
+const resultSeqs = new WeakMap<any, {next: number; applied: number}>();
+const errorSeqs = new WeakMap<any, {next: number; applied: number}>();
 
-function seqOf(store: ResultStore) {
-  let seq = resultSeqs.get(store);
+function seqOf(
+  store: object,
+  seqs: WeakMap<any, {next: number; applied: number}>
+) {
+  let seq = seqs.get(store);
   if (!seq) {
     seq = {next: 0, applied: 0};
-    resultSeqs.set(store, seq);
+    seqs.set(store, seq);
   }
   return seq;
 }
@@ -104,12 +121,23 @@ export function getStaleStore(fn: Func): StaleStore {
   return store;
 }
 
+/** Lazily creates and returns the shared error store of an injectable. */
+export function getErrorStore(fn: Func): ErrorStore {
+  const context = getInjectContext(fn);
+  let store = context[errorKey] as ErrorStore | undefined;
+  if (!store) {
+    store = {listeners: new Set(), error: undefined, failureCount: 0};
+    context[errorKey] = store;
+  }
+  return store;
+}
+
 /**
  * Reserves the call ticket handed to {@link emitResult}. Tickets are given
  * out in call order, one per emitting wrapper per call.
  */
 export function nextResultSeq(store: ResultStore): number {
-  return ++seqOf(store).next;
+  return ++seqOf(store, resultSeqs).next;
 }
 
 /**
@@ -121,7 +149,25 @@ export function nextResultSeq(store: ResultStore): number {
  * own call.
  */
 export function currentResultSeq(store: ResultStore): number {
-  return seqOf(store).applied;
+  return seqOf(store, resultSeqs).applied;
+}
+
+/**
+ * Reserves the call ticket handed to {@link emitError}. Tickets are given
+ * out in call order, one per emitting wrapper per call.
+ */
+export function nextErrorSeq(store: ErrorStore): number {
+  return ++seqOf(store, errorSeqs).next;
+}
+
+/**
+ * Returns the latest error ticket already applied to the store. Emitting
+ * with this value overwrites the current error WITHOUT raising the
+ * sequencing watermark, so a call that reserved a newer ticket with
+ * {@link nextErrorSeq} still lands afterwards.
+ */
+export function currentErrorSeq(store: ErrorStore): number {
+  return seqOf(store, errorSeqs).applied;
 }
 
 /**
@@ -134,7 +180,7 @@ export function currentResultSeq(store: ResultStore): number {
  * @param seq the ticket obtained from {@link nextResultSeq} when the call started
  */
 export function emitResult(store: ResultStore, result: any, seq: number) {
-  const guard = seqOf(store);
+  const guard = seqOf(store, resultSeqs);
   if (seq < guard.applied) return;
   guard.applied = seq;
   store.lastResult = result;
@@ -152,6 +198,26 @@ export function emitLoading(store: LoadingStore, count: number) {
 export function emitStale(store: StaleStore, stale: boolean) {
   store.stale = stale;
   for (const listener of store.listeners) listener(stale);
+}
+
+/**
+ * Stores the latest error (or its clearance) and broadcasts it to every
+ * subscriber. An emission whose ticket is older than the latest applied
+ * one is dropped, so the failure of a slow old call can never clobber the
+ * success of a newer call.
+ *
+ * @param store the shared error store of the injectable
+ * @param error the error to publish, or `undefined` on success
+ * @param seq the ticket obtained from {@link nextErrorSeq} when the call started
+ */
+export function emitError(store: ErrorStore, error: any, seq: number) {
+  const guard = seqOf(store, errorSeqs);
+  if (seq < guard.applied) return;
+  guard.applied = seq;
+  store.error = error;
+  // A success resets the failure tally; each failure increments it.
+  store.failureCount = error === undefined ? 0 : store.failureCount + 1;
+  for (const listener of store.listeners) listener(error);
 }
 
 // React 18+ exports useSyncExternalStore; React 16.8–17 peers do not, and
