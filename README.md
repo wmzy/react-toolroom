@@ -6,7 +6,7 @@
 
 ## Highlights
 
-- **Zero dependencies, tiny footprint** — `react-toolroom` is 1.4 kB and `react-toolroom/async` is 4.18 kB (minified + brotli, including the shared chunk), enforced by CI budgets of 2 kB / 4.5 kB.
+- **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 4.31 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
 - **No Provider, no Context** — every hook works standalone; state lives on the functions you pass in, so there is nothing to mount at the app root.
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
@@ -23,7 +23,7 @@ Two entries: `react-toolroom` (core: `memo`, `stableHash`) and `react-toolroom/a
 
 ## When to choose this library
 
-React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus and reconnect revalidation, cancellation, mutation-linked invalidation — in ~4 kB with no Provider. This is an honest comparison:
+React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus and reconnect revalidation, cancellation, mutation-linked invalidation — in ~4.3 kB with no Provider (less when you cherry-pick). This is an honest comparison:
 
 | Capability | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
@@ -41,9 +41,9 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
-| Bundle size¹ | **1.4 kB** + **3.91 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| Bundle size¹ | **1.4 kB** + **4.31 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
-¹ Minified + compressed, entry point only. react-toolroom numbers are exact and enforced by CI; competitor numbers are approximate and vary by version — check their docs.
+¹ Minified + compressed, full entry without tree-shaking — an upper bound; cherry-picked imports are smaller. react-toolroom numbers are exact, measured from the CI build; competitor numbers are approximate and vary by version — check their docs.
 
 **Choose react-toolroom** for small-to-mid applications, for embedding inside a component library, or when you only want to cherry-pick a few capabilities at minimal cost. **Choose TanStack Query** when you want a managed server-state client — cache-wide invalidation by query-key predicates, mutation-to-query coordination handled by the client itself, persistence plugins, and its full DevTools.
 
@@ -609,8 +609,8 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size budgets** — [size-limit](./.size-limit.json) keeps `react-toolroom` under 2 kB and `react-toolroom/async` under 4 kB (brotli, entry + shared chunk). Currently 1.4 kB / 3.91 kB.
-- **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for little else.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 4.31 kB.
+- **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.9 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
 - **Tested** — 204 tests (vitest + Testing Library).

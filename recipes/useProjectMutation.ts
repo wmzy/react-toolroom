@@ -55,17 +55,22 @@ const reportMutationError = (error: Error, ...args: unknown[]) => {
 /**
  * Wrap a mutation with the project defaults: same contract as
  * `useMutation` — `[mutate, status, reset]` — plus default error
- * reporting. See the library hook's docs for the full semantics; the
- * lifecycle tests live in `test/async-hooks.test.ts`.
+ * reporting. `invalidates` passes straight through (it lives in
+ * `...rest`), so declarative cache invalidation works unchanged:
+ * `useProjectMutation(saveArticle, {invalidates: [fetchFeed]})`.
+ * See the library hook's docs for the full semantics; the lifecycle
+ * tests live in `test/async-hooks.test.ts`.
  *
  * @param {AsyncFunc} mutation - the write function to wrap; inline arrows
- *   are fine.
- * @param {ProjectMutationOptions} [options] - lifecycle callbacks; an
- *   explicit `onError` replaces the project reporter.
+ *   are fine — `useInjectable` adopts the latest closure every render.
+ * @param {ProjectMutationOptions} [options] - lifecycle callbacks and
+ *   `invalidates` cache targets; an explicit `onError` replaces the
+ *   project reporter.
  * @return {[M, ProjectMutationStatus, function]} `[mutate, status, reset]`.
  * @example
  * ```tsx
  * const [rename, {isMutating, error}] = useProjectMutation(renameProject, {
+ *   invalidates: [fetchProjects],
  *   onSuccess: () => toast('Saved')
  * });
  * rename(user.id, nextName).catch(() => {});
