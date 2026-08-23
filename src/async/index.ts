@@ -82,6 +82,7 @@ import {
   ErrorStore,
   LoadingStore,
   ResultStore,
+  currentErrorSeq,
   emitError,
   emitLoading,
   emitResult,
@@ -94,6 +95,13 @@ import {
   nextResultSeq,
   useStoreValue
 } from './base';
+import {
+  InvalidateTarget,
+  ValidatedTargets,
+  invalidate,
+  recordCacheArgs,
+  useCacheInvalidation
+} from './invalidation';
 import createMemoryCacheProvider from './memory-cache-provider';
 
 export {useInject, useInjectBefore, getInjectContext, isInjectable};
@@ -102,6 +110,9 @@ export type {AsyncFunc, Func, R, CacheProvider, CacheResult} from '@@/types';
 export {useDedup} from './dedup';
 export {useOptimistic} from './optimistic';
 export {useInfinite} from './infinite';
+
+export {invalidate} from './invalidation';
+export type {InvalidateTarget} from './invalidation';
 
 export {subscribeInjectEvents} from './devtools';
 
@@ -295,6 +306,12 @@ export function useSuspenseResult<AF extends AsyncFunc>(
  * winning. Each consumer still registers its own wrapper, so a call still
  * performs the cache lookup once per consumer.
  *
+ * Binding the provider here also registers the injectable for declarative
+ * invalidation: `invalidate([injectableFn, ...])` and the `invalidates`
+ * option of `useMutation` resolve their targets through exactly this
+ * provider, purging matching entries and revalidating the arg tuples this
+ * wrapper has seen (see {@link invalidate}).
+ *
  * @param {AsyncFunc} injectableFn - the asynchronous function to memoize
  * @param {CacheProvider} cacheProvider - the cache provider for the function results
  * @param {number} staleTime - the time in milliseconds after which the cached result is considered stale
@@ -307,6 +324,11 @@ export function useCache<AF extends AsyncFunc>(
 ) {
   const store = getResultStore(injectableFn);
   const staleStore = getStaleStore(injectableFn);
+  // Bind the provider to the injectable for `invalidate` / the
+  // `invalidates` option of `useMutation`: every entry this wrapper caches
+  // becomes invalidatable by naming the injectable, and the arg tuples
+  // seen below are the queries a later invalidation revalidates.
+  const registry = useCacheInvalidation(injectableFn, cacheProvider);
   // The boolean snapshot is stable by nature, so unchanged emissions bail
   // out of re-renders exactly like the old local setState did.
   const stale = useStoreValue(
@@ -320,6 +342,7 @@ export function useCache<AF extends AsyncFunc>(
     injectableFn,
     (f: AF) =>
       ((...args) => {
+        recordCacheArgs(registry, cacheProvider, args);
         const seq = nextResultSeq(store);
         const refetch = () =>
           f(...args).then(
@@ -493,6 +516,184 @@ export function useFailureCount<AF extends AsyncFunc>(injectableFn: AF) {
     store,
     useCallback(() => store.failureCount, [store])
   );
+}
+
+/** Lifecycle callbacks of one mutation — naming aligned with TanStack/SWR. */
+export type MutationOptions<
+  M extends AsyncFunc,
+  T extends readonly unknown[] = readonly InvalidateTarget[]
+> = {
+  /** Fires synchronously right before the call starts. */
+  onMutate?: (...args: Parameters<M>) => void;
+  /** Fires with the resolved value when the call succeeds. */
+  onSuccess?: (result: R<M>, ...args: Parameters<M>) => void;
+  /** Fires with the rejection when the call fails. */
+  onError?: (error: Error, ...args: Parameters<M>) => void;
+  /** Fires exactly once per call, after `onSuccess` or `onError`. */
+  onSettled?: (
+    result: R<M> | undefined,
+    error: Error | undefined,
+    ...args: Parameters<M>
+  ) => void;
+  /**
+   * Cache targets to invalidate when the call succeeds — declarative
+   * `useInvalidate` for the common "write, then refresh what the write
+   * touched" flow. Each entry is an injectable (all of its cache) or an
+   * `[injectable, ...argsPrefix]` tuple (entries whose args extend the
+   * prefix); a failed mutation invalidates nothing. See
+   * {@link invalidate} for the full semantics.
+   */
+  invalidates?: readonly [...T] & ValidatedTargets<T>;
+};
+
+/** What {@link useMutation} hands to your components. */
+export type MutationStatus = {
+  /** `true` while any call is in flight (concurrent calls all count). */
+  isMutating: boolean;
+  /** The latest error; a later success clears it. Shared per injectable. */
+  error: Error | undefined;
+  /** Consecutive failures so far; a success resets it to `0`. */
+  failureCount: number;
+};
+
+/**
+ * Wrap a write function with mutation lifecycle tracking — the write-side
+ * counterpart of `useRun`.
+ *
+ * The returned `mutate` is the injectable itself: stable identity, latest
+ * closure, and the chain that `useOptimistic` / `useInvalidate` (or any
+ * other wrapper) can also be registered on. The status reads the
+ * injectable's shared stores — `isMutating` from the loading store,
+ * `error` / `failureCount` from the error store — so every consumer of
+ * the same mutation updates together and components mounted after a call
+ * start from the shared snapshot.
+ *
+ * Rejections keep flowing: `mutate` behaves like the original function, so
+ * per-call callbacks are simply `.then` / `.catch` on the returned promise
+ * — no separate per-call options API. Hook-level callbacks go through a
+ * ref funnel: `options` may be a fresh inline object every render and the
+ * latest closures still fire. `reset` writes a success-shaped clearance
+ * without raising the seq watermark, so a call already in flight still
+ * lands afterwards — reset only wipes what has already settled.
+ *
+ * `invalidates` is the declarative mutation→query link: on success (only)
+ * each target — an injectable for its whole cache, or an
+ * `[injectable, ...argsPrefix]` tuple for prefix-matching entries — is
+ * purged and its live queries revalidated, exactly as `invalidate()` does.
+ * A rejected mutation invalidates nothing.
+ *
+ * Division of labor: `useMutation` owns the lifecycle and status;
+ * `useOptimistic` adds optimistic snapshots for locally predictable edits;
+ * `invalidates` (or `useInvalidate` / `deletePrefix`) refreshes cached
+ * reads — compose them on the same injectables.
+ *
+ * @param {AsyncFunc} mutation - the write function to wrap; inline arrows
+ *   are fine — `useInjectable` adopts the latest closure every render.
+ * @param {MutationOptions} [options] - `onMutate` / `onSuccess` /
+ *   `onError` / `onSettled` callbacks and `invalidates` cache targets; all
+ *   optional.
+ * @return {[M, MutationStatus, function]} `[mutate, status, reset]` —
+ *   call `mutate` from event handlers; render `isMutating` on the submit
+ *   button and `error` / `failureCount` for feedback UI; `reset` clears
+ *   the failure bookkeeping between submissions.
+ * @example
+ * ```tsx
+ * function RenameForm({id, name, fetchUsers}: Props) {
+ *   const [rename, {isMutating, error}, reset] = useMutation(renameUser, {
+ *     invalidates: [fetchUsers],
+ *     onError: () => toast('Save failed')
+ *   });
+ *   return (
+ *     <form onSubmit={(e) => {
+ *       e.preventDefault();
+ *       reset();
+ *       rename(id, name).catch(() => {});
+ *     }}>
+ *       {error && <p>{error.message}</p>}
+ *       <button disabled={isMutating}>Save</button>
+ *     </form>
+ *   );
+ * }
+ * ```
+ */
+export function useMutation<
+  M extends AsyncFunc,
+  const T extends readonly unknown[] = readonly InvalidateTarget[]
+>(
+  mutation: M,
+  options?: MutationOptions<M, T>
+): [M, MutationStatus, () => void] {
+  // 1. The injectable IS the returned `mutate`: stable identity across
+  //    renders, and the wrapper chain the hooks below (plus
+  //    useOptimistic/useInvalidate in consumers) register on.
+  const mutate = useInjectable(mutation);
+
+  // 2. Ref funnel for the callbacks: `options` is usually an inline object
+  //    (new identity every render). One wrapper is registered ONCE on the
+  //    chain and reads through the ref, so callbacks stay fresh without
+  //    re-registering the wrapper or dragging options through effect deps.
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  // Dev-only, fail fast: a raw (non-injectable) target would otherwise
+  // only blow up inside the success handler and turn a succeeded mutation
+  // into a rejection. Throwing during render points at the component.
+  if (process.env.NODE_ENV !== 'production' && options?.invalidates) {
+    for (const target of options.invalidates) {
+      const fn = Array.isArray(target) ? target[0] : target;
+      if (!isInjectable(fn)) {
+        throw new Error(
+          'useMutation: invalidates expects injectables returned by ' +
+            'useInjectable() (optionally as [injectable, ...argsPrefix] ' +
+            'tuples), got something else.'
+        );
+      }
+    }
+  }
+  useInject(
+    mutate,
+    (f: M) =>
+      ((...args: Parameters<M>) => {
+        const {onMutate, onSuccess, onError, onSettled, invalidates} =
+          optionsRef.current ?? {};
+        onMutate?.(...args);
+        return f(...args).then(
+          (result) => {
+            // Invalidation runs before the user callbacks: it is library
+            // plumbing and must not be hostage to a throwing onSuccess.
+            // Rejections never reach here — a failed mutation invalidates
+            // nothing.
+            if (invalidates) invalidate(invalidates as readonly any[]);
+            onSuccess?.(result, ...args);
+            onSettled?.(result, undefined, ...args);
+            return result;
+          },
+          (e: any) => {
+            onError?.(e, ...args);
+            onSettled?.(undefined, e, ...args);
+            // Rejections keep flowing: `mutate` behaves like the original
+            // function, so awaiting callers can branch on the outcome.
+            throw e;
+          }
+        );
+      }) as M
+  );
+
+  // 3. Status from the shared stores — every flag is injectable-level
+  //    state: sibling components tracking the same mutation update
+  //    together, and late mounters start from the current values.
+  const isMutating = useLoading(mutate);
+  const error = useError(mutate);
+  const failureCount = useFailureCount(mutate);
+
+  // 4. Clear the settled error bookkeeping. Writing with the CURRENT seq
+  //    does not raise the watermark, so an in-flight call's ticket stays
+  //    valid and its outcome still lands after the reset.
+  const reset = useCallback(() => {
+    const store = getErrorStore(mutate);
+    emitError(store, undefined, currentErrorSeq(store));
+  }, [mutate]);
+
+  return [mutate, {isMutating, error, failureCount}, reset];
 }
 
 // Base delay (ms) of the preset backoff strategies of useRetry.

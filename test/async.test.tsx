@@ -23,6 +23,8 @@ import {
   useRetry,
   useCache,
   useInvalidate,
+  useMutation,
+  invalidate,
   getInjectContext,
   useInject,
   useDedup,
@@ -1857,6 +1859,350 @@ describe('async hooks', () => {
       expect(fetchData).toHaveBeenCalledTimes(1);
       expect(fetchData).toHaveBeenCalledWith(1);
       expect(fetchData).not.toHaveBeenCalledWith(2);
+    });
+  });
+
+  describe('invalidation', () => {
+    // The composition every test below shares: the parent owns the
+    // injectables (the library's cross-component model — state lives on
+    // the functions you pass down), the Feed children cache + subscribe +
+    // drive the query, the editors mutate and declare what to invalidate
+    // with the literal option, so the `invalidates` types are checked
+    // exactly as a user writes them.
+    function Feed({
+      query,
+      cache,
+      tab
+    }: {
+      query: (tab: string) => Promise<string>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      tab: string;
+    }) {
+      useCache(query, cache, 60000);
+      const result = useResult(query);
+      useEffect(() => {
+        void query(tab);
+      }, [query, tab]);
+      return <span data-testid={`feed-${tab}`}>{result ?? 'none'}</span>;
+    }
+
+    function SaveButton({mutate}: {mutate: (draft: string) => Promise<string>}) {
+      return (
+        <button
+          data-testid='save'
+          type='button'
+          onClick={() => {
+            mutate('draft').catch(() => {});
+          }}
+        >
+          save
+        </button>
+      );
+    }
+
+    // By-identity target: every cache entry of the injectable.
+    function IdentityEditor({
+      query,
+      save
+    }: {
+      query: (tab: string) => Promise<string>;
+      save: (draft: string) => Promise<string>;
+    }) {
+      const [mutate] = useMutation(save, {invalidates: [query]});
+      return <SaveButton mutate={mutate} />;
+    }
+
+    // Prefix target: only the entries whose args extend the prefix.
+    function PrefixEditor({
+      query,
+      save
+    }: {
+      query: (tab: string) => Promise<string>;
+      save: (draft: string) => Promise<string>;
+    }) {
+      const [mutate] = useMutation(save, {invalidates: [[query, 'news']]});
+      return <SaveButton mutate={mutate} />;
+    }
+
+    function App({
+      fetchFeed,
+      save,
+      cache,
+      Editor
+    }: {
+      fetchFeed: (tab: string) => Promise<string>;
+      save: (draft: string) => Promise<string>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      Editor: typeof IdentityEditor | typeof PrefixEditor;
+    }) {
+      const query = useInjectable(fetchFeed);
+      const write = useInjectable(save);
+      return (
+        <>
+          <Feed query={query} cache={cache} tab='news' />
+          <Editor query={query} save={write} />
+        </>
+      );
+    }
+
+    function deferredFetch() {
+      const resolveQueue: Array<(v: string) => void> = [];
+      const fetchFeed = vi.fn(
+        (tab: string) =>
+          new Promise<string>((resolve) => {
+            resolveQueue.push(resolve);
+          })
+      );
+      return {resolveQueue, fetchFeed};
+    }
+
+    it('should purge the cache and refetch what subscribers display when the mutation succeeds', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const save = vi.fn(() => Promise.resolve('saved'));
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      render(
+        <App
+          fetchFeed={fetchFeed}
+          save={save}
+          cache={cache}
+          Editor={IdentityEditor}
+        />
+      );
+
+      // first call populates the cache and the result
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(1);
+      });
+      await act(async () => {
+        resolveQueue[0]('feed v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+      });
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+      expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
+
+      // a successful mutation purges the entry and re-runs the tracked
+      // ['news'] call — the subscriber goes through a fresh loading cycle
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('save'));
+      });
+      await waitFor(() => {
+        expect(fetchFeed).toHaveBeenCalledTimes(2);
+      });
+      expect(fetchFeed).toHaveBeenLastCalledWith('news');
+      // the entry is deleted before the refetch starts, so the refetch is
+      // a hard cache miss
+      expect(cache.get(['news'])).toBeUndefined();
+
+      await act(async () => {
+        resolveQueue[1]('feed v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v2');
+      });
+      expect(cache.get(['news'])).toEqual(['feed v2', expect.any(Number)]);
+      expect(save).toHaveBeenCalledWith('draft');
+    });
+
+    it('should invalidate nothing when the mutation fails', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const save = vi.fn(() => Promise.reject(new Error('boom')));
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      render(
+        <App
+          fetchFeed={fetchFeed}
+          save={save}
+          cache={cache}
+          Editor={IdentityEditor}
+        />
+      );
+
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(1);
+      });
+      await act(async () => {
+        resolveQueue[0]('feed v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('save'));
+      });
+      await act(async () => {});
+      // the rejection left the cache and the displayed data untouched
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+      expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
+      expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+    });
+
+    it('should match targets by args prefix and leave other entries alone', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const save = vi.fn(() => Promise.resolve('saved'));
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      // Two tabs are two injectables of the same fetcher (each owns its
+      // result broadcast) sharing ONE cache provider — the SWR-recipe
+      // composition. The prefix target discriminates entries inside the
+      // shared cache.
+      function TwoTabs() {
+        const newsQuery = useInjectable(fetchFeed);
+        const sportsQuery = useInjectable(fetchFeed);
+        const write = useInjectable(save);
+        return (
+          <>
+            <Feed query={newsQuery} cache={cache} tab='news' />
+            <Feed query={sportsQuery} cache={cache} tab='sports' />
+            <PrefixEditor query={newsQuery} save={write} />
+          </>
+        );
+      }
+
+      render(<TwoTabs />);
+
+      // both tabs load once and land in the shared cache under their args
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(2);
+      });
+      await act(async () => {
+        resolveQueue[0]('news v1');
+        resolveQueue[1]('sports v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('news v1');
+        expect(screen.getByTestId('feed-sports').textContent).toBe(
+          'sports v1'
+        );
+      });
+      expect(cache.get(['news'])).toEqual(['news v1', expect.any(Number)]);
+      expect(cache.get(['sports'])).toEqual(['sports v1', expect.any(Number)]);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('save'));
+      });
+      // only the 'news' line is invalidated and re-run
+      await waitFor(() => {
+        expect(fetchFeed).toHaveBeenCalledTimes(3);
+      });
+      expect(fetchFeed).toHaveBeenLastCalledWith('news');
+      expect(cache.get(['news'])).toBeUndefined();
+      expect(cache.get(['sports'])).toEqual(['sports v1', expect.any(Number)]);
+
+      await act(async () => {
+        resolveQueue[2]('news v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('news v2');
+      });
+      expect(screen.getByTestId('feed-sports').textContent).toBe('sports v1');
+    });
+
+    it('should survive StrictMode double mounting with exactly one refetch', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const save = vi.fn(() => Promise.resolve('saved'));
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      function StrictApp() {
+        const query = useInjectable(fetchFeed);
+        const write = useInjectable(save);
+        return (
+          <>
+            <Feed query={query} cache={cache} tab='news' />
+            <IdentityEditor query={query} save={write} />
+          </>
+        );
+      }
+
+      render(
+        <StrictMode>
+          <StrictApp />
+        </StrictMode>
+      );
+
+      // StrictMode double-fires the mount effects: the initial run happens
+      // twice (both cache misses until the first resolves)
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(2);
+      });
+      await act(async () => {
+        resolveQueue[0]('feed v1');
+        resolveQueue[1]('feed v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+      });
+      expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('save'));
+      });
+      // the simulated remount re-tracked ['news'], so invalidation
+      // refetches it exactly once (deduped by the structural key)
+      await waitFor(() => {
+        expect(fetchFeed).toHaveBeenCalledTimes(3);
+      });
+      expect(fetchFeed).toHaveBeenLastCalledWith('news');
+
+      await act(async () => {
+        resolveQueue[2]('feed v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v2');
+      });
+      expect(cache.get(['news'])).toEqual(['feed v2', expect.any(Number)]);
+    });
+
+    it('should purge a target without live consumers and not refetch it', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      let queryRef: ((tab: string) => Promise<string>) | undefined;
+
+      function OnlyFeed() {
+        const query = useInjectable(fetchFeed);
+        queryRef = query;
+        return <Feed query={query} cache={cache} tab='news' />;
+      }
+
+      const {unmount} = render(<OnlyFeed />);
+
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(1);
+      });
+      await act(async () => {
+        resolveQueue[0]('feed v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+      });
+      expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
+
+      // the provider binding outlives the consumer: after unmount the
+      // entry survives (that is what a cache is for) …
+      unmount();
+      expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
+
+      // … and the standalone invalidate() still purges it, without a
+      // refetch — there is no mounted wrapper chain to revalidate through
+      act(() => {
+        invalidate([queryRef!]);
+      });
+      expect(cache.get(['news'])).toBeUndefined();
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
     });
   });
 

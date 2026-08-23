@@ -23,6 +23,9 @@ import {
   useReconnectRevalidate,
   useOptimistic,
   useInfinite,
+  useMutation,
+  invalidate,
+  type MutationOptions,
   isInjectable,
   subscribeInjectEvents
 } from '../src/async';
@@ -98,6 +101,11 @@ describe('async hooks exports', () => {
   it('should export useInvalidate', () => {
     expect(useInvalidate).toBeDefined();
     expect(typeof useInvalidate).toBe('function');
+  });
+
+  it('should export invalidate', () => {
+    expect(invalidate).toBeDefined();
+    expect(typeof invalidate).toBe('function');
   });
 
   it('should export getInjectContext', () => {
@@ -1061,5 +1069,189 @@ describe('useRun inline-args dev warning', () => {
       vi.unstubAllEnvs();
       warn.mockRestore();
     }
+  });
+});
+
+describe('useMutation', () => {
+  // Minimal deferred for driving in-flight calls deterministically.
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: any) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return {promise, resolve, reject};
+  }
+
+  function MutationView({
+    save,
+    options,
+    seen,
+    onPromise
+  }: {
+    save: (name: string) => Promise<string>;
+    options?: MutationOptions<(name: string) => Promise<string>>;
+    seen?: {mutates: unknown[]};
+    onPromise?: (p: Promise<string>) => void;
+  }) {
+    const [mutate, {isMutating, error, failureCount}, reset] = useMutation(
+      save,
+      options
+    );
+    seen?.mutates.push(mutate);
+    return createElement(
+      'div',
+      null,
+      createElement('p', null, isMutating ? 'mutating' : 'idle'),
+      ...(error ? [createElement('p', null, error.message)] : []),
+      createElement('p', null, `failures ${failureCount}`),
+      createElement(
+        'button',
+        {
+          type: 'button',
+          onClick: () => {
+            const p = mutate('alpha');
+            // The raw promise goes to the test (to assert propagation);
+            // the no-op catch keeps fire-and-forget clicks unhandled-free.
+            onPromise?.(p);
+            p.catch(() => {});
+          }
+        },
+        'rename'
+      ),
+      createElement('button', {type: 'button', onClick: reset}, 'reset')
+    );
+  }
+
+  it('should flip isMutating around the call and fire onSuccess with result and args', async () => {
+    const onSuccess = vi.fn();
+    const first = deferred<string>();
+
+    render(
+      createElement(MutationView, {
+        save: () => first.promise,
+        options: {onSuccess}
+      })
+    );
+    expect(screen.getByText('idle')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('mutating')).toBeTruthy();
+
+    await act(async () => {
+      first.resolve('saved');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+    expect(screen.queryByText('mutating')).toBeNull();
+    expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha');
+    expect(screen.getByText('failures 0')).toBeTruthy();
+  });
+
+  it('should surface the error, count failures, then reset both on success', async () => {
+    const onError = vi.fn();
+    let fail = true;
+    const save = (name: string) =>
+      fail ? Promise.reject(new Error('boom')) : Promise.resolve('saved');
+
+    render(createElement(MutationView, {save, options: {onError}}));
+
+    fireEvent.click(screen.getByText('rename'));
+    await act(async () => {});
+    expect(screen.getByText('boom')).toBeTruthy();
+    expect(screen.getByText('failures 1')).toBeTruthy();
+    expect(screen.getByText('idle')).toBeTruthy(); // not stuck mutating
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), 'alpha');
+
+    fail = false;
+    fireEvent.click(screen.getByText('rename'));
+    await act(async () => {});
+    // a success clears the shared error and resets the failure tally
+    expect(screen.queryByText('boom')).toBeNull();
+    expect(screen.getByText('failures 0')).toBeTruthy();
+  });
+
+  it('should clear settled errors on reset while in-flight calls still land', async () => {
+    // Every call hands back its own deferred: outcomes are settled in the
+    // exact order the test chooses.
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const save = () => {
+      const d = deferred<string>();
+      calls.push(d);
+      return d.promise;
+    };
+
+    render(createElement(MutationView, {save}));
+
+    // A settled failure is wiped by reset.
+    fireEvent.click(screen.getByText('rename'));
+    await act(async () => {
+      calls[0]!.reject(new Error('boom'));
+    });
+    expect(screen.getByText('boom')).toBeTruthy();
+    expect(screen.getByText('failures 1')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('reset'));
+    await act(async () => {});
+    expect(screen.queryByText('boom')).toBeNull();
+    expect(screen.getByText('failures 0')).toBeTruthy();
+
+    // An in-flight SUCCESS settled after reset still applies.
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('mutating')).toBeTruthy();
+    fireEvent.click(screen.getByText('reset'));
+    await act(async () => {
+      calls[1]!.resolve('saved');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+    expect(screen.queryByText('boom')).toBeNull();
+
+    // An in-flight FAILURE settled after reset still surfaces: reset
+    // writes below the seq watermark, so the reserved ticket stays valid.
+    fireEvent.click(screen.getByText('rename'));
+    fireEvent.click(screen.getByText('reset'));
+    await act(async () => {
+      calls[2]!.reject(new Error('late'));
+    });
+    expect(screen.getByText('late')).toBeTruthy();
+    expect(screen.getByText('failures 1')).toBeTruthy();
+  });
+
+  it('should keep mutate stable and funnel the latest inline options', async () => {
+    const seen = {mutates: [] as unknown[]};
+    const stale = vi.fn();
+    const fresh = vi.fn();
+    const save = (name: string) => Promise.resolve(`saved:${name}`);
+
+    const {rerender} = render(
+      createElement(MutationView, {save, options: {onSuccess: stale}, seen})
+    );
+    rerender(
+      createElement(MutationView, {save, options: {onSuccess: fresh}, seen})
+    );
+    expect(seen.mutates).toHaveLength(2);
+    expect(seen.mutates[0]).toBe(seen.mutates[1]); // stable identity
+
+    fireEvent.click(screen.getByText('rename'));
+    await act(async () => {});
+    expect(stale).not.toHaveBeenCalled();
+    expect(fresh).toHaveBeenCalledWith('saved:alpha', 'alpha');
+  });
+
+  it('should propagate rejections to the caller', async () => {
+    let captured: Promise<string> | undefined;
+    render(
+      createElement(MutationView, {
+        save: () => Promise.reject(new Error('nope')),
+        onPromise: (p) => {
+          captured = p;
+        }
+      })
+    );
+    fireEvent.click(screen.getByText('rename'));
+    await act(async () => {
+      await expect(captured).rejects.toThrow('nope');
+    });
+    expect(screen.getByText('nope')).toBeTruthy();
   });
 });

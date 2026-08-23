@@ -213,29 +213,26 @@ describe('recipes/useProjectPaginatedQuery', () => {
   });
 });
 
-// The mutation template (recipes/useProjectMutation.ts): the hook is
-// generic over the wrapped mutation, so these tests drive it with inline
-// functions instead of a mocked service module.
+// The mutation template (recipes/useProjectMutation.ts). Since the
+// library ships a first-class useMutation (covered in
+// test/async-hooks.test.ts), these tests pin the template's added value
+// only: default-vs-explicit onError wiring.
 describe('recipes/useProjectMutation', () => {
   function MutationView({
     save,
-    onSuccess,
     onError
   }: {
     save: (name: string) => Promise<string>;
-    onSuccess?: (...args: any[]) => void;
-    onError?: (...args: any[]) => void;
+    onError?: (error: Error, ...args: any[]) => void;
   }) {
-    const [mutate, {isMutating, error, failureCount}] = useProjectMutation(
-      save,
-      {onSuccess, onError}
-    );
+    const [mutate, {isMutating, error}] = useProjectMutation(save, {
+      onError
+    });
     return createElement(
       'div',
       null,
       createElement('p', null, isMutating ? 'mutating' : 'idle'),
       ...(error ? [createElement('p', null, error.message)] : []),
-      createElement('p', null, `failures ${failureCount}`),
       // Fire-and-forget call: rejections propagate out of `mutate`, so
       // callers that read `error` instead of awaiting append a catch.
       createElement(
@@ -246,56 +243,45 @@ describe('recipes/useProjectMutation', () => {
     );
   }
 
-  it('should flip isMutating around the call and fire onSuccess with result and args', async () => {
-    const onSuccess = vi.fn();
-    const first = deferred<string>();
-
-    render(
-      createElement(MutationView, {
-        save: () => first.promise,
-        onSuccess
-      })
-    );
-    expect(screen.getByText('idle')).toBeTruthy();
-
-    fireEvent.click(screen.getByText('rename'));
-    expect(screen.getByText('mutating')).toBeTruthy();
-
-    await act(async () => {
-      first.resolve('saved');
-    });
-    expect(screen.getByText('idle')).toBeTruthy();
-    expect(screen.queryByText('mutating')).toBeNull();
-    expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha');
-    expect(screen.getByText('failures 0')).toBeTruthy();
+  it('should report failures to the default reporter when no onError is given', async () => {
+    const reported = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(
+        createElement(MutationView, {
+          save: () => Promise.reject(new Error('boom'))
+        })
+      );
+      fireEvent.click(screen.getByText('rename'));
+      await act(async () => {});
+      expect(screen.getByText('boom')).toBeTruthy();
+      expect(screen.getByText('idle')).toBeTruthy(); // not stuck mutating
+      expect(reported).toHaveBeenCalledTimes(1);
+      const reportedError = reported.mock.calls[0]![1];
+      expect(reportedError).toBeInstanceOf(Error);
+      expect((reportedError as Error).message).toBe('boom');
+    } finally {
+      reported.mockRestore();
+    }
   });
 
-  it('should surface the error, count failures, then reset both on success', async () => {
-    const onSuccess = vi.fn();
+  it('should let an explicit onError replace the default reporter', async () => {
+    const reported = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onError = vi.fn();
-    let fail = true;
-    const save = (name: string) =>
-      fail ? Promise.reject(new Error('boom')) : Promise.resolve('saved');
-
-    render(createElement(MutationView, {save, onSuccess, onError}));
-
-    fireEvent.click(screen.getByText('rename'));
-    await waitFor(() => expect(screen.getByText('boom')).toBeTruthy());
-    expect(screen.getByText('failures 1')).toBeTruthy();
-    expect(screen.getByText('idle')).toBeTruthy(); // not stuck mutating
-    expect(onError).toHaveBeenCalledWith(expect.any(Error), 'alpha');
-    expect(onSuccess).not.toHaveBeenCalled();
-
-    fail = false;
-    fireEvent.click(screen.getByText('rename'));
-    await waitFor(() =>
-      expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha')
-    );
-    // a success clears the shared error and resets the failure tally
-    await waitFor(() => {
-      expect(screen.queryByText('boom')).toBeNull();
-      expect(screen.getByText('failures 0')).toBeTruthy();
-    });
+    try {
+      render(
+        createElement(MutationView, {
+          save: () => Promise.reject(new Error('boom')),
+          onError
+        })
+      );
+      fireEvent.click(screen.getByText('rename'));
+      await act(async () => {});
+      expect(onError).toHaveBeenCalledWith(expect.any(Error), 'alpha');
+      expect(screen.getByText('boom')).toBeTruthy();
+      expect(reported).not.toHaveBeenCalled();
+    } finally {
+      reported.mockRestore();
+    }
   });
 });
 
