@@ -1,13 +1,41 @@
 import {Func} from '@@/types';
-import {RefObject, useCallback, useEffect, useRef} from 'react';
+import {
+  RefObject,
+  useCallback,
+  useEffect,
+  useInsertionEffect,
+  useRef
+} from 'react';
 
 const map = new WeakMap();
+
+// Trampoline bookkeeping for React 18's discarded render passes (StrictMode
+// replays each mount render twice and throws the first hook state away, so
+// the first pass registers a trampoline no cleanup will ever remove; React
+// 19 reuses hook state across the replay, and concurrent rendering can
+// discard whole passes the same way). See useInjectable for how the orphans
+// are told apart from not-yet-confirmed siblings of the same commit.
+const CLAIMED = Symbol('claimed');
+const SEQ = Symbol('seq');
+
+type Registry = {
+  /** Monotonic insertion counter for render-time trampolines. */
+  next: number;
+  /**
+   * Largest SEQ among trampolines confirmed by an effect. An unconfirmed
+   * trampoline with a smaller SEQ predates a confirmed insertion, so it can
+   * only come from a discarded render pass: SEQ grows monotonically with
+   * each render-time insertion, so a not-yet-confirmed sibling of the same
+   * commit always carries a larger SEQ than every confirmed trampoline.
+   */
+  claimMax: number;
+};
 
 // `callContext` is a fresh object created for every single call, so a
 // wrapper may stash per-call metadata on it (e.g. the AbortSignal bridge
 // registered by `useRun`).
 export type InjectWrapper<F extends Func> = (f: F, callContext: any) => F;
-type InjectableRef<F extends Func> = [F, InjectWrapper<F>[], any];
+type InjectableRef<F extends Func> = [F, InjectWrapper<F>[], any, Registry];
 
 /**
  * A registration slot owned by a single `useInject` hook instance.
@@ -36,13 +64,30 @@ type Cell<F extends Func> = {
  */
 export function useInjectable<F extends Func>(fn: F): F {
   const ref = useRef<InjectableRef<F>>(undefined);
-  if (!ref.current) ref.current = [fn, [], {}];
+  if (!ref.current) ref.current = [fn, [], {}, {next: 0, claimMax: -1}];
   // Keep the latest fn closure; the wrapper list and context stay stable and
   // are maintained by the individual useInject slots.
   ref.current[0] = fn;
 
   const f = useCallback((...args: Parameters<F>) => {
-    const [func, injects] = ref.current!;
+    const [func, injects, , registry] = ref.current!;
+    // Drop orphans left by discarded render passes. A trampoline that no
+    // effect ever claimed and that predates the latest confirmed insertion
+    // belongs to a hook state React threw away — its cleanup will never
+    // run. Siblings of the same commit carry a larger SEQ than every
+    // confirmed trampoline, so they are safe here. Until the first claim
+    // this filter keeps everything, which preserves the render-time
+    // registration contract for early callers.
+    for (let i = injects.length - 1; i >= 0; i--) {
+      const stable = injects[i] as any;
+      if (
+        stable[SEQ] !== undefined &&
+        !stable[CLAIMED] &&
+        stable[SEQ] < registry.claimMax
+      ) {
+        injects.splice(i, 1);
+      }
+    }
     const callContext = {};
     return injects.reduce((i, w) => w(i, callContext), func)(...args);
   }, []) as F;
@@ -119,6 +164,13 @@ export function addWrapper<F extends Func>(
   };
 }
 
+// Confirming a trampoline must happen before any effect may call the
+// injectable, so prefer useInsertionEffect (which fires before layout and
+// passive effects); React 16.8/17 lack it and fall back to useEffect —
+// they have no StrictMode replay, so the fallback is safe there.
+const useClaim: typeof useEffect =
+  typeof useInsertionEffect === 'function' ? useInsertionEffect : useEffect;
+
 function useInjectCell<F extends Func>(
   fn: F,
   hookName: string,
@@ -135,14 +187,25 @@ function useInjectCell<F extends Func>(
     cellRef.current = cell;
     // Register during render so injections are in place before any effect
     // fires (even ones declared earlier). Pushed exactly once per hook
-    // instance, so re-renders cannot duplicate the registration.
+    // instance, so re-renders cannot duplicate the registration. The SEQ
+    // lets useInjectable tell this insertion apart from orphans left by
+    // discarded render passes (see the claim in the effect below).
+    (cell.stable as any)[SEQ] = ref.current[3].next++;
     insert(ref.current[1], cell.stable);
   } else {
     cellRef.current.latest = wrapper;
   }
   const cell = cellRef.current;
-  useEffect(() => {
+  useClaim(() => {
     const list = ref.current[1];
+    const registry = ref.current[3];
+    // Confirming this trampoline means its component committed: every
+    // earlier unconfirmed trampoline is an orphan from a discarded pass.
+    const seq = (cell.stable as any)[SEQ] as number;
+    (cell.stable as any)[CLAIMED] = true;
+    // claimMax starts at -1 ("nothing claimed yet"); the first claim seeds
+    // it, later ones can only push it up.
+    registry.claimMax = Math.max(registry.claimMax, seq);
     // Re-add after StrictMode's simulated unmount/remount; remove on real
     // unmount so the wrapper stops applying once the component is gone.
     if (!list.includes(cell.stable)) insert(list, cell.stable);

@@ -334,6 +334,60 @@ describe('async hooks', () => {
       });
       expect(applied).toHaveBeenCalledTimes(1);
     });
+
+    it('should keep every wrapper when sibling components inject the same injectable under StrictMode', async () => {
+      const calls: string[] = [];
+      let holder!: (...args: any[]) => Promise<any>;
+
+      function Owner() {
+        const f = useInjectable(async () => 'ok');
+        holder = f;
+        return (
+          <>
+            <First fn={f} />
+            <Second fn={f} />
+          </>
+        );
+      }
+
+      function First({fn}: {fn: any}) {
+        useInject(
+          fn,
+          (f: any) =>
+            ((...args: any[]) => {
+              calls.push('first');
+              return f(...args);
+            }) as any
+        );
+        return null;
+      }
+
+      function Second({fn}: {fn: any}) {
+        useInject(
+          fn,
+          (f: any) =>
+            ((...args: any[]) => {
+              calls.push('second');
+              return f(...args);
+            }) as any
+        );
+        return null;
+      }
+
+      render(
+        <StrictMode>
+          <Owner />
+        </StrictMode>
+      );
+      await act(async () => {
+        await holder();
+      });
+      // React 18's StrictMode replay leaves orphan trampolines behind, but
+      // the cleanup must only drop those — each committed sibling keeps
+      // exactly one wrapper, applied once per call. Second registered last,
+      // so it is the outer layer and runs first.
+      expect(calls).toEqual(['second', 'first']);
+    });
   });
 
   describe('createMemoryCacheProvider', () => {
@@ -1886,7 +1940,11 @@ describe('async hooks', () => {
       return <span data-testid={`feed-${tab}`}>{result ?? 'none'}</span>;
     }
 
-    function SaveButton({mutate}: {mutate: (draft: string) => Promise<string>}) {
+    function SaveButton({
+      mutate
+    }: {
+      mutate: (draft: string) => Promise<string>;
+    }) {
       return (
         <button
           data-testid='save'
@@ -2080,9 +2138,7 @@ describe('async hooks', () => {
       });
       await waitFor(() => {
         expect(screen.getByTestId('feed-news').textContent).toBe('news v1');
-        expect(screen.getByTestId('feed-sports').textContent).toBe(
-          'sports v1'
-        );
+        expect(screen.getByTestId('feed-sports').textContent).toBe('sports v1');
       });
       expect(cache.get(['news'])).toEqual(['news v1', expect.any(Number)]);
       expect(cache.get(['sports'])).toEqual(['sports v1', expect.any(Number)]);
