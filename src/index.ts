@@ -4,3 +4,5 @@
  */
 
 export {default as memo, memoBase, defaultTestEvent} from './memo';
+export {stableHash, isAbortSignal} from './util';
+export type {Func} from './types';

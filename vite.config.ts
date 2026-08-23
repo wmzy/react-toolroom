@@ -1,7 +1,7 @@
 import * as path from 'path';
 import {defineConfig, PluginOption} from 'vite';
 import react from '@vitejs/plugin-react';
-import linaria from '@linaria/vite';
+import wyw from '@wyw-in-js/vite';
 
 const buildDemo = process.env.BUILD_DEMO === 'true';
 const base = buildDemo ? '/react-toolroom/demos/' : '/demos/';
@@ -13,6 +13,10 @@ export default defineConfig({
       {
         find: 'react-toolroom/async',
         replacement: `${path.join(__dirname, 'src/async/index.ts')}`
+      },
+      {
+        find: 'react-toolroom/devtools',
+        replacement: `${path.join(__dirname, 'src/devtools/index.tsx')}`
       },
       {
         find: 'react-toolroom',
@@ -31,6 +35,12 @@ export default defineConfig({
   define: {
     'process.env.BASE_URL': JSON.stringify(base)
   },
+  // vite 8 resolves bare imports to optimized deps (.vite/deps) which breaks
+  // @linaria's wyw-in-js tag discovery (the optimized file has no package.json
+  // next to it). Exclude it so the evaluator sees the real package.
+  optimizeDeps: {
+    exclude: ['@linaria/core']
+  },
   esbuild: false,
   build: buildDemo
     ? {
@@ -44,9 +54,16 @@ export default defineConfig({
           name: 'react-toolroom',
           entry: {
             index: 'src/index.ts',
-            async: 'src/async/index.ts'
+            async: 'src/async/index.ts',
+            devtools: 'src/devtools/index.tsx'
           },
-          formats: ['es']
+          formats: ['es', 'cjs'],
+          // Without a "type" field in package.json Vite names cjs outputs
+          // `.js` (resolveOutputJsExtension); pin extensions per format so
+          // CommonJS artifacts are `.cjs`, unambiguous under any future
+          // `"type"` setting. Chunks follow the same rule via their defaults.
+          fileName: (format, entryName) =>
+            format === 'cjs' ? `${entryName}.cjs` : `${entryName}.mjs`
         },
         rollupOptions: {
           external: (id) =>
@@ -61,12 +78,16 @@ export default defineConfig({
     open: '/demos/'
   },
   plugins: [
-    buildDemo
-      ? null
-      : (linaria({
-          sourceMap: true,
-          exclude: ['node_modules/**']
-        }) as PluginOption),
+    // `hybrid` resolver handles Vite virtual modules (e.g. react-refresh's
+    // /@react-refresh) which the evaluator hits when components use inline
+    // `css` tags. `@linaria/vite` 5.x is unmaintained and breaks on Vite 8.
+    wyw({
+      sourceMap: true,
+      exclude: ['node_modules/**'],
+      eval: {
+        resolver: 'hybrid'
+      }
+    }) as PluginOption,
     react({
       exclude: ['node_modules/**'],
       babel: {
@@ -74,5 +95,5 @@ export default defineConfig({
         babelrc: true
       }
     })
-  ].filter((p): p is PluginOption => p !== null)
+  ]
 });

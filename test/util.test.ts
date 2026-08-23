@@ -1,5 +1,13 @@
 import {describe, it, expect} from 'vitest';
-import {thru, thruSet, thruError, noop, getDisplayName} from '../src/util';
+import {
+  thru,
+  thruSet,
+  thruError,
+  noop,
+  getDisplayName,
+  stableHash,
+  isAbortSignal
+} from '../src/util';
 
 describe('util', () => {
   describe('thru', () => {
@@ -165,6 +173,130 @@ describe('util', () => {
       };
       Component.displayName = 'PreferredName';
       expect(getDisplayName(Component)).toBe('PreferredName');
+    });
+  });
+
+  describe('stableHash', () => {
+    it('should hash primitives by type', () => {
+      expect(stableHash(undefined)).toBe('u');
+      expect(stableHash(null)).toBe('n');
+      expect(stableHash(true)).not.toBe(stableHash(false));
+    });
+
+    it('should distinguish 1 and "1"', () => {
+      expect(stableHash(1)).not.toBe(stableHash('1'));
+      expect(stableHash(1)).not.toBe(stableHash([1]));
+    });
+
+    it('should treat equivalent objects with different key order as equal', () => {
+      expect(stableHash({a: 1, b: 2})).toBe(stableHash({b: 2, a: 1}));
+      expect(stableHash({a: 1, b: 2})).not.toBe(stableHash({a: 2, b: 1}));
+      expect(stableHash({a: 1})).not.toBe(stableHash({a: 1, b: 2}));
+    });
+
+    it('should hash Dates with the same instant equally', () => {
+      expect(stableHash(new Date(1000))).toBe(stableHash(new Date(1000)));
+      expect(stableHash(new Date(1000))).not.toBe(stableHash(new Date(2000)));
+    });
+
+    it('should return a fixed placeholder for AbortSignal', () => {
+      const controller1 = new AbortController();
+      const controller2 = new AbortController();
+      expect(stableHash(controller1.signal)).toBe('#sig');
+      expect(stableHash(controller2.signal)).toBe('#sig');
+      expect(stableHash([controller1.signal])).toBe(
+        stableHash([controller2.signal])
+      );
+    });
+
+    it('should return stable hashes for function references', () => {
+      const fn = () => {};
+      const other = () => {};
+      expect(stableHash(fn)).toBe(stableHash(fn));
+      expect(stableHash(fn)).not.toBe(stableHash(other));
+      expect(stableHash({callback: fn})).toBe(stableHash({callback: fn}));
+    });
+
+    it('should not throw on circular references', () => {
+      const obj: any = {name: 'cycle'};
+      obj.self = obj;
+      expect(() => stableHash(obj)).not.toThrow();
+      expect(stableHash(obj)).toBe(stableHash(obj));
+
+      const arr: any[] = [];
+      arr.push(arr);
+      expect(() => stableHash(arr)).not.toThrow();
+    });
+
+    it('should hash nested arrays and objects structurally', () => {
+      const a = {list: [1, {x: 'y'}], meta: {ok: true}};
+      const b = {meta: {ok: true}, list: [1, {x: 'y'}]};
+      expect(stableHash(a)).toBe(stableHash(b));
+      expect(stableHash(a)).not.toBe(
+        stableHash({list: [1, {x: 'z'}], meta: {ok: true}})
+      );
+      expect(stableHash([[1, 2], [3]])).toBe(stableHash([[1, 2], [3]]));
+      expect(stableHash([[1, 2], [3]])).not.toBe(stableHash([[3], [1, 2]]));
+    });
+
+    it('should hash Map entries and Set values order-independently', () => {
+      expect(
+        stableHash(
+          new Map([
+            ['a', 1],
+            ['b', 2]
+          ])
+        )
+      ).toBe(
+        stableHash(
+          new Map([
+            ['b', 2],
+            ['a', 1]
+          ])
+        )
+      );
+      expect(stableHash(new Map([['a', 1]]))).not.toBe(
+        stableHash(new Map([['a', 2]]))
+      );
+      expect(stableHash(new Set([1, 2, 3]))).toBe(
+        stableHash(new Set([3, 2, 1]))
+      );
+      expect(stableHash(new Set([1, 2]))).not.toBe(stableHash(new Set([1, 3])));
+    });
+  });
+
+  describe('isAbortSignal', () => {
+    it('should return true for a real AbortSignal', () => {
+      expect(isAbortSignal(new AbortController().signal)).toBe(true);
+    });
+
+    it('should return true for a duck-typed signal from another realm', () => {
+      // A plain object standing in for a signal whose realm is not this one
+      // (e.g. an iframe's AbortSignal): `instanceof` would fail here.
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+      expect(isAbortSignal(foreignSignal)).toBe(true);
+    });
+
+    it('should return false for non-signals', () => {
+      expect(isAbortSignal(undefined)).toBe(false);
+      expect(isAbortSignal(null)).toBe(false);
+      expect(isAbortSignal({})).toBe(false);
+      expect(isAbortSignal({aborted: false})).toBe(false);
+      expect(isAbortSignal(() => {})).toBe(false);
+    });
+
+    it('should let stableHash hash a duck-typed signal as #sig', () => {
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+      expect(stableHash(foreignSignal)).toBe('#sig');
+      expect(stableHash({signal: foreignSignal})).toBe(
+        stableHash({signal: new AbortController().signal})
+      );
     });
   });
 });
