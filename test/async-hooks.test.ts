@@ -713,9 +713,11 @@ describe('subscribeInjectEvents', () => {
 
     // The observer is the outermost layer, so its duration spans the whole
     // chain underneath — including the hook-registered wrapper's 50ms sleep.
+    // setTimeout and performance.now() come from different clock sources, so
+    // the measured span can run a fraction of a millisecond short of 50.
     expect(settles.length).toBe(1);
     expect(settles[0].result).toBe('ok');
-    expect(settles[0].duration).toBeGreaterThanOrEqual(50);
+    expect(settles[0].duration).toBeGreaterThanOrEqual(45);
 
     unsubscribe();
   });
