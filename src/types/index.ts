@@ -32,7 +32,24 @@ export type CacheProvider<T, K extends any[]> = {
   // The members below are optional so existing custom providers (localStorage,
   // IndexedDB, no-op stubs, …) keep compiling and stay semantically valid —
   // only the memory provider ships them. Callers must feature-detect
-  // (`if (provider.dehydrate) …`) instead of assuming they exist.
+  // (`if (provider.load) …`) instead of assuming they exist.
+  /**
+   * Atomic get-or-insert of the in-flight slot: if a request for `k` is
+   * already pending, its promise is returned and `factory` is NOT invoked;
+   * otherwise `factory()` runs once and its promise is registered, so every
+   * concurrent consumer (and every channel — another injectable, a router
+   * loader) shares one request. On settle the provider writes the result
+   * back itself — unless a write (`set`/`delete`/…) touched the key while
+   * the request was in flight, in which case the late response is dropped
+   * instead of clobbering the newer value. A rejection vacates the slot,
+   * keeps any previously settled data and rethrows as-is.
+   */
+  load?: (k: K, factory: () => Promise<T>) => Promise<T>;
+  /**
+   * Reads the settled entry for `k` — `{value, cachedAt}` or `undefined` —
+   * without observing in-flight requests and without ever creating one.
+   */
+  peek?: (k: K) => {value: T; cachedAt: number} | undefined;
   /** Serializes every entry into a JSON-safe plain object, for SSR transport. */
   dehydrate?: () => Record<string, [T, number]>;
   /** Merges entries produced by `dehydrate` back in; never clears existing ones. */
@@ -47,6 +64,6 @@ export type CacheProvider<T, K extends any[]> = {
   deleteWhere?: (predicate: (k: K) => boolean) => void;
   /** Notifies `listener` after any entry mutation; returns an unsubscribe. */
   subscribe?: (listener: (e: CacheEvent<K>) => void) => () => void;
-  /** Shallow-copies every entry as {key, value, cachedAt} for read-only observation. */
-  snapshot?: () => {key: string; value: T; cachedAt: number}[];
+  /** Shallow-copies every settled entry as {key, value, cachedAt} for read-only observation; entries with a request in flight carry an additive `pending: true`. */
+  snapshot?: () => {key: string; value: T; cachedAt: number; pending?: boolean}[];
 };

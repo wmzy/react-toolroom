@@ -11,7 +11,7 @@
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
 - **React 16.8 – 19** — one code path, broad peer range.
-- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 226 tests.
+- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 233 tests.
 
 ## Install
 
@@ -29,7 +29,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | --- | --- | --- | --- | --- |
 | Runtime dependencies | **0** | 0 | 0 | ahooks itself |
 | Global Provider required | **No** | Yes (`QueryClientProvider`) | No | No |
-| Request deduplication | `useDedup` | built-in | built-in | ✗ (debounce/throttle only) |
+| Request deduplication | built-in (`load` on the cache provider; `useDedup` for uncached injectables) | built-in | built-in | ✗ (debounce/throttle only) |
 | Polling | `usePolling` | `refetchInterval` | `refreshInterval` | `pollingInterval` |
 | Refetch on focus | `useFocusRevalidate` | `refetchOnWindowFocus` | `revalidateOnFocus` | `refreshOnWindowFocus` |
 | Refetch on reconnect | `useReconnectRevalidate` | built-in | built-in | ✗ |
@@ -232,6 +232,8 @@ const report = useResult(loadReport);
 
 Keys default to `stableHash`, which is insertion-order independent and maps every `AbortSignal` to a fixed placeholder — so reruns from `useRun(fn, args, {signal: true})` still dedupe. Entries are dropped when the promise settles, which means a failed call can be retried.
 
+> **Redundant alongside `createMemoryCacheProvider`.** The memory cache provider now deduplicates in-flight requests itself (`load`, below) — and `useCache` routes every fetch through it — so stacking `useDedup` on a cached injectable adds nothing: same args in flight → one request either way. `useDedup` remains the tool for *custom* providers (localStorage, IndexedDB, no-op stubs) that do not implement `load`, or for deduping an injectable that is not cached at all.
+
 ### Poll and revalidate on focus — `usePolling` + `useFocusRevalidate`
 
 ```tsx
@@ -295,6 +297,30 @@ function UserList() {
 ```
 
 On a cache hit, the cached value is broadcast to every subscriber **immediately** — components render data without waiting for the network. If it is older than `staleTime` (default `0`: every hit revalidates), a background refetch follows and updates everyone when it lands; its failures are swallowed so stale data stays on screen. With defaults, `createMemoryCacheProvider()` keeps entries forever (`cacheTime: Infinity`) and hashes keys with `stableHash`; when a finite `cacheTime` is set, the cache clears itself once no component has used it for that long. The returned `stale` flag is shared state too: every `useCache` consumer of the same injectable reads one broadcast flag and updates together, the last staleness verdict winning.
+
+Because every fetch `useCache` starts (a miss or a stale background revalidation) goes through the provider's `load`, concurrent consumers share one in-flight request — including consumers on *different* injectables, as long as they read the same provider with the same args. StrictMode double-mounts, two components fetching the same key in one commit, a router loader running the same read: one network request, one write-back.
+
+### Read-through with in-flight sharing — `load` / `peek`
+
+`createMemoryCacheProvider()` entries are **three-state**: settled data, an in-flight request, or both (stale data served while a background revalidation runs). Two provider methods expose that machinery directly — this is the seam a router loader uses to share a cache with `useCache`:
+
+```tsx
+const userCache = createMemoryCacheProvider<User, [string]>({cacheTime: 60000});
+
+// Router loader channel: read-through with in-flight dedup.
+const user = await userCache.load([id], () => api.user(id));
+// Same args while that request is pending — from this loader, a useCache
+// consumer, anything — share the very same promise; the factory runs once.
+
+// Synchronous peek: settled data or undefined. Never observes an
+// in-flight request, never starts one — safe for render-time checks.
+const cached = userCache.peek([id]); // {value, cachedAt} | undefined
+```
+
+- **`load(args, factory)`** — atomic get-or-insert of the in-flight slot: an existing pending request for the same key is returned as-is (`factory` not invoked), otherwise `factory()` runs once and is registered. When it settles, the provider writes the result back itself. A per-key **generation counter**, bumped by every write (`set`/`delete`/`deletePrefix`/`deleteWhere`, wiped by `clear`), guards the write-back: if anything wrote to the key while the request was in flight — a mutation's write-through, an invalidation — the late response is dropped instead of clobbering the newer value. `cachedAt` is stamped **from settlement**, not from when the request started, so a slow response does not eat into the data's `cacheTime`/`staleTime` budget. A rejection vacates the slot, keeps any previously settled data (SWR: a failed background refetch leaves the stale value on screen) and rethrows to the caller as-is.
+- **`peek(args)`** — reads the settled entry (`{value, cachedAt}` or `undefined`) without observing in-flight requests and without ever creating one: checking the cache can never trigger a fetch. (`get` also reads only settled data, but as the tuple `[value, cachedAt]`; `peek` is the object-shaped, request-free contract non-React channels program against.)
+
+In-flight state is deliberately invisible to `get`/`peek`/`dehydrate`/`snapshot` data rows — only settled data is ever "the cache". `snapshot()` marks entries that additionally have a request running with an additive `pending: true`.
 
 ### Invalidate after a mutation — `useInvalidate`
 
@@ -601,8 +627,8 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is a cache provider (all of its entries are purged) or a `[provider, ...argsPrefix]` tuple (only entries whose raw args tuple structurally extends the prefix, removed via the provider's `deleteWhere` — any `hash` convention works). A pure cache operation: no injectable needed, no request issued; mounted `useCache` consumers of the provider refresh themselves through its deletion event (refetch via the wrapper chain, rewrite, broadcast). |
 | `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
 | `useInfinite(fn, {getNextPageParam})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` — a subset of TanStack's `useInfiniteQuery`. Only `fetchNextPage()` calls append; any direct call (e.g. a `useRun` rerun) resets `pages`. |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges), `deletePrefix` (batch invalidation by hashed-key prefix), `deleteWhere` (batch invalidation by args predicate — what prefix `invalidates` targets use) and `subscribe`/`snapshot` — an observation interface driving both the DevTools panel and `useCache`'s passive revalidation (a `set` event fires after writes, a `delete` event after removals carrying the removed entries' raw args; `snapshot()` lists every entry as `{key, value, cachedAt}`); idle-garbage-collects entries after `cacheTime` once unused. |
-| `useDedup(fn, {hash = stableHash}?)` | Concurrent calls with the same key share one in-flight promise; the entry is dropped on settle, so failures are retryable. |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `load(args, factory)` (atomic get-or-insert of the in-flight slot: concurrent same-key reads share one request whose generation-guarded settle write-back the provider owns — the seam a router loader uses to share a cache with `useCache`), `peek(args)` (read settled data as `{value, cachedAt}` without observing or starting requests), `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges), `deletePrefix` (batch invalidation by hashed-key prefix), `deleteWhere` (batch invalidation by args predicate — what prefix `invalidates` targets use) and `subscribe`/`snapshot` — an observation interface driving both the DevTools panel and `useCache`'s passive revalidation (a `set` event fires after writes, a `delete` event after removals carrying the removed entries' raw args; `snapshot()` lists every settled entry as `{key, value, cachedAt}`, with an additive `pending: true` while a request runs); idle-garbage-collects entries after `cacheTime` once unused. |
+| `useDedup(fn, {hash = stableHash}?)` | Concurrent calls with the same key share one in-flight promise; the entry is dropped on settle, so failures are retryable. Redundant alongside `createMemoryCacheProvider` (its `load` already dedupes, and `useCache` routes through it) — kept for custom providers without `load` and for uncached injectables. |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | Call `fn(...args)` every `interval` ms; skips ticks while the previous call is pending; pauses while the document is hidden unless `whenHidden`. Changing `interval` restarts the timer. `args` land on the same `useCache`/`useDedup` key as `useRun(fn, args)` — pass the keyed tuple when `useRun` uses one. |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | Refetch on window focus and on `visibilitychange` back to visible, throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. |
 | `useReconnectRevalidate(fn, {interval = 0, args = []}?)` | Refetch when the network connection comes back (window `online` event), guarded by `navigator.onLine` and throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. The equivalent of TanStack's `refetchOnReconnect` / SWR's `revalidateOnReconnect`. |
@@ -635,7 +661,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
-- **Tested** — 226 tests (vitest + Testing Library).
+- **Tested** — 233 tests (vitest + Testing Library).
 
 ## Demos
 

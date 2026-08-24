@@ -629,6 +629,137 @@ describe('async hooks', () => {
         expect.any(Number)
       ]);
     });
+
+    it('should run the factory once for concurrent loads with the same key', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let resolveFn!: (v: string) => void;
+      const factory = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      const a = provider.load!(['k'], factory);
+      const b = provider.load!(['k'], factory);
+      resolveFn('v');
+
+      expect(await a).toBe('v');
+      expect(await b).toBe('v');
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(await provider.get(['k'])).toEqual(['v', expect.any(Number)]);
+    });
+
+    it('should stamp cachedAt from settlement, not from the request start', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let factoryDoneAt = 0;
+      const promise = provider.load!(
+        ['k'],
+        () =>
+          new Promise<string>((resolve) => {
+            setTimeout(() => {
+              factoryDoneAt = Date.now();
+              resolve('v');
+            }, 10);
+          })
+      );
+
+      await promise;
+
+      // A slow response must not eat into the data's cacheTime budget: the
+      // timestamp counts from when the value landed, which is never before
+      // the factory finished.
+      const [, cachedAt] = (await provider.get(['k']))!;
+      expect(cachedAt).toBeGreaterThanOrEqual(factoryDoneAt);
+    });
+
+    it('should keep a write-through value when an in-flight load settles later', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let resolveFn!: (v: string) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      provider.set(['k'], 'written');
+
+      resolveFn('fetched');
+      // Callers of the shared request still receive its result…
+      expect(await promise).toBe('fetched');
+      // …but the cache keeps the value written while it was in flight.
+      expect(await provider.get(['k'])).toEqual(['written', expect.any(Number)]);
+    });
+
+    it('should not resurrect an entry deleted while its load was in flight', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let resolveFn!: (v: string) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      provider.delete(['k']);
+
+      resolveFn('fetched');
+      await promise;
+      expect(await provider.get(['k'])).toBeUndefined();
+    });
+
+    it('should keep settled data and vacate the slot when a load rejects', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      provider.set(['k'], 'old');
+      let rejectFn!: (e: Error) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((_, reject) => (rejectFn = reject))
+      );
+
+      rejectFn(new Error('boom'));
+
+      await expect(promise).rejects.toThrow('boom');
+      // SWR: a failed background refetch leaves the old value on screen.
+      expect(await provider.get(['k'])).toEqual(['old', expect.any(Number)]);
+
+      // The slot was vacated, so a retry starts a fresh factory instead of
+      // sharing the rejected promise.
+      const factory = vi.fn(() => Promise.resolve('fresh'));
+      await provider.load!(['k'], factory);
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(await provider.get(['k'])).toEqual(['fresh', expect.any(Number)]);
+    });
+
+    it('should peek settled entries without observing in-flight requests', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let resolveFn!: (v: string) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      expect(provider.peek!(['k'])).toBeUndefined();
+
+      resolveFn('v');
+      await promise;
+
+      const peeked = provider.peek!(['k'])!;
+      expect(peeked.value).toBe('v');
+      expect(peeked.cachedAt).toEqual(expect.any(Number));
+    });
   });
 
   describe('useResult', () => {
@@ -2009,6 +2140,57 @@ describe('async hooks', () => {
         expect(screen.getByTestId('b').textContent).toBe('fresh');
       });
     });
+
+    it('should share one in-flight request across independent injectables using the same provider', async () => {
+      let resolveFn!: (v: string) => void;
+      const fetchData = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+      const cache = createMemoryCacheProvider<string, []>({
+        cacheTime: 60000,
+        hash: (k) => JSON.stringify(k)
+      });
+
+      // Two component instances → two independent injectables (separate
+      // stores and broadcasts), but one shared provider: the provider-level
+      // in-flight slot collapses their concurrent misses into one request —
+      // the cross-component capability useDedup used to own.
+      function Consumer({label}: {label: string}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const result = useResult(injectable);
+        useRun(injectable, []);
+
+        return <span data-testid={label}>{result ?? 'pending'}</span>;
+      }
+
+      function TestComponent() {
+        return (
+          <div>
+            <Consumer label='a' />
+            <Consumer label='b' />
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // both consumers miss the cache in the same commit; the provider's
+      // in-flight slot collapses the two misses into one request
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(1);
+      });
+
+      await act(async () => {
+        resolveFn!('v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('v1');
+        expect(screen.getByTestId('b').textContent).toBe('v1');
+      });
+
+      expect(fetchData).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('useInvalidate', () => {
@@ -2426,14 +2608,14 @@ describe('async hooks', () => {
         </StrictMode>
       );
 
-      // StrictMode double-fires the mount effects: the initial run happens
-      // twice (both cache misses until the first resolves)
+      // StrictMode double-fires the mount effects: both runs miss the cache
+      // while the first is still pending, so the provider-level in-flight
+      // slot collapses them into a single request
       await waitFor(() => {
-        expect(resolveQueue.length).toBe(2);
+        expect(resolveQueue.length).toBe(1);
       });
       await act(async () => {
         resolveQueue[0]('feed v1');
-        resolveQueue[1]('feed v1');
       });
       await waitFor(() => {
         expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
@@ -2446,12 +2628,12 @@ describe('async hooks', () => {
       // the simulated remount re-tracked ['news'], so invalidation
       // refetches it exactly once (deduped by the structural key)
       await waitFor(() => {
-        expect(fetchFeed).toHaveBeenCalledTimes(3);
+        expect(fetchFeed).toHaveBeenCalledTimes(2);
       });
       expect(fetchFeed).toHaveBeenLastCalledWith('news');
 
       await act(async () => {
-        resolveQueue[2]('feed v2');
+        resolveQueue[1]('feed v2');
       });
       await waitFor(() => {
         expect(screen.getByTestId('feed-news').textContent).toBe('feed v2');

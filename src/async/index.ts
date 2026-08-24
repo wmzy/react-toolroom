@@ -482,6 +482,13 @@ export function useSuspenseResult<AF extends AsyncFunc>(
  * wrapper chain and broadcasts the fresh results (see
  * {@link invalidate}).
  *
+ * Providers that implement `load` get in-flight sharing for free: every
+ * fetch this hook starts (a miss or a stale background revalidation) goes
+ * through `provider.load(args, factory)`, so concurrent consumers — and any
+ * other channel reading the same provider — share one request whose
+ * settle write-back the provider guards itself. Providers without `load`
+ * keep the classic path: run the inner chain, then `set`.
+ *
  * @param {AsyncFunc} injectableFn - the asynchronous function to memoize
  * @param {CacheProvider} cacheProvider - the cache provider for the function results
  * @param {number} staleTime - the time in milliseconds after which the cached result is considered stale
@@ -530,14 +537,24 @@ export function useCache<AF extends AsyncFunc>(
       ((...args: Parameters<AF>) => {
         seen.set(stableHash(args), args);
         const seq = nextResultSeq(store);
-        const refetch = () =>
-          f(...args).then(
-            thru<R<AF>>((r) => {
-              cacheProvider.set(args, r);
-              emitResult(store, r, seq, args);
-              emitStale(staleStore, false);
-            })
-          );
+        const refetch = () => {
+          const publish = thru<R<AF>>((r) => {
+            // With a load-capable provider the settle write-back belongs to
+            // the provider itself (generation-guarded against writes that
+            // landed mid-flight); the legacy path keeps its write-through.
+            if (!cacheProvider.load) cacheProvider.set(args, r);
+            emitResult(store, r, seq, args);
+            emitStale(staleStore, false);
+          });
+          // Routing through `load` shares ONE in-flight promise across every
+          // consumer of these args — and every other channel using the same
+          // provider (another component's injectable, a router loader) —
+          // with the factory, i.e. the whole inner wrapper chain including
+          // any useRetry loop, running exactly once.
+          return cacheProvider.load
+            ? cacheProvider.load(args, () => f(...args)).then(publish)
+            : f(...args).then(publish);
+        };
         return new Promise<CacheResult<R<AF>>>((resolve) => {
           resolve(cacheProvider.get(args));
         })

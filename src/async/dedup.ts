@@ -16,6 +16,12 @@ const inflightCache = new WeakMap<Func, Map<string, Promise<any>>>();
  * dropped, so subsequent calls run again and a failed call can be retried.
  * This mirrors the request deduplication of react-query.
  *
+ * Redundant alongside `createMemoryCacheProvider`: the provider deduplicates
+ * in-flight requests itself (`load`) and `useCache` routes every fetch
+ * through it, so a cached injectable is already deduped. Kept for custom
+ * providers that do not implement `load`, and for injectables that are not
+ * cached at all.
+ *
  * When several components call `useDedup` on the same injectable, their
  * wrappers share one map: the first wrapper reached by a call stores the
  * promise and any other wrapper in the chain finds it and returns early,
