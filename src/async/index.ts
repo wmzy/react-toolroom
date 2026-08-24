@@ -124,6 +124,28 @@ export type {InvalidateTarget} from './invalidation';
 
 export {subscribeInjectEvents} from './devtools';
 
+// Returns the injectable's shared result store with its emission wiring
+// kept alive: while any result consumer is mounted, every call through the
+// injectable publishes its resolved value into the store. Both result
+// hooks below need exactly this, so their broadcast semantics are
+// identical by construction.
+function useEmittingResultStore<AF extends AsyncFunc>(
+  injectableFn: AF
+): ResultStore {
+  const store = getResultStore(injectableFn);
+  useInject(
+    injectableFn,
+    (f: AF) =>
+      ((...args) => {
+        const seq = nextResultSeq(store);
+        return f(...args).then(
+          thru<R<AF>>((r) => emitResult(store, r, seq, args))
+        );
+      }) as AF
+  );
+  return store;
+}
+
 /**
  * Get the result of a wrapped async function. Results are broadcast through
  * a store shared by every consumer of the same injectable, so all subscribed
@@ -132,6 +154,7 @@ export {subscribeInjectEvents} from './devtools';
  * @param injectableFn the wrapped async function
  * @param [init] the initial value, used until any result has arrived
  * @returns the result
+ * @see {@link useResultSelect} to subscribe to a projected slice only
  */
 export function useResult<AF extends AsyncFunc>(
   injectableFn: AF
@@ -140,12 +163,20 @@ export function useResult<AF extends AsyncFunc>(
   injectableFn: AF,
   init: R<AF>
 ): R<AF>;
+// The fallback for an optional init: `useResult(fn, options?.initialData)`
+// passes `R<AF> | undefined`, and a possibly-absent init can only promise
+// `R<AF> | undefined` back. Without this overload such calls would fall
+// through to the implementation signature and type as `unknown`.
+export function useResult<AF extends AsyncFunc>(
+  injectableFn: AF,
+  init: R<AF> | undefined
+): R<AF> | undefined;
 export function useResult<AF extends AsyncFunc>(
   injectableFn: AF,
   init?: R<AF>
 ): R<AF> | undefined {
   type RAF = R<AF>;
-  const store = getResultStore(injectableFn);
+  const store = useEmittingResultStore(injectableFn);
   // `init` only applies to the first frame and is captured once, so later
   // changes to the prop never leak into an ongoing render stream.
   const [initial] = useState<RAF | undefined>(() =>
@@ -153,25 +184,87 @@ export function useResult<AF extends AsyncFunc>(
   );
   // Late subscribers start from the shared last result instead of `init`,
   // so they render data immediately without re-running the request.
-  const result = useStoreValue(
+  return useStoreValue(
     store,
     useCallback(
       () => (store.hasResult ? store.lastResult : initial),
       [store, initial]
     )
   );
+}
 
-  useInject(
-    injectableFn,
-    (f: AF) =>
-      ((...args) => {
-        const seq = nextResultSeq(store);
-        return f(...args).then(
-          thru<RAF>((r) => emitResult(store, r, seq, args))
-        );
-      }) as AF
+/**
+ * Subscribe to a projected slice of a wrapped async function's result —
+ * this library's `select`, named after its source. Same shared store and
+ * broadcast semantics as {@link useResult}, but the component only ever
+ * sees the projection.
+ * @param injectableFn the wrapped async function
+ * @param select the projection applied to the result and to `init`
+ * @param [init] the initial value, projected and used until any result has
+ * arrived; a possibly-absent init (`options?.initialData`) is accepted and
+ * yields `T | undefined`
+ * @returns the projected slice, `undefined` until a result or `init`
+ * exists — `select` is not called while neither exists
+ */
+export function useResultSelect<AF extends AsyncFunc, T>(
+  injectableFn: AF,
+  select: (result: R<AF>) => T
+): T | undefined;
+export function useResultSelect<AF extends AsyncFunc, T>(
+  injectableFn: AF,
+  select: (result: R<AF>) => T,
+  init: R<AF>
+): T;
+export function useResultSelect<AF extends AsyncFunc, T>(
+  injectableFn: AF,
+  select: (result: R<AF>) => T,
+  init: R<AF> | undefined
+): T | undefined;
+export function useResultSelect<AF extends AsyncFunc, T>(
+  injectableFn: AF,
+  select: (result: R<AF>) => T,
+  init?: R<AF>
+): T | undefined {
+  type RAF = R<AF>;
+  const store = useEmittingResultStore(injectableFn);
+  // `init` only applies to the first frame and is captured once, so later
+  // changes to the prop never leak into an ongoing render stream.
+  const [initial] = useState<RAF | undefined>(() =>
+    store.hasResult ? store.lastResult : init
   );
-  return result;
+  // Last-input/last-output memo. `useSyncExternalStore` requires
+  // `getSnapshot` to return a referentially stable value for a given store
+  // state; a selector that builds a fresh object per call would look like an
+  // ever-changing snapshot and trip React's "getSnapshot should be cached"
+  // loop detection. The projection is therefore cached against the exact
+  // input and selector it was computed from — unchanged identities return
+  // the cached output, so unrelated re-renders neither re-run `select` nor
+  // change the projected reference, while a new result or a new `select`
+  // (e.g. one rebuilt from state via `useCallback`) recomputes.
+  const cell = useRef<{
+    input: unknown;
+    selector: unknown;
+    output: T | undefined;
+  }>(undefined);
+  // Late subscribers start from the shared last result instead of `init`,
+  // so they render data immediately without re-running the request.
+  return useStoreValue(
+    store,
+    useCallback(() => {
+      const input = store.hasResult ? store.lastResult : initial;
+      const last = cell.current;
+      const memo =
+        last === undefined || last.input !== input || last.selector !== select
+          ? {
+              input,
+              selector: select,
+              output: input === undefined ? undefined : select(input as RAF)
+            }
+          : last;
+      cell.current = memo;
+      return memo.output;
+    }, [store, initial, select])
+  );
 }
 
 // Drops the trailing AbortSignal slot of an args tuple. `useRun` with

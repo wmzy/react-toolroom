@@ -4,6 +4,7 @@ import {
   memo,
   StrictMode,
   Suspense,
+  useCallback,
   useState,
   useEffect,
   startTransition
@@ -13,6 +14,7 @@ import {
   useInjectable,
   createMemoryCacheProvider,
   useResult,
+  useResultSelect,
   useSuspenseResult,
   useLoading,
   useInitialLoading,
@@ -811,6 +813,243 @@ describe('async hooks', () => {
       });
       expect(screen.getByTestId('a').textContent).toBe('shared');
       expect(screen.getByTestId('b').textContent).toBe('shared');
+    });
+
+    it('should project the result through select', async () => {
+      const fetchPage = vi.fn(async () => ({
+        articles: ['a', 'b'],
+        articlesCount: 2
+      }));
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        // A select building a fresh object per call — the shape that would
+        // break a naive useSyncExternalStore wiring.
+        const count = useResultSelect(injectable, (r) => ({
+          count: r.articlesCount
+        }));
+        useRun(injectable, []);
+        return <div>{count === undefined ? 'loading' : count.count}</div>;
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByText('loading')).toBeDefined();
+      await waitFor(() => {
+        expect(screen.getByText('2')).toBeDefined();
+      });
+    });
+
+    it('should neither re-run select nor change its reference on unrelated re-renders', async () => {
+      const fetchPage = vi.fn(async () => ({articlesCount: 2}));
+      const select = vi.fn((r: {articlesCount: number}) => ({
+        count: r.articlesCount
+      }));
+      const renders = {projection: 0};
+
+      const Projection = memo(({value}: {value?: {count: number}}) => {
+        renders.projection++;
+        return <span data-testid='projection'>{value?.count ?? 'none'}</span>;
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const [, setState] = useState(0);
+        const count = useResultSelect(injectable, select);
+        useRun(injectable, []);
+        return (
+          <div>
+            <button type='button' onClick={() => setState((n) => n + 1)}>
+              bump
+            </button>
+            <Projection value={count} />
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('projection').textContent).toBe('2');
+      });
+      // The store never had a real input before the result landed, so the
+      // projection ran exactly once — for the result itself.
+      expect(select).toHaveBeenCalledTimes(1);
+      const rendersAfterResult = renders.projection;
+
+      // Two unrelated re-renders: the projection is neither recomputed nor
+      // replaced by a fresh reference, so the memoized child stays skipped.
+      fireEvent.click(screen.getByText('bump'));
+      fireEvent.click(screen.getByText('bump'));
+      expect(select).toHaveBeenCalledTimes(1);
+      expect(renders.projection).toBe(rendersAfterResult);
+      expect(screen.getByTestId('projection').textContent).toBe('2');
+    });
+
+    it('should recompute the projection when a new result arrives', async () => {
+      const fetchPage = vi
+        .fn<() => Promise<{articlesCount: number}>>()
+        .mockResolvedValueOnce({articlesCount: 2})
+        .mockResolvedValueOnce({articlesCount: 5});
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const count = useResultSelect(injectable, (r) => r.articlesCount);
+        useRun(injectable, []);
+        return (
+          <div>
+            <button type='button' onClick={() => injectable()}>
+              refresh
+            </button>
+            {count ?? 'loading'}
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByText('loading')).toBeDefined();
+
+      await waitFor(() => {
+        expect(screen.getByText('2')).toBeDefined();
+      });
+
+      fireEvent.click(screen.getByText('refresh'));
+      await waitFor(() => {
+        expect(screen.getByText('5')).toBeDefined();
+      });
+    });
+
+    it('should apply select to the init value before the first result', async () => {
+      const fetchPage = vi.fn(
+        () => new Promise<{articlesCount: number}>(() => {})
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const count = useResultSelect(injectable, (r) => r.articlesCount, {
+          articlesCount: 7
+        });
+        useRun(injectable, []);
+        return <div>{count}</div>;
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByText('7')).toBeDefined();
+    });
+
+    it('should not call select while no result exists', async () => {
+      const fetchPage = vi.fn(() => new Promise<never>(() => {}));
+      const select = vi.fn((r: {articlesCount: number}) => r.articlesCount);
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const count = useResultSelect(injectable, select);
+        useRun(injectable, []);
+        return <div>{count === undefined ? 'loading' : String(count)}</div>;
+      }
+
+      render(<TestComponent />);
+      expect(screen.getByText('loading')).toBeDefined();
+      expect(select).not.toHaveBeenCalled();
+    });
+
+    it('should recompute when the selector identity changes', async () => {
+      let resolve!: (v: {a: number; b: number}) => void;
+      const fetchPage = vi.fn(
+        () => new Promise<{a: number; b: number}>((r) => (resolve = r))
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const [pickB, setPickB] = useState(false);
+        const select = useCallback(
+          (r: {a: number; b: number}) => (pickB ? r.b : r.a),
+          [pickB]
+        );
+        const value = useResultSelect(injectable, select);
+        useRun(injectable, []);
+        return (
+          <div>
+            <button type='button' onClick={() => setPickB(true)}>
+              swap
+            </button>
+            <span data-testid='value'>{value ?? 'loading'}</span>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await act(async () => {
+        resolve({a: 1, b: 2});
+      });
+      expect(screen.getByTestId('value').textContent).toBe('1');
+
+      // The result is unchanged; only the selector identity did. The
+      // memo keys on both, so the new projection wins.
+      fireEvent.click(screen.getByText('swap'));
+      await waitFor(() => {
+        expect(screen.getByTestId('value').textContent).toBe('2');
+      });
+    });
+
+    it('should keep the projected snapshot stable under StrictMode double-render', async () => {
+      const fetchPage = vi.fn(async () => ({articlesCount: 2}));
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        function TestComponent() {
+          const injectable = useInjectable(fetchPage);
+          const count = useResultSelect(injectable, (r) => ({
+            count: r.articlesCount
+          }));
+          useRun(injectable, []);
+          return <div>{count === undefined ? 'loading' : count.count}</div>;
+        }
+
+        render(
+          <StrictMode>
+            <TestComponent />
+          </StrictMode>
+        );
+        await waitFor(() => {
+          expect(screen.getByText('2')).toBeDefined();
+        });
+        expect(
+          errors.mock.calls.some((call) =>
+            String(call[0]).includes('getSnapshot')
+          )
+        ).toBe(false);
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('should coexist with useResult on the same injectable', async () => {
+      const fetchPage = vi.fn(async () => ({
+        articles: ['a'],
+        articlesCount: 1
+      }));
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchPage);
+        const full = useResult(injectable);
+        const count = useResultSelect(injectable, (r) => r.articlesCount);
+        useRun(injectable, []);
+        return (
+          <div>
+            <span data-testid='full'>
+              {full === undefined ? 'loading' : full.articles.join(',')}
+            </span>
+            <span data-testid='count'>
+              {count === undefined ? 'loading' : count}
+            </span>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('full').textContent).toBe('a');
+        expect(screen.getByTestId('count').textContent).toBe('1');
+      });
     });
   });
 

@@ -6,12 +6,12 @@
 
 ## Highlights
 
-- **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 4.31 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
+- **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 4.72 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
 - **No Provider, no Context** — every hook works standalone; state lives on the functions you pass in, so there is nothing to mount at the app root.
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
 - **React 16.8 – 19** — one code path, broad peer range.
-- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 204 tests.
+- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 226 tests.
 
 ## Install
 
@@ -41,7 +41,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
-| Bundle size¹ | **1.4 kB** + **4.31 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| Bundle size¹ | **1.4 kB** + **4.72 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ Minified + compressed, full entry without tree-shaking — an upper bound; cherry-picked imports are smaller. react-toolroom numbers are exact, measured from the CI build; competitor numbers are approximate and vary by version — check their docs.
 
@@ -500,6 +500,19 @@ When `page` changes, the previous page stays on screen until the new result land
 
 Since the kept data is just the old result, consumers need a way to tell whose data they are rendering. `usePlaceholderData(fn, args)` answers exactly that: the shared store records the args tuple the displayed result was fetched with, and the flag compares it (structurally, via `stableHash`, ignoring an appended `AbortSignal`) against the current args — `true` while the previous page is on screen, `false` once the new one lands. With no result at all yet, an optional third argument plays the TanStack `placeholderData` role: pass the same value to `useResult(fn, placeholderData)` and it is displayed (and flagged) until the first result ever arrives. Results of unknown provenance — optimistic snapshots, `useInfinite`'s accumulated pages — are never claimed as placeholders.
 
+### Subscribe to a slice — `useResultSelect(fn, select)`
+
+A list endpoint returns `{articles, articlesCount}`, but the pagination bar only needs the count. `useResultSelect` subscribes the component to the projected slice only, like TanStack Query's `select`:
+
+```tsx
+const count = useResultSelect(fetchArticles, (r) => r.articlesCount);
+// with an initial value: useResultSelect(fetchArticles, (r) => r.articlesCount, initialData)
+```
+
+The projection is memoized on the identity of the result *and* of `select` itself: until a new result (or a new selector — e.g. one rebuilt from state via `useCallback`) arrives, `getSnapshot` returns the cached output. A `select` that builds a fresh object per call therefore never trips `useSyncExternalStore`'s unstable-snapshot loop detection, unrelated re-renders never re-run it, and memoized children receiving the slice stay skipped. `select` is not called while no result exists — the hook returns `undefined` until then, exactly `useResult(fn)`'s contract projected.
+
+It's a separate hook rather than a `useResult` option, so `useResult` users never bundle its code — like every hook here, it tree-shakes on its own.
+
 ### Infinite loading — `useInfinite`
 
 ```tsx
@@ -571,6 +584,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `getInjectContext(fn)` | The injectable's stable context object — where wrappers keep state shared across calls. |
 | `subscribeInjectEvents(fn, {onCall, onSettle})` | Non-hook observation API for devtools/log panels: `onCall(args)` fires before the chain runs, `onSettle({args, result?, error?, duration})` fires once per call, `duration` covering the whole onion chain below the observer. Returns an unsubscribe function. |
 | `useResult(fn, init?)` | Subscribe to the latest result; results broadcast to every consumer, and late subscribers start from the shared last result. |
+| `useResultSelect(fn, select, init?)` | `useResult` projected through `select` (TanStack `select`): the component subscribes to the slice only — memoized on result + selector identity, so fresh-object projections stay referentially stable. |
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
@@ -617,11 +631,11 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 4.31 kB.
-- **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.9 kB.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 4.72 kB.
+- **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
-- **Tested** — 204 tests (vitest + Testing Library).
+- **Tested** — 226 tests (vitest + Testing Library).
 
 ## Demos
 

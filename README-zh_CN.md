@@ -6,12 +6,12 @@
 
 ## 特性
 
-- **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 4.31 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
+- **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 4.72 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
 - **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `useDedup` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
 - **React 16.8 – 19** — 一套代码路径，覆盖广谱版本。
-- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；204 个测试。
+- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；226 个测试。
 
 ## 安装
 
@@ -41,7 +41,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **1.4 kB** + **4.31 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **1.4 kB** + **4.72 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、全量入口（未 tree-shaking）的体积，是按需引入的上界。react-toolroom 的数字是 CI 构建产物的实测值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -496,6 +496,19 @@ function UserList() {
 
 既然保留的数据本来就是旧结果，消费者就需要一个办法分辨"当前渲染的到底是谁的数据"。`usePlaceholderData(fn, args)` 回答的正是这个问题：共享 store 会记录当前结果是由哪组 args 取回的，该标志把它（经 `stableHash` 结构化比较，并忽略追加的 `AbortSignal`）与当前 args 对照——上一页还在屏幕上时为 `true`，新一页落地后翻回 `false`。在尚无任何结果的窗口里，可选的第三个参数扮演 TanStack `placeholderData` 的角色：把同一个值传给 `useResult(fn, placeholderData)`，首个结果到来前就会显示它（并带 `true` 标志）。来源未知的结果——乐观快照、`useInfinite` 累积的 pages——不会被认领为占位数据。
 
+### 只订阅切片 — `useResultSelect(fn, select)`
+
+列表接口返回 `{articles, articlesCount}`，但分页条只需要总数。`useResultSelect` 让组件只订阅投影后的切片，对应 TanStack Query 的 `select`：
+
+```tsx
+const count = useResultSelect(fetchArticles, (r) => r.articlesCount);
+// 带初始值：useResultSelect(fetchArticles, (r) => r.articlesCount, initialData)
+```
+
+投影按结果*与* `select` 本身的身份 memo：新结果（或新 selector——比如经 `useCallback` 依赖 state 重建的）到来之前，`getSnapshot` 一直返回缓存输出。因此 `select` 每次调用都构造新对象也不会触发 `useSyncExternalStore` 的 snapshot 不稳定循环检测，无关重渲染不会重跑它，接收切片的 memo 子组件照旧跳过渲染。尚无结果时不会调用 `select`，hook 返回 `undefined`——即 `useResult(fn)` 契约的投影版。
+
+它是独立 hook 而非 `useResult` 的选项，因此只用 `useResult` 的用户不会为它打包——和这里每个 hook 一样，可独立 tree-shaking。
+
 ### 无限加载 — `useInfinite`
 
 ```tsx
@@ -567,6 +580,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `getInjectContext(fn)` | injectable 的稳定 context 对象——wrapper 在这里存放跨调用共享的状态。 |
 | `subscribeInjectEvents(fn, {onCall, onSettle})` | 非 hook 的观察 API，面向 devtools/日志面板：链执行前触发 `onCall(args)`，每次调用落定时恰好触发一次 `onSettle({args, result?, error?, duration})`，`duration` 覆盖观察者之下的整条洋葱链。返回退订函数。 |
 | `useResult(fn, init?)` | 订阅最新结果；结果广播给所有消费者，晚订阅的组件直接从共享的上次结果起步。 |
+| `useResultSelect(fn, select, init?)` | 经 `select` 投影的 `useResult`（对应 TanStack 的 `select`）：组件只订阅切片——按结果与 selector 的身份 memo，返回新对象的投影也保持引用稳定。 |
 | `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。首个结果后，更新与 `useResult` 完全一致地流入。 |
 | `useLoading(fn)` | 任意调用进行中为 `true`。 |
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
@@ -613,11 +627,11 @@ const stop = subscribeInjectEvents(fetchUsers, {
 ## 工程事实
 
 - **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
-- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 6 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 1.4 kB / 4.31 kB。
-- **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，`useCache` + `useDedup` + `useResult` 读取套件约 1.9 kB。
+- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 6 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 1.4 kB / 4.72 kB。
+- **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useDedup` + `useResult` 读取套件约 1.7 kB。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。
-- **测试覆盖** — 204 个测试（vitest + Testing Library）。
+- **测试覆盖** — 226 个测试（vitest + Testing Library）。
 
 ## 示例
 
