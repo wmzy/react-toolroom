@@ -41,7 +41,7 @@ type Project = R<typeof fetchList>;
 // Module scope: one cache shared by every component importing this hook.
 // Customization point — swap the provider (e.g. a localStorage-backed one)
 // or tune `cacheTime` (idle entries are garbage-collected after it).
-const projectCache = createMemoryCacheProvider<Project, any[]>({
+const projectCache = createMemoryCacheProvider<Project, [size?: number]>({
   cacheTime: 60000
 });
 

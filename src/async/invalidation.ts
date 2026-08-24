@@ -28,7 +28,12 @@ type ValidTarget<T> = T extends readonly [infer P, ...infer A extends any[]]
       ? T
       : never
     : never
-  : T extends CacheProvider<any, any[]>
+  : // The bare-provider branch matches any key tuple: `K` is invariant in
+    // `CacheProvider` (function-valued members use it in both parameter and
+    // output positions), so a concrete `CacheProvider<string, [string]>`
+    // does not extend `CacheProvider<any, any[]>` even though every
+    // concrete tuple does extend `any[]`.
+    T extends CacheProvider<any, infer K extends any[]>
     ? T
     : never;
 
@@ -65,16 +70,18 @@ function matchesPrefix(prefix: readonly any[], args: readonly any[]): boolean {
  * consumers (or from `useInvalidate`'s explicit follow-up call) triggering N
  * refetches of the same args. Lives on the injectable's context like the
  * stores of `base.ts`; entries are removed when the revalidation settles.
+ * Keyed by provider identity alone — the key type is `object` because the
+ * registry serves providers of any args-tuple type.
  */
-type PendingRegistry = Map<CacheProvider<any, any[]>, Set<string>>;
+type PendingRegistry = Map<object, Set<string>>;
 
 // Module-private store key, following the store-key pattern of base.ts.
 const pendingKey = Symbol('revalidation pending');
 
 /** Lazily creates and returns the pending set of an injectable×provider pair. */
-export function getPendingSet(
+export function getPendingSet<K extends any[]>(
   fn: Func,
-  cacheProvider: CacheProvider<any, any[]>
+  cacheProvider: CacheProvider<any, K>
 ): Set<string> {
   const context = getInjectContext(fn);
   let registry = context[pendingKey] as PendingRegistry | undefined;
@@ -109,9 +116,9 @@ export function getPendingSet(
  *
  * @return an unsubscribe function
  */
-export function bindCacheRevalidation(
+export function bindCacheRevalidation<K extends any[]>(
   injectableFn: AsyncFunc,
-  cacheProvider: CacheProvider<any, any[]>,
+  cacheProvider: CacheProvider<any, K>,
   seen: Map<string, any[]>
 ): () => void {
   return (

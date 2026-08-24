@@ -52,7 +52,7 @@ describe('async hooks', () => {
     });
 
     it('should re-run when dependencies change', () => {
-      const fn = vi.fn(() => 'result');
+      const fn = vi.fn((..._deps: number[]) => 'result');
 
       function TestComponent({deps}: {deps: number[]}) {
         useRun(fn, deps);
@@ -1366,7 +1366,7 @@ describe('async hooks', () => {
 
   describe('useCatch', () => {
     it('should catch and transform errors', async () => {
-      const fetchData = vi.fn(async () => {
+      const fetchData = vi.fn(async (): Promise<string> => {
         throw new Error('original');
       });
       const catcher = vi.fn((e: Error) => `caught: ${e.message}`);
@@ -1848,7 +1848,7 @@ describe('async hooks', () => {
           resolveRefetch = resolve;
         });
       });
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, []>({
         cacheTime: 60000,
         hash: (k) => JSON.stringify(k)
       });
@@ -1927,7 +1927,7 @@ describe('async hooks', () => {
           resolveRefetch = resolve;
         });
       });
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, []>({
         cacheTime: 60000,
         hash: (k) => JSON.stringify(k)
       });
@@ -2024,7 +2024,7 @@ describe('async hooks', () => {
             resolveQueue.push(resolve);
           })
       );
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [number]>({
         cacheTime: 60000,
         hash: (k) => JSON.stringify(k)
       });
@@ -2113,7 +2113,7 @@ describe('async hooks', () => {
             resolveQueue.push(resolve);
           })
       );
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [number]>({
         cacheTime: 60000,
         hash: (k) => JSON.stringify(k)
       });
@@ -2168,7 +2168,7 @@ describe('async hooks', () => {
       tab
     }: {
       query: (tab: string) => Promise<string>;
-      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, [string]>>;
       tab: string;
     }) {
       useCache(query, cache, 60000);
@@ -2202,7 +2202,7 @@ describe('async hooks', () => {
       cache,
       save
     }: {
-      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, [string]>>;
       save: (draft: string) => Promise<string>;
     }) {
       const [mutate] = useMutation(save, {invalidates: [cache]});
@@ -2214,7 +2214,7 @@ describe('async hooks', () => {
       cache,
       save
     }: {
-      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, [string]>>;
       save: (draft: string) => Promise<string>;
     }) {
       const [mutate] = useMutation(save, {invalidates: [[cache, 'news']]});
@@ -2229,7 +2229,7 @@ describe('async hooks', () => {
     }: {
       fetchFeed: (tab: string) => Promise<string>;
       save: (draft: string) => Promise<string>;
-      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, [string]>>;
       Editor: typeof IdentityEditor | typeof PrefixEditor;
     }) {
       const query = useInjectable(fetchFeed);
@@ -2256,7 +2256,7 @@ describe('async hooks', () => {
     it('should purge the cache and refetch what subscribers display when the mutation succeeds', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
       const save = vi.fn(() => Promise.resolve('saved'));
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2308,7 +2308,7 @@ describe('async hooks', () => {
     it('should invalidate nothing when the mutation fails', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
       const save = vi.fn(() => Promise.reject(new Error('boom')));
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2344,7 +2344,7 @@ describe('async hooks', () => {
     it('should match targets by args prefix and leave other entries alone', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
       const save = vi.fn(() => Promise.resolve('saved'));
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2405,7 +2405,7 @@ describe('async hooks', () => {
     it('should survive StrictMode double mounting with exactly one refetch', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
       const save = vi.fn(() => Promise.resolve('saved'));
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2461,7 +2461,7 @@ describe('async hooks', () => {
 
     it('should purge a target without live consumers and not refetch it', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2500,7 +2500,7 @@ describe('async hooks', () => {
     it('should refresh every consumer of a shared provider, across injectables', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
       const save = vi.fn(() => Promise.resolve('saved'));
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2554,7 +2554,7 @@ describe('async hooks', () => {
 
     it('should revalidate passively when the cache is purged outside invalidate()', async () => {
       const {resolveQueue, fetchFeed} = deferredFetch();
-      const cache = createMemoryCacheProvider<string, any[]>({
+      const cache = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000
       });
 
@@ -2688,7 +2688,7 @@ describe('async hooks', () => {
       const data = {users: []};
       let resolveFn!: (v: typeof data) => void;
       const fetchData = vi.fn(
-        () =>
+        (_id: number) =>
           new Promise<typeof data>((resolve) => {
             resolveFn = resolve;
           })
@@ -2731,7 +2731,7 @@ describe('async hooks', () => {
       let fail = true;
       let resolveFn!: (v: string) => void;
       const fetchData = vi.fn(
-        () =>
+        (_id: number) =>
           new Promise<string>((resolve, reject) => {
             if (fail) reject(new Error('network down'));
             else resolveFn = resolve;

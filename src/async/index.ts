@@ -489,7 +489,7 @@ export function useSuspenseResult<AF extends AsyncFunc>(
  */
 export function useCache<AF extends AsyncFunc>(
   injectableFn: AF,
-  cacheProvider: CacheProvider<R<AF>, any[]>,
+  cacheProvider: CacheProvider<R<AF>, Parameters<AF>>,
   staleTime = 0
 ) {
   const store = getResultStore(injectableFn);
@@ -527,7 +527,7 @@ export function useCache<AF extends AsyncFunc>(
   useInject(
     injectableFn,
     (f: AF) =>
-      ((...args) => {
+      ((...args: Parameters<AF>) => {
         seen.set(stableHash(args), args);
         const seq = nextResultSeq(store);
         const refetch = () =>
@@ -598,7 +598,7 @@ export function useCache<AF extends AsyncFunc>(
  */
 export function useInvalidate<AF extends AsyncFunc>(
   injectableFn: AF,
-  cacheProvider: CacheProvider<R<AF>, any[]>
+  cacheProvider: CacheProvider<R<AF>, Parameters<AF>>
 ): (...args: Parameters<AF>) => Promise<R<AF>> {
   return useCallback(
     (...args: Parameters<AF>) => {
@@ -688,7 +688,7 @@ function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
  * @param {AsyncFunc} injectableFn - The async function to be executed.
  * @return {Error} The error thrown by the async function.
  */
-export function useError<AF extends AsyncFunc, E extends Error>(
+export function useError<E extends Error, AF extends AsyncFunc = AsyncFunc>(
   injectableFn: AF
 ): E | undefined {
   const store = useErrorWrapper(injectableFn);

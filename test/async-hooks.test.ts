@@ -327,7 +327,7 @@ describe('usePlaceholderData', () => {
     let call = 0;
 
     function View({query}: {query: {page: number}}) {
-      const fetchPage = useInjectable(() => queue[call++]);
+      const fetchPage = useInjectable((_q: {page: number}) => queue[call++]);
       useRun(fetchPage, [query], {hash: stableHash});
       const data = useResult(fetchPage);
       const isPlaceholderData = usePlaceholderData(fetchPage, [query]);
@@ -360,7 +360,7 @@ describe('usePlaceholderData', () => {
   it('should be true before the first result when placeholderData is given', async () => {
     const first = deferred<{page: number}>();
     function View({query}: {query: {page: number}}) {
-      const fetchPage = useInjectable(() => first.promise);
+      const fetchPage = useInjectable((_q: {page: number}) => first.promise);
       useRun(fetchPage, [query], {hash: stableHash});
       const data = useResult(fetchPage, ['seed'] as any);
       const isPlaceholderData = usePlaceholderData(fetchPage, [query], [
@@ -413,7 +413,7 @@ describe('usePlaceholderData', () => {
   it('should not claim results of unknown provenance', async () => {
     const first = deferred<string>();
     function View({query}: {query: {page: number}}) {
-      const fetchPage = useInjectable(() => first.promise);
+      const fetchPage = useInjectable((_q: {page: number}) => first.promise);
       // An optimistic snapshot is emitted with the CURRENT ticket and no
       // args — provenance resets to unknown and must read as "not mine".
       useOptimistic(fetchPage, () => 'optimistic' as any);

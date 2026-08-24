@@ -11,7 +11,7 @@ import {
 import {section} from '@/util/styles';
 import {fetchList} from '@/services/user';
 
-const cache = createMemoryCacheProvider<any, any[]>({
+const cache = createMemoryCacheProvider<any, [size?: number]>({
   cacheTime: 10000,
   hash: (k: any[]) => JSON.stringify(k)
 });

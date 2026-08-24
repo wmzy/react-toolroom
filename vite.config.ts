@@ -89,11 +89,7 @@ export default defineConfig({
       }
     }) as PluginOption,
     react({
-      exclude: ['node_modules/**'],
-      babel: {
-        configFile: true,
-        babelrc: true
-      }
+      exclude: ['node_modules/**']
     })
   ]
 });

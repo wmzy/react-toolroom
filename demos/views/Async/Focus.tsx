@@ -11,7 +11,7 @@ import {section} from '@/util/styles';
 import {fetchFocusStat} from '@/services/metrics';
 import {type FocusStat} from '@/types/metrics';
 
-const statCache = createMemoryCacheProvider<FocusStat, any[]>({
+const statCache = createMemoryCacheProvider<FocusStat, []>({
   cacheTime: 60000
 });
 

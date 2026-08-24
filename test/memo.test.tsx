@@ -170,7 +170,7 @@ describe('memo', () => {
       }: {
         name: string;
         data: string;
-        onClick: () => void;
+        onClick?: () => void;
       }) => (
         <div data-testid='data-value' data-value={data}>
           <span>{name}</span>

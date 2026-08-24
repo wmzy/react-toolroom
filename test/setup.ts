@@ -7,6 +7,8 @@ afterEach(() => {
 });
 
 global.localStorage = {
+  length: 0,
+  key: () => null,
   getItem: vi.fn(),
   setItem: vi.fn(),
   removeItem: vi.fn(),
