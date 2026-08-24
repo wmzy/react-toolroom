@@ -27,7 +27,9 @@ import {
   invalidate,
   type MutationOptions,
   isInjectable,
-  subscribeInjectEvents
+  subscribeInjectEvents,
+  usePlaceholderData,
+  stableHash
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
 import {addWrapper, useInjectBefore} from '../src/async/inject';
@@ -301,6 +303,133 @@ describe('useInitialLoading', () => {
     expect(fetchData).toHaveBeenCalledTimes(2);
     expect(screen.getByText('ready')).toBeDefined();
     expect(screen.queryByText('initial')).toBeNull();
+  });
+});
+
+describe('usePlaceholderData', () => {
+  // Minimal deferred for driving in-flight calls deterministically.
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: any) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return {promise, resolve, reject};
+  }
+
+  it('should be false for matching args and true while a new page is in flight', async () => {
+    const first = deferred<{page: number}>();
+    const second = deferred<{page: number}>();
+    // The injectable closes over the queue and advances it per call, so
+    // each rerun resolves from the test's hand-picked deferred.
+    const queue = [first.promise, second.promise];
+    let call = 0;
+
+    function View({query}: {query: {page: number}}) {
+      const fetchPage = useInjectable(() => queue[call++]);
+      useRun(fetchPage, [query], {hash: stableHash});
+      const data = useResult(fetchPage);
+      const isPlaceholderData = usePlaceholderData(fetchPage, [query]);
+      return createElement(
+        'p',
+        null,
+        `page ${data?.page} placeholder ${isPlaceholderData}`
+      );
+    }
+
+    const {rerender} = render(createElement(View, {query: {page: 1}}));
+    // first load: no result at all yet, and no placeholderData → false
+    expect(screen.getByText('page undefined placeholder false')).toBeTruthy();
+
+    await act(async () => {
+      first.resolve({page: 1});
+    });
+    expect(screen.getByText('page 1 placeholder false')).toBeTruthy();
+
+    rerender(createElement(View, {query: {page: 2}}));
+    // page change: page 1 stays on display and is now flagged as placeholder
+    expect(screen.getByText('page 1 placeholder true')).toBeTruthy();
+
+    await act(async () => {
+      second.resolve({page: 2});
+    });
+    expect(screen.getByText('page 2 placeholder false')).toBeTruthy();
+  });
+
+  it('should be true before the first result when placeholderData is given', async () => {
+    const first = deferred<{page: number}>();
+    function View({query}: {query: {page: number}}) {
+      const fetchPage = useInjectable(() => first.promise);
+      useRun(fetchPage, [query], {hash: stableHash});
+      const data = useResult(fetchPage, ['seed'] as any);
+      const isPlaceholderData = usePlaceholderData(fetchPage, [query], [
+        'seed'
+      ] as any);
+      return createElement(
+        'p',
+        null,
+        `data ${JSON.stringify(data)} placeholder ${isPlaceholderData}`
+      );
+    }
+
+    render(createElement(View, {query: {page: 1}}));
+    expect(screen.getByText('data ["seed"] placeholder true')).toBeTruthy();
+
+    await act(async () => {
+      first.resolve({page: 1});
+    });
+    expect(screen.getByText('data {"page":1} placeholder false')).toBeTruthy();
+  });
+
+  it('should ignore a trailing AbortSignal on both sides', async () => {
+    const first = deferred<{page: number}>();
+    function View({query}: {query: {page: number}}) {
+      const fetchPage = useInjectable(
+        async (q: {page: number}, signal?: AbortSignal) => {
+          expect(signal).toBeInstanceOf(AbortSignal);
+          return first.promise;
+        }
+      );
+      // {signal: true} appends a fresh AbortSignal to the args tuple on
+      // every rerun — the flag must not care.
+      useRun(fetchPage, [query], {hash: stableHash, signal: true});
+      const data = useResult(fetchPage);
+      const isPlaceholderData = usePlaceholderData(fetchPage, [query]);
+      return createElement(
+        'p',
+        null,
+        `page ${data?.page} placeholder ${isPlaceholderData}`
+      );
+    }
+
+    render(createElement(View, {query: {page: 1}}));
+    await act(async () => {
+      first.resolve({page: 1});
+    });
+    expect(screen.getByText('page 1 placeholder false')).toBeTruthy();
+  });
+
+  it('should not claim results of unknown provenance', async () => {
+    const first = deferred<string>();
+    function View({query}: {query: {page: number}}) {
+      const fetchPage = useInjectable(() => first.promise);
+      // An optimistic snapshot is emitted with the CURRENT ticket and no
+      // args — provenance resets to unknown and must read as "not mine".
+      useOptimistic(fetchPage, () => 'optimistic' as any);
+      useRun(fetchPage, [query], {hash: stableHash});
+      const data = useResult(fetchPage);
+      const isPlaceholderData = usePlaceholderData(fetchPage, [query]);
+      return createElement(
+        'p',
+        null,
+        `data ${data} placeholder ${isPlaceholderData}`
+      );
+    }
+
+    render(createElement(View, {query: {page: 1}}));
+    await act(async () => {});
+    expect(screen.getByText('data optimistic placeholder false')).toBeTruthy();
   });
 });
 

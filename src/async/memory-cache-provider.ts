@@ -45,9 +45,7 @@ export default function create<T, K extends any[]>({
   const notifySet = () => {
     if (listeners) for (const listener of listeners) listener({type: 'set'});
   };
-  const notifyDelete = (
-    entries: Iterable<[K | undefined, T, number]>
-  ) => {
+  const notifyDelete = (entries: Iterable<[K | undefined, T, number]>) => {
     if (!listeners) return;
     // Only entries whose raw tuple is recoverable can be reported; hydrated
     // ones are omitted — no wrapper-driven subscriber has ever seen them.

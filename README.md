@@ -36,7 +36,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | Mutation lifecycle | `useMutation` | `useMutation` | `useSWRMutation` | manual |
 | Invalidation linked to mutations | `useInvalidate` / `invalidates` | `invalidateQueries` | manual `mutate` | manual |
 | Infinite loading | ✅ `useInfinite` | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
-| Keep previous data on key change | **default** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
+| Keep previous data on key change | **default** + `usePlaceholderData` flag | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
 | DevTools | ✅ `InjectDevTools` panel (separate entry) | ✅ | community | ✗ |
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
@@ -59,7 +59,7 @@ The [`recipes/`](./recipes/) directory holds copy-and-customize templates to sta
 | [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | The write side, on top of the first-class `useMutation`: pins the project's default failure reporting while an explicit `onError` still replaces it — the pattern for adding a house convention to a library hook. |
 | [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`. |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | Adds `usePolling` on a fixed interval. |
-| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
+| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data made observable by `usePlaceholderData`, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
 | [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | A `CacheProvider` that persists entries to `localStorage` — for caches that should survive a page reload instead of rebuilding from scratch. |
 
 Copy the one closest to your screen, swap in your fetcher, and adjust the common customization points each file header calls out: `staleTime`, error reporting, the cache instance, and the return shape. One hook gives every screen a single loading/error contract — and exactly one place to change it.
@@ -474,12 +474,13 @@ function UserList() {
   useRun(loadUsers, [{page}], {hash: stableHash});
 
   const users = useResult(loadUsers);    // still the previous page while the new one loads
+  const isPlaceholderData = usePlaceholderData(loadUsers, [{page}]); // true while it does
   const loading = useLoading(loadUsers); // true — show a small indicator, not a skeleton
 
   return (
     <div>
       {loading && <p>loading…</p>}
-      <ul>
+      <ul style={{opacity: isPlaceholderData ? 0.5 : 1}}>
         {users?.map((u) => (
           <li key={u.id}>{u.username}</li>
         ))}
@@ -496,6 +497,8 @@ function UserList() {
 ```
 
 When `page` changes, the previous page stays on screen until the new result lands: the shared result store is never reset between calls, and a per-call sequence ticket drops the result of any call older than the latest applied one — a slow request can't clobber the data a newer call already delivered. TanStack Query needs `placeholderData: keepPreviousData` and SWR needs `keepPreviousData: true` for this; here it is the default, no option required. Pair it with `useInitialLoading` for the very first load (full-page skeleton) and `useCache` to revisit a page instantly from cache while it revalidates in the background.
+
+Since the kept data is just the old result, consumers need a way to tell whose data they are rendering. `usePlaceholderData(fn, args)` answers exactly that: the shared store records the args tuple the displayed result was fetched with, and the flag compares it (structurally, via `stableHash`, ignoring an appended `AbortSignal`) against the current args — `true` while the previous page is on screen, `false` once the new one lands. With no result at all yet, an optional third argument plays the TanStack `placeholderData` role: pass the same value to `useResult(fn, placeholderData)` and it is displayed (and flagged) until the first result ever arrives. Results of unknown provenance — optimistic snapshots, `useInfinite`'s accumulated pages — are never claimed as placeholders.
 
 ### Infinite loading — `useInfinite`
 
@@ -571,6 +574,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
+| `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
 | `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |
@@ -606,7 +610,7 @@ For custom wrappers and cache providers, the entries also export the types you n
 
 The load-bearing surface is frozen — signatures and semantics are treated as contracts, and changes there would require a critical bug: the injection core (`useInjectable`, `useInject`, `useInjectBefore`, `getInjectContext`, `addWrapper`), `useRun`, `useCache` / `useInvalidate` / `createMemoryCacheProvider`, `useDedup`, and the state hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`.
 
-Still evolving, with feedback welcome: `useMutation`, `useOptimistic`, `useInfinite`, `useSuspenseResult`, and the DevTools panel.
+Still evolving, with feedback welcome: `useMutation`, `useOptimistic`, `useInfinite`, `useSuspenseResult`, `usePlaceholderData`, and the DevTools panel.
 
 During 0.x, breaking changes ship as semver **minor** bumps and are called out in the CHANGELOG — 1.0 freezes everything listed above.
 

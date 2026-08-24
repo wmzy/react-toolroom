@@ -151,12 +151,18 @@ describe('recipes/useProjectPollingQuery', () => {
 });
 
 describe('recipes/useProjectPaginatedQuery', () => {
-  function PagedView() {
+  function PagedView({placeholder}: {placeholder?: typeof projects}) {
     const [page, setPage] = useState(1);
-    const {data, initialLoading, loading} = useProjectPaginatedQuery(page);
+    const {data, isPlaceholderData, initialLoading, loading} =
+      useProjectPaginatedQuery(
+        page,
+        10,
+        placeholder ? {placeholderData: placeholder} : {}
+      );
     const texts = [
       ...(initialLoading ? ['skeleton'] : []),
       ...(loading ? ['refreshing'] : []),
+      ...(isPlaceholderData ? ['placeholder'] : []),
       ...(data ?? []).map((p) => p.username)
     ];
     return createElement(
@@ -196,11 +202,14 @@ describe('recipes/useProjectPaginatedQuery', () => {
     expect(screen.getByText('user 10')).toBeTruthy();
     expect(screen.queryByText('skeleton')).toBeNull();
     expect(screen.queryByText('refreshing')).toBeNull();
+    expect(screen.queryByText('placeholder')).toBeNull();
 
     fireEvent.click(screen.getByText('next'));
     // page change: keep-previous-data keeps page 1 on screen behind a small
-    // refreshing indicator — NOT the full-page skeleton
+    // refreshing indicator — NOT the full-page skeleton — and flags the
+    // kept rows as placeholder data
     expect(screen.getByText('refreshing')).toBeTruthy();
+    expect(screen.getByText('placeholder')).toBeTruthy();
     expect(screen.getByText('user 1')).toBeTruthy();
     expect(screen.queryByText('skeleton')).toBeNull();
 
@@ -210,6 +219,35 @@ describe('recipes/useProjectPaginatedQuery', () => {
     expect(screen.getByText('user 11')).toBeTruthy();
     expect(screen.queryByText('user 1')).toBeNull();
     expect(screen.queryByText('refreshing')).toBeNull();
+    expect(screen.queryByText('placeholder')).toBeNull();
+  });
+
+  it('should display placeholderData before the first page lands', async () => {
+    const all = Array.from({length: 20}, (_, i) => ({
+      id: i + 1,
+      username: `user ${i + 1}`,
+      description: '',
+      updatedAt: 0
+    }));
+    const first = deferred<typeof all>();
+    fetchListMock.mockImplementationOnce(() => first.promise);
+
+    render(
+      createElement(PagedView, {
+        placeholder: [{id: 0, username: 'seed', description: '', updatedAt: 0}]
+      })
+    );
+    // no skeleton: the placeholder rows are on screen, flagged as such
+    expect(screen.queryByText('skeleton')).toBeNull();
+    expect(screen.getByText('placeholder')).toBeTruthy();
+    expect(screen.getByText('seed')).toBeTruthy();
+
+    await act(async () => {
+      first.resolve(all);
+    });
+    // first real page lands: the placeholder window is over
+    expect(screen.queryByText('placeholder')).toBeNull();
+    expect(screen.getByText('user 1')).toBeTruthy();
   });
 });
 

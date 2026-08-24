@@ -29,6 +29,14 @@ export type ResultStore = {
   listeners: Set<(result: any) => void>;
   lastResult: any;
   hasResult: boolean;
+  /**
+   * The args tuple the current `lastResult` was fetched with, when the
+   * emitting wrapper knew it. Swapped together with `lastResult` by every
+   * applied emission — `undefined` means "provenance unknown" (an
+   * optimistic snapshot, the accumulated pages of `useInfinite`, or an
+   * `emitResult` call predating this field).
+   */
+  lastArgs?: any[];
 };
 
 /**
@@ -175,16 +183,30 @@ export function currentErrorSeq(store: ErrorStore): number {
  * result whose ticket is older than the latest applied one is dropped, so a
  * slow call can never clobber the result of a newer call.
  *
+ * When `args` is given it becomes the store's `lastArgs` — the provenance
+ * record `usePlaceholderData` compares the consumer's current args against.
+ * An emission without `args` clears it back to "provenance unknown", so
+ * `lastArgs` can never claim the displayed result belongs to args it was
+ * not fetched with. Recording args never touches the ticket sequence: a
+ * dropped emission discards result and args together.
+ *
  * @param store the shared result store of the injectable
  * @param result the successful result to publish
  * @param seq the ticket obtained from {@link nextResultSeq} when the call started
+ * @param [args] the args tuple the call was invoked with
  */
-export function emitResult(store: ResultStore, result: any, seq: number) {
+export function emitResult(
+  store: ResultStore,
+  result: any,
+  seq: number,
+  args?: any[]
+) {
   const guard = seqOf(store, resultSeqs);
   if (seq < guard.applied) return;
   guard.applied = seq;
   store.lastResult = result;
   store.hasResult = true;
+  store.lastArgs = args;
   for (const listener of store.listeners) listener(result);
 }
 

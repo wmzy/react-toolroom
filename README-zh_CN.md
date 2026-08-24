@@ -36,7 +36,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | mutation 生命周期 | `useMutation` | `useMutation` | `useSWRMutation` | 手动 |
 | mutation 联动失效缓存 | `useInvalidate` / `invalidates` | `invalidateQueries` | 手动 `mutate` | 手动 |
 | 无限加载 | ✅ `useInfinite` | `useInfiniteQuery` | `useSWRInfinite` | `useInfiniteScroll` |
-| key 变化时保留旧数据 | **默认行为** | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
+| key 变化时保留旧数据 | **默认行为** + `usePlaceholderData` 标志 | `placeholderData: keepPreviousData` | `keepPreviousData: true` | ✗ |
 | DevTools | ✅ `InjectDevTools` 面板（独立入口） | ✅ | 社区版 | ✗ |
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
@@ -59,7 +59,7 @@ React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。
 | [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | 写操作侧，叠在一等 `useMutation` 之上：钉住项目默认的失败上报，显式 `onError` 仍可替换——这是给库 hook 叠加项目约定的范式。 |
 | [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | 加 `useCache(staleTime)`（模块级缓存实例）+ `useFocusRevalidate`。 |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | 加固定间隔的 `usePolling`。 |
-| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | 按键运行的 `useRun(fn, [{page}], {hash: stableHash})`，默认保留旧数据；`useLoading` 做小刷新指示器，`useInitialLoading` 做首屏骨架。 |
+| [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | 按键运行的 `useRun(fn, [{page}], {hash: stableHash})`，默认保留旧数据，并用 `usePlaceholderData` 把它变成可观察的标志；`useLoading` 做小刷新指示器，`useInitialLoading` 做首屏骨架。 |
 | [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | 把条目持久化到 `localStorage` 的 `CacheProvider`——面向应当挺过页面刷新、而非每次从零重建的缓存。 |
 
 复制最贴近你场景的一份，替换成你的 fetcher，再按每个文件头列出的常见定制点调整：`staleTime`、错误上报、缓存实例、返回形状。一个 hook 让所有屏幕共用同一套 loading/error 契约——并且只有一处需要修改。
@@ -470,12 +470,13 @@ function UserList() {
   useRun(loadUsers, [{page}], {hash: stableHash});
 
   const users = useResult(loadUsers);    // 新一页加载期间，渲染的仍是上一页
+  const isPlaceholderData = usePlaceholderData(loadUsers, [{page}]); // 为 true 的正是这段窗口
   const loading = useLoading(loadUsers); // true —— 显示小指示器，而不是 skeleton
 
   return (
     <div>
       {loading && <p>loading…</p>}
-      <ul>
+      <ul style={{opacity: isPlaceholderData ? 0.5 : 1}}>
         {users?.map((u) => (
           <li key={u.id}>{u.username}</li>
         ))}
@@ -492,6 +493,8 @@ function UserList() {
 ```
 
 `page` 变化时，旧一页会一直留在屏幕上，直到新结果落地：共享的 result store 在调用之间从不重置，且每次调用持有的序号票券会丢弃任何比最新已应用结果更旧的写入——慢请求无法覆盖新调用已经交付的数据。TanStack Query 需要配置 `placeholderData: keepPreviousData`、SWR 需要 `keepPreviousData: true` 才能得到这个行为；本库中它是默认行为，无需任何选项。首次加载配合 `useInitialLoading`（整页 skeleton），重访页面配合 `useCache`（命中缓存立即渲染、后台重新验证）。
+
+既然保留的数据本来就是旧结果，消费者就需要一个办法分辨"当前渲染的到底是谁的数据"。`usePlaceholderData(fn, args)` 回答的正是这个问题：共享 store 会记录当前结果是由哪组 args 取回的，该标志把它（经 `stableHash` 结构化比较，并忽略追加的 `AbortSignal`）与当前 args 对照——上一页还在屏幕上时为 `true`，新一页落地后翻回 `false`。在尚无任何结果的窗口里，可选的第三个参数扮演 TanStack `placeholderData` 的角色：把同一个值传给 `useResult(fn, placeholderData)`，首个结果到来前就会显示它（并带 `true` 标志）。来源未知的结果——乐观快照、`useInfinite` 累积的 pages——不会被认领为占位数据。
 
 ### 无限加载 — `useInfinite`
 
@@ -567,6 +570,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。首个结果后，更新与 `useResult` 完全一致地流入。 |
 | `useLoading(fn)` | 任意调用进行中为 `true`。 |
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
+| `usePlaceholderData(fn, args, placeholderData?)` | 当前显示的结果并非由 `args` 取回时为 `true`——默认 keep-previous-data 行为的可观察标志（经 `stableHash` 结构化比较，忽略末尾追加的 `AbortSignal`）。传入 `placeholderData` 时，首个结果到来之前也为 `true`。 |
 | `useError(fn)` | 最近一次抛出的错误；成功时清空。错误状态挂在 injectable 级的共享广播 store 上：晚挂载的组件直接从共享快照读到上一次错误，多个消费者同步更新；写入带序号保护，慢的旧调用失败不会覆盖新调用的成功状态。 |
 | `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。与 `useError` 共用 injectable 级的共享广播 store，晚挂载的组件同样从共享快照起步。 |
 | `useCatch(fn, catcher)` | 通过 `catcher(e) => result` 把 rejection 转为兜底值。 |
@@ -602,7 +606,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 承重面已冻结——签名与语义按契约对待，改动它需要出现关键性 bug 才行：注入核心（`useInjectable`、`useInject`、`useInjectBefore`、`getInjectContext`、`addWrapper`）、`useRun`、`useCache` / `useInvalidate` / `createMemoryCacheProvider`、`useDedup`，以及状态 hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`。
 
-仍在演进、欢迎反馈：`useMutation`、`useOptimistic`、`useInfinite`、`useSuspenseResult` 与 DevTools 面板。
+仍在演进、欢迎反馈：`useMutation`、`useOptimistic`、`useInfinite`、`useSuspenseResult`、`usePlaceholderData` 与 DevTools 面板。
 
 0.x 阶段，破坏性变更随 semver **minor** 版本发布，并在 CHANGELOG 中逐条说明——1.0 冻结上述全部内容。
 

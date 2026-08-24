@@ -106,7 +106,14 @@ import {
 import createMemoryCacheProvider from './memory-cache-provider';
 
 export {useInject, useInjectBefore, getInjectContext, isInjectable};
-export type {AsyncFunc, Func, R, CacheProvider, CacheResult, CacheEvent} from '@@/types';
+export type {
+  AsyncFunc,
+  Func,
+  R,
+  CacheProvider,
+  CacheResult,
+  CacheEvent
+} from '@@/types';
 
 export {useDedup} from './dedup';
 export {useOptimistic} from './optimistic';
@@ -159,10 +166,78 @@ export function useResult<AF extends AsyncFunc>(
     (f: AF) =>
       ((...args) => {
         const seq = nextResultSeq(store);
-        return f(...args).then(thru<RAF>((r) => emitResult(store, r, seq)));
+        return f(...args).then(
+          thru<RAF>((r) => emitResult(store, r, seq, args))
+        );
       }) as AF
   );
   return result;
+}
+
+// Drops the trailing AbortSignal slot of an args tuple. `useRun` with
+// `{signal: true}` appends the signal AFTER the caller's logical
+// arguments, and stableHash already collapses every signal instance to one
+// fixed placeholder — so trimming the extra slot makes tuples with and
+// without an appended signal hash identically.
+const trimTrailingSignal = (args: readonly any[]) =>
+  args.length > 0 && isAbortSignal(args[args.length - 1])
+    ? args.slice(0, -1)
+    : args;
+
+/**
+ * Returns `true` while the result currently on display was not fetched
+ * with `args` — the observable flag of this library's default
+ * keep-previous-data behavior. TanStack Query needs
+ * `placeholderData: keepPreviousData` to keep the old data on a key
+ * change; here that is already the default (the shared result store is
+ * never reset between calls), and this hook tells the consumer WHICH data
+ * it is looking at: `true` means "the previous args' result (or the
+ * `placeholderData` fallback), dim it / spin a top indicator", `false`
+ * means "the real result for the current args".
+ *
+ * The flag is computed structurally: both the recorded provenance of the
+ * displayed result and `args` pass through `stableHash`, so re-renders
+ * with a fresh-but-equal args literal do not flip it, and a trailing
+ * `AbortSignal` appended by `useRun`'s `{signal: true}` is ignored on
+ * both sides. Results whose provenance is unknown — an optimistic
+ * snapshot, the accumulated pages of `useInfinite` — are never claimed
+ * as placeholders. Pair with `useResult(fn, placeholderData)` so the
+ * fallback value is actually displayed while the first load is pending.
+ *
+ * @param {AsyncFunc} injectableFn - the wrapped async function to watch.
+ * @param {Parameters<AF>} args - the args tuple the consumer is currently
+ *   rendering for — pass the very tuple handed to `useRun`.
+ * @param {R<AF>} [placeholderData] - when given, the flag is also `true`
+ *   before the first result ever arrives (the fallback display window).
+ * @returns {boolean} whether the displayed result belongs to `args`.
+ * @example
+ * ```tsx
+ * const fetchPage = useInjectable((query: {page: number}) => api.list(query));
+ * useRun(fetchPage, [{page}], {hash: stableHash});
+ * const rows = useResult(fetchPage);
+ * const isPlaceholderData = usePlaceholderData(fetchPage, [{page}]);
+ *
+ * return <Table rows={rows} dimmed={isPlaceholderData} />;
+ * ```
+ */
+export function usePlaceholderData<AF extends AsyncFunc>(
+  injectableFn: AF,
+  args: Parameters<AF>,
+  placeholderData?: R<AF>
+): boolean {
+  const store = getResultStore(injectableFn);
+  const argsKey = stableHash(trimTrailingSignal(args));
+  // The snapshot is a boolean, so it is naturally stable between
+  // broadcasts; it is recomputed whenever the args key or the fallback
+  // changes, which is exactly when the verdict can differ.
+  return useStoreValue(
+    store,
+    useCallback(() => {
+      if (!store.hasResult) return placeholderData !== undefined;
+      if (store.lastArgs === undefined) return false;
+      return stableHash(trimTrailingSignal(store.lastArgs)) !== argsKey;
+    }, [store, argsKey, placeholderData])
+  );
 }
 
 // Module-private in-flight slot key, following the store-key pattern of
@@ -263,7 +338,7 @@ export function useSuspenseResult<AF extends AsyncFunc>(
         // of this chain, in that order), so the retry render React
         // schedules on this very promise always finds `hasResult` set.
         const promise = f(...args).then(
-          thru<R<AF>>((r) => emitResult(store, r, seq))
+          thru<R<AF>>((r) => emitResult(store, r, seq, args))
         );
         slot.promise = promise;
         const settle = () => {
@@ -366,7 +441,7 @@ export function useCache<AF extends AsyncFunc>(
           f(...args).then(
             thru<R<AF>>((r) => {
               cacheProvider.set(args, r);
-              emitResult(store, r, seq);
+              emitResult(store, r, seq, args);
               emitStale(staleStore, false);
             })
           );
@@ -380,8 +455,10 @@ export function useCache<AF extends AsyncFunc>(
             const isStale = Date.now() - cachedAt >= staleTime;
             emitStale(staleStore, isStale);
             // Broadcast the cached data right away so every subscriber
-            // renders it without waiting for the network.
-            emitResult(store, data, seq);
+            // renders it without waiting for the network. The cached value
+            // was fetched with these very args, so they are recorded as
+            // its provenance — a revisited page is not a placeholder.
+            emitResult(store, data, seq, args);
             if (isStale) {
               // The background revalidation is fire-and-forget: failures are
               // swallowed silently so the stale data stays on screen. A cache

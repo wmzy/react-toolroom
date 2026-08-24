@@ -41,7 +41,9 @@ export type ValidatedTargets<T extends readonly unknown[]> = {
 };
 
 /** Runtime shape check of an invalidation target's head. */
-export function isCacheProvider(value: any): value is CacheProvider<any, any[]> {
+export function isCacheProvider(
+  value: any
+): value is CacheProvider<any, any[]> {
   return (
     !!value &&
     typeof value.delete === 'function' &&
@@ -172,7 +174,10 @@ export function invalidate<const T extends readonly unknown[]>(
   // the elements are plain targets again — the validation already happened
   // at the type level, and `Array.isArray` narrowing does not play well
   // with the deferred intersection types.
-  for (const target of targets as readonly (CacheProvider<any, any[]> | readonly any[])[]) {
+  for (const target of targets as readonly (
+    | CacheProvider<any, any[]>
+    | readonly any[]
+  )[]) {
     const [provider, prefix] = Array.isArray(target)
       ? [target[0] as CacheProvider<any, any[]>, target.slice(1) as any[]]
       : [target as CacheProvider<any, any[]>, undefined];
