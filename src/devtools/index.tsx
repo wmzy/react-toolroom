@@ -10,7 +10,7 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import type {CSSProperties} from 'react';
 import {subscribeInjectEvents} from '../async';
-import type {AsyncFunc} from '../async';
+import type {AsyncFunc, CacheEvent} from '../async';
 
 /** Max characters shown per args/result summary cell. */
 const SUMMARY_LIMIT = 80;
@@ -147,8 +147,11 @@ export type InjectDevToolsProps = {
 export type ObservableCache = {
   /** Shallow copy of every entry as `{key, value, cachedAt}`. */
   snapshot?: () => {key: string; value: any; cachedAt: number}[];
-  /** Fires after any entry mutation; returns an unsubscribe. */
-  subscribe?: (listener: () => void) => () => void;
+  /**
+   * Fires after any entry mutation with what changed (`set` after writes,
+   * `delete` with the removed entries' raw args); returns an unsubscribe.
+   */
+  subscribe?: (listener: (e: CacheEvent<any[]>) => void) => () => void;
 };
 
 /**

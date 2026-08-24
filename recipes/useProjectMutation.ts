@@ -57,7 +57,9 @@ const reportMutationError = (error: Error, ...args: unknown[]) => {
  * `useMutation` — `[mutate, status, reset]` — plus default error
  * reporting. `invalidates` passes straight through (it lives in
  * `...rest`), so declarative cache invalidation works unchanged:
- * `useProjectMutation(saveArticle, {invalidates: [fetchFeed]})`.
+ * `useProjectMutation(saveArticle, {invalidates: [feedCache]})` —
+ * targets are cache providers (module constants), not injectables, so
+ * no reference plumbing is needed.
  * See the library hook's docs for the full semantics; the lifecycle
  * tests live in `test/async-hooks.test.ts`.
  *
@@ -70,7 +72,7 @@ const reportMutationError = (error: Error, ...args: unknown[]) => {
  * @example
  * ```tsx
  * const [rename, {isMutating, error}] = useProjectMutation(renameProject, {
- *   invalidates: [fetchProjects],
+ *   invalidates: [projectsCache],
  *   onSuccess: () => toast('Saved')
  * });
  * rename(user.id, nextName).catch(() => {});

@@ -1917,12 +1917,12 @@ describe('async hooks', () => {
   });
 
   describe('invalidation', () => {
-    // The composition every test below shares: the parent owns the
-    // injectables (the library's cross-component model — state lives on
-    // the functions you pass down), the Feed children cache + subscribe +
-    // drive the query, the editors mutate and declare what to invalidate
-    // with the literal option, so the `invalidates` types are checked
-    // exactly as a user writes them.
+    // The composition every test below shares: the Feed children cache +
+    // subscribe + drive the query through their injectables, the editors
+    // mutate and declare what to invalidate with the literal option, so
+    // the `invalidates` types are checked exactly as a user writes them.
+    // Note the editors never see the injectable — a provider reference
+    // (usually a module constant) is all invalidation needs.
     function Feed({
       query,
       cache,
@@ -1958,27 +1958,27 @@ describe('async hooks', () => {
       );
     }
 
-    // By-identity target: every cache entry of the injectable.
+    // By-identity target: every entry of the provider.
     function IdentityEditor({
-      query,
+      cache,
       save
     }: {
-      query: (tab: string) => Promise<string>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
       save: (draft: string) => Promise<string>;
     }) {
-      const [mutate] = useMutation(save, {invalidates: [query]});
+      const [mutate] = useMutation(save, {invalidates: [cache]});
       return <SaveButton mutate={mutate} />;
     }
 
     // Prefix target: only the entries whose args extend the prefix.
     function PrefixEditor({
-      query,
+      cache,
       save
     }: {
-      query: (tab: string) => Promise<string>;
+      cache: ReturnType<typeof createMemoryCacheProvider<string, any[]>>;
       save: (draft: string) => Promise<string>;
     }) {
-      const [mutate] = useMutation(save, {invalidates: [[query, 'news']]});
+      const [mutate] = useMutation(save, {invalidates: [[cache, 'news']]});
       return <SaveButton mutate={mutate} />;
     }
 
@@ -1998,7 +1998,7 @@ describe('async hooks', () => {
       return (
         <>
           <Feed query={query} cache={cache} tab='news' />
-          <Editor query={query} save={write} />
+          <Editor cache={cache} save={write} />
         </>
       );
     }
@@ -2121,7 +2121,7 @@ describe('async hooks', () => {
           <>
             <Feed query={newsQuery} cache={cache} tab='news' />
             <Feed query={sportsQuery} cache={cache} tab='sports' />
-            <PrefixEditor query={newsQuery} save={write} />
+            <PrefixEditor cache={cache} save={write} />
           </>
         );
       }
@@ -2176,7 +2176,7 @@ describe('async hooks', () => {
         return (
           <>
             <Feed query={query} cache={cache} tab='news' />
-            <IdentityEditor query={query} save={write} />
+            <IdentityEditor cache={cache} save={write} />
           </>
         );
       }
@@ -2226,11 +2226,8 @@ describe('async hooks', () => {
         cacheTime: 60000
       });
 
-      let queryRef: ((tab: string) => Promise<string>) | undefined;
-
       function OnlyFeed() {
         const query = useInjectable(fetchFeed);
-        queryRef = query;
         return <Feed query={query} cache={cache} tab='news' />;
       }
 
@@ -2247,18 +2244,115 @@ describe('async hooks', () => {
       });
       expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
 
-      // the provider binding outlives the consumer: after unmount the
-      // entry survives (that is what a cache is for) …
+      // after unmount the entry survives (that is what a cache is for) …
       unmount();
       expect(cache.get(['news'])).toEqual(['feed v1', expect.any(Number)]);
 
-      // … and the standalone invalidate() still purges it, without a
-      // refetch — there is no mounted wrapper chain to revalidate through
+      // … and the standalone invalidate() still purges it, with no
+      // injectable reference at all — the provider IS the address — and
+      // without a refetch: no mounted consumer subscribed to the event
       act(() => {
-        invalidate([queryRef!]);
+        invalidate([cache]);
       });
       expect(cache.get(['news'])).toBeUndefined();
       expect(fetchFeed).toHaveBeenCalledTimes(1);
+    });
+
+    it('should refresh every consumer of a shared provider, across injectables', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const save = vi.fn(() => Promise.resolve('saved'));
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      // Both tabs share the provider; a bare-provider target addresses the
+      // data itself, so BOTH mounted consumers — each with its own
+      // injectable and result broadcast — refetch their seen tuples.
+      function TwoTabsAndEditor() {
+        const newsQuery = useInjectable(fetchFeed);
+        const sportsQuery = useInjectable(fetchFeed);
+        const write = useInjectable(save);
+        return (
+          <>
+            <Feed query={newsQuery} cache={cache} tab='news' />
+            <Feed query={sportsQuery} cache={cache} tab='sports' />
+            <IdentityEditor cache={cache} save={write} />
+          </>
+        );
+      }
+
+      render(<TwoTabsAndEditor />);
+
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(2);
+      });
+      await act(async () => {
+        resolveQueue[0]('news v1');
+        resolveQueue[1]('sports v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('news v1');
+        expect(screen.getByTestId('feed-sports').textContent).toBe('sports v1');
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('save'));
+      });
+      // the clear() event reaches both consumers: two more fetches
+      await waitFor(() => {
+        expect(fetchFeed).toHaveBeenCalledTimes(4);
+      });
+
+      await act(async () => {
+        resolveQueue[2]('news v2');
+        resolveQueue[3]('sports v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('news v2');
+        expect(screen.getByTestId('feed-sports').textContent).toBe('sports v2');
+      });
+    });
+
+    it('should revalidate passively when the cache is purged outside invalidate()', async () => {
+      const {resolveQueue, fetchFeed} = deferredFetch();
+      const cache = createMemoryCacheProvider<string, any[]>({
+        cacheTime: 60000
+      });
+
+      function OnlyFeed() {
+        const query = useInjectable(fetchFeed);
+        return <Feed query={query} cache={cache} tab='news' />;
+      }
+
+      render(<OnlyFeed />);
+
+      await waitFor(() => {
+        expect(resolveQueue.length).toBe(1);
+      });
+      await act(async () => {
+        resolveQueue[0]('feed v1');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v1');
+      });
+
+      // deletePrefix (or delete/clear — a devtools panel button, any
+      // writer) is not library plumbing, yet the mounted consumer refreshes
+      // through the very same deletion event
+      await act(async () => {
+        cache.deletePrefix?.(stableHash(['news']).slice(0, 3));
+      });
+      await waitFor(() => {
+        expect(fetchFeed).toHaveBeenCalledTimes(2);
+      });
+      expect(cache.get(['news'])).toBeUndefined();
+
+      await act(async () => {
+        resolveQueue[1]('feed v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('feed-news').textContent).toBe('feed v2');
+      });
     });
   });
 

@@ -1,149 +1,52 @@
 import {AsyncFunc, CacheProvider, Func} from '@@/types';
-import {useEffect} from 'react';
 import {noop, stableHash} from '@@/util';
 import {emitStale, getStaleStore} from './base';
 import {getInjectContext} from './inject';
 
 /**
  * One declarative invalidation target:
+ * - a bare cache provider — its whole cache is purged, or
+ * - a `[provider, ...argsPrefix]` tuple — only entries whose raw args tuple
+ *   structurally extends the prefix, so `[feedCache, 'news']` leaves the
+ *   `sports` entries alone.
  *
- * - the injectable alone — every cache entry bound to it (`useCache` binds
- *   providers to the injectable as long as it lives);
- * - an `[injectable, ...argsPrefix]` tuple — only the entries whose call
- *   arguments structurally extend the prefix, so `[fetchFeed, 'news']`
- *   leaves the `sports` tab alone and `[fetchUser, id]` invalidates that
- *   one user regardless of the trailing arguments.
- *
- * The prefix elements are checked element-wise against the injectable's
- * parameters (see {@link ValidatedTargets}); at runtime, matching compares
- * `stableHash` per position — the same equivalence the cache keys use.
+ * The prefix elements are checked element-wise against the provider's raw
+ * key tuples (`deleteWhere`), so any `hash` convention works — matching
+ * happens in args space, never in hashed-key space.
  */
-export type InvalidateTarget<AF extends AsyncFunc = AsyncFunc> =
-  | AF
-  | readonly [injectable: AF, ...argsPrefix: Partial<Parameters<AF>>];
+export type InvalidateTarget = CacheProvider<any, any[]>;
 
 /**
- * Validates one element of an `invalidates` array: an injectable alone, or
- * an `[injectable, ...prefix]` tuple whose prefix is assignable to the
- * leading parameters of the injectable in the head. An invalid element
- * collapses to `never`, so the containing array rejects the literal and
- * the error points at the offending slot.
+ * Validates one element of an `invalidates` array: a cache provider alone,
+ * or a `[provider, ...prefix]` tuple whose prefix is assignable to the
+ * provider's key tuple. An invalid element collapses to `never`, so the
+ * containing array rejects the literal at compile time.
  */
-type ValidTarget<T> = T extends readonly [
-  infer F extends AsyncFunc,
-  ...infer A extends any[]
-]
-  ? A extends Partial<Parameters<F>>
-    ? T
+type ValidTarget<T> = T extends readonly [infer P, ...infer A extends any[]]
+  ? P extends CacheProvider<any, infer K extends any[]>
+    ? A extends Partial<K>
+      ? T
+      : never
     : never
-  : T extends AsyncFunc
+  : T extends CacheProvider<any, any[]>
     ? T
     : never;
 
 /**
  * Maps {@link ValidTarget} over a tuple, so each element's prefix is checked
- * against its own injectable — heterogeneous targets stay independent and
- * one bad element poisons exactly its own slot. The explicit `readonly`
- * modifier keeps the mapped tuple assignable from the readonly tuples the
- * `const` type parameter of {@link invalidate} infers.
+ * against its own provider's key tuple.
  */
 export type ValidatedTargets<T extends readonly unknown[]> = {
   readonly [K in keyof T]: ValidTarget<T[K]>;
 };
 
-/** What one cache provider bound to an injectable tracks for invalidation:
- * how many `useCache` consumers are mounted (`refs`) and every args tuple
- * that flowed through their wrappers, keyed by `stableHash(args)` (the
- * structural cache-line key, latest raw tuple winning). */
-type CacheBinding = {refs: number; args: Map<string, any[]>};
-
-/**
- * Per-injectable invalidation registry — which cache providers a
- * `useCache` consumer ever bound to the injectable, and the arg tuples
- * their wrappers saw. It lives on the injectable's context like the
- * result/error stores of `base.ts`, and its lifetime IS the injectable's:
- *
- * - Bindings are permanent, so invalidation still purges entries after
- *   their consumers unmounted — a remounting consumer must never be
- *   served pre-mutation data.
- * - The tuples are kept for the same reason: a prefix target can only
- *   delete entries it can address, and `delete(args)` needs the raw
- *   tuple. They are deduped structurally, so a long session grows this
- *   with distinct queries, not with calls.
- * - `refs` gates revalidation: with no mounted consumer there is no
- *   wrapper chain to refetch through — a revalidation call would hit the
- *   raw function without caching or broadcasting — so purged-but-inactive
- *   entries are left for the next mount to fetch fresh.
- */
-type CacheRegistry = Map<CacheProvider<any, any[]>, CacheBinding>;
-
-// Module-private store key, following the store-key pattern of base.ts:
-// the registry is reachable only through the helpers below.
-const cacheRegistryKey = Symbol('cache registry');
-
-/** Lazily creates and returns the invalidation registry of an injectable. */
-function getCacheRegistry(fn: Func): CacheRegistry {
-  // Throws the descriptive error of the inject system for plain functions —
-  // invalidation targets must be injectables (the cache binding, the stores
-  // and the wrapper chain all live on the injectable).
-  const context = getInjectContext(fn);
-  let registry = context[cacheRegistryKey] as CacheRegistry | undefined;
-  if (!registry) {
-    registry = new Map();
-    context[cacheRegistryKey] = registry;
-  }
-  return registry;
-}
-
-/**
- * Binds a cache provider to an injectable for invalidation and refcounts
- * the mounted `useCache` consumers. Composed into {@link useCache} — the
- * one place where an injectable and its provider meet — so every cached
- * read is invalidatable without extra wiring.
- *
- * The binding itself is created during render (idempotent get-or-create),
- * so a mutation fired from a sibling's effect already resolves the
- * injectable to its provider. The refcount lives in an effect: mount adds,
- * StrictMode's simulated remount re-adds, unmount releases — the same
- * mount/unmount semantics every other hook here follows. The binding
- * (with its tracked tuples) outlives the consumers on purpose; only the
- * injectable's own garbage collection drops it.
- *
- * @param injectableFn the injectable `useCache` is caching
- * @param cacheProvider the provider `useCache` was given
- * @return the injectable's registry, for the wrapper's arg tracking
- */
-export function useCacheInvalidation<AF extends AsyncFunc>(
-  injectableFn: AF,
-  cacheProvider: CacheProvider<any, any[]>
-): CacheRegistry {
-  const registry = getCacheRegistry(injectableFn);
-  let binding = registry.get(cacheProvider);
-  if (!binding) registry.set(cacheProvider, (binding = {refs: 0, args: new Map()}));
-  useEffect(() => {
-    binding!.refs++;
-    return () => {
-      binding!.refs--;
-    };
-    // The registry lives on the injectable's context — one object per
-    // injectable — and the provider is typically module-level, so both
-    // identities are stable; a changed provider simply binds alongside.
-  }, [registry, cacheProvider]);
-  return registry;
-}
-
-/**
- * Records an args tuple seen by a `useCache` wrapper. Keyed by
- * `stableHash(args)` — the structural key of the cache line — so repeated
- * and structurally equal calls (including fresh `AbortSignal`s, which
- * `stableHash` maps to one placeholder) collapse to the latest raw tuple.
- */
-export function recordCacheArgs(
-  registry: CacheRegistry,
-  cacheProvider: CacheProvider<any, any[]>,
-  args: any[]
-): void {
-  registry.get(cacheProvider)?.args.set(stableHash(args), args);
+/** Runtime shape check of an invalidation target's head. */
+export function isCacheProvider(value: any): value is CacheProvider<any, any[]> {
+  return (
+    !!value &&
+    typeof value.delete === 'function' &&
+    typeof value.clear === 'function'
+  );
 }
 
 /** Whether `args` structurally extends `prefix`, position by position. */
@@ -155,42 +58,111 @@ function matchesPrefix(prefix: readonly any[], args: readonly any[]): boolean {
 }
 
 /**
- * Invalidate every matching cache entry of the given targets and revalidate
- * the queries live consumers display — the fire-and-forget counterpart of
- * TanStack Query's `queryClient.invalidateQueries`, expressed through the
- * wrapper-injection architecture instead of a global client.
+ * Per-injectable, per-provider set of structurally-keyed revalidations in
+ * flight — the dedup that keeps one delete event from N mounted `useCache`
+ * consumers (or from `useInvalidate`'s explicit follow-up call) triggering N
+ * refetches of the same args. Lives on the injectable's context like the
+ * stores of `base.ts`; entries are removed when the revalidation settles.
+ */
+type PendingRegistry = Map<CacheProvider<any, any[]>, Set<string>>;
+
+// Module-private store key, following the store-key pattern of base.ts.
+const pendingKey = Symbol('revalidation pending');
+
+/** Lazily creates and returns the pending set of an injectable×provider pair. */
+export function getPendingSet(
+  fn: Func,
+  cacheProvider: CacheProvider<any, any[]>
+): Set<string> {
+  const context = getInjectContext(fn);
+  let registry = context[pendingKey] as PendingRegistry | undefined;
+  if (!registry) {
+    registry = new Map();
+    context[pendingKey] = registry;
+  }
+  let pending = registry.get(cacheProvider);
+  if (!pending) registry.set(cacheProvider, (pending = new Set()));
+  return pending;
+}
+
+/**
+ * Subscribes a `useCache` consumer to its provider's deletion events — the
+ * passive half of the invalidation model. Whenever entries are removed
+ * (`delete`/`clear`/`deleteWhere`/`deletePrefix`/expiry), every tuple this
+ * consumer's wrapper has seen among them is re-run through the injectable's
+ * full wrapper chain: a hard cache miss that refetches, writes the fresh
+ * result and broadcasts it to every subscriber, exactly like a focus
+ * revalidation. The shared stale flag is raised first so subscribers can
+ * render their refreshing indicator.
  *
- * Per target:
+ * `seen` is the consumer's own Map of structurally-keyed args tuples — owned
+ * by the hook instance, dropped with it on unmount, so a departed consumer's
+ * queries are never re-run by a later event. Cross-consumer dedup happens
+ * through {@link getPendingSet}.
  *
- * 1. **Purge.** A bare injectable clears every provider bound to it (bind
- *    one provider per injectable — the documented pattern — and clearing
- *    cannot hit another entity). A prefix tuple deletes exactly the
- *    tracked entries whose args structurally extend the prefix; since the
- *    `useCache` wrapper is the only writer of these entries, tracked means
- *    cached.
- * 2. **Revalidate.** The arg tuples of providers with mounted consumers
- *    are re-run through the full wrapper chain — a hard cache miss that
- *    refetches, writes the fresh result and broadcasts it to every
- *    subscriber, exactly like a focus revalidation. The shared stale flag
- *    is raised first so subscribers can render their refreshing
- *    indicator. Purged entries with no live consumer are not re-run
- *    (there is no wrapper chain to refetch through); the next mount
- *    simply fetches fresh data.
+ * Providers without the optional `subscribe` member get no passive
+ * revalidation: entries still purge, and the next wrapper-driven call
+ * (remount, manual call) fetches fresh — matching the pre-observable
+ * provider contract.
  *
- * Revalidation failures surface through the target's error store
- * (`useError`) like any other call; their promises are swallowed here so a
- * fire-and-forget `invalidate` never leaks an unhandled rejection.
+ * @return an unsubscribe function
+ */
+export function bindCacheRevalidation(
+  injectableFn: AsyncFunc,
+  cacheProvider: CacheProvider<any, any[]>,
+  seen: Map<string, any[]>
+): () => void {
+  return (
+    cacheProvider.subscribe?.((e) => {
+      if (e.type !== 'delete') return;
+      const pending = getPendingSet(injectableFn, cacheProvider);
+      const hits: any[][] = [];
+      for (const args of e.deleted) {
+        const key = stableHash(args);
+        if (seen.has(key) && !pending.has(key)) hits.push(args);
+      }
+      if (hits.length === 0) return;
+      emitStale(getStaleStore(injectableFn), true);
+      for (const args of hits) {
+        pending.add(stableHash(args));
+        // Fire-and-forget like the old active revalidation: failures surface
+        // through the target's error store (useError), never as an unhandled
+        // rejection on the mutating call's promise.
+        Promise.resolve(injectableFn(...args))
+          .catch(noop)
+          .finally(() => pending.delete(stableHash(args)));
+      }
+    }) ?? noop
+  );
+}
+
+/**
+ * Purge the caches addressed by the given targets — the imperative,
+ * mutation-agnostic half of the invalidation model (the `invalidates` option
+ * of `useMutation` calls exactly this on success).
  *
- * @param targets what to invalidate: each entry is an injectable (all of
- *   its cache) or an `[injectable, ...argsPrefix]` tuple (entries whose
- *   args extend the prefix)
+ * Per target: a bare provider clears outright; a `[provider, ...argsPrefix]`
+ * tuple removes only the entries whose raw args tuple structurally extends
+ * the prefix, via the provider's `deleteWhere` (entries whose tuple the
+ * provider cannot recover — SSR hydration — are skipped).
+ *
+ * This is a pure cache operation: it touches no injectable, needs no
+ * mounted consumer and never issues a request. Refreshing what mounted
+ * `useCache` consumers display is the provider's own event and
+ * {@link bindCacheRevalidation}'s job — which is why `deletePrefix`, a
+ * devtools panel button or any other writer gets the same revalidation for
+ * free.
+ *
+ * @param targets what to purge: each entry is a cache provider (all of it)
+ *   or a `[provider, ...argsPrefix]` tuple (entries whose args extend the
+ *   prefix)
  * @example
  * ```tsx
  * const [save] = useMutation(saveArticle, {
- *   invalidates: [fetchFeed, [fetchArticle, slug]]
+ *   invalidates: [feedCache, [articleCache, slug]]
  * });
  * // or imperatively, e.g. from a websocket handler:
- * invalidate([fetchFeed]);
+ * invalidate([feedCache]);
  * ```
  */
 export function invalidate<const T extends readonly unknown[]>(
@@ -200,38 +172,26 @@ export function invalidate<const T extends readonly unknown[]>(
   // the elements are plain targets again — the validation already happened
   // at the type level, and `Array.isArray` narrowing does not play well
   // with the deferred intersection types.
-  for (const target of targets as readonly InvalidateTarget[]) {
-    invalidateTarget(target);
-  }
-}
-
-function invalidateTarget(target: InvalidateTarget): void {
-  const [fn, prefix] = Array.isArray(target)
-    ? [target[0] as AsyncFunc, target.slice(1) as any[]]
-    : [target as AsyncFunc, undefined];
-  // An empty tuple literal typed its head away; nothing to resolve.
-  if (!fn) return;
-  const registry = getCacheRegistry(fn);
-
-  // A zero-length prefix covers any args — the same match as the bare
-  // form, which clears outright instead of enumerating tuples.
-  const wholeCache = prefix === undefined || prefix.length === 0;
-  const refetches = new Map<string, any[]>();
-  for (const [provider, binding] of registry) {
-    if (wholeCache) provider.clear();
-    for (const [key, args] of binding.args) {
-      if (wholeCache || matchesPrefix(prefix, args)) {
-        if (!wholeCache) provider.delete(args);
-        // Revalidate only what live consumers display — see CacheRegistry.
-        if (binding.refs > 0) refetches.set(key, args);
-      }
+  for (const target of targets as readonly (CacheProvider<any, any[]> | readonly any[])[]) {
+    const [provider, prefix] = Array.isArray(target)
+      ? [target[0] as CacheProvider<any, any[]>, target.slice(1) as any[]]
+      : [target as CacheProvider<any, any[]>, undefined];
+    if (!isCacheProvider(provider)) {
+      throw new Error(
+        'invalidate expects cache providers (optionally as ' +
+          '[provider, ...argsPrefix] tuples), got something else.'
+      );
     }
-  }
-
-  if (refetches.size > 0) {
-    emitStale(getStaleStore(fn), true);
-    for (const args of refetches.values()) {
-      Promise.resolve(fn(...args)).catch(noop);
+    if (prefix === undefined || prefix.length === 0) {
+      provider.clear();
+    } else if (provider.deleteWhere) {
+      provider.deleteWhere((args) => matchesPrefix(prefix, args));
+    } else if (process.env.NODE_ENV !== 'production') {
+      console.error(
+        'invalidate: prefix targets need a provider implementing ' +
+          'deleteWhere() (createMemoryCacheProvider does); the target was ' +
+          'skipped.'
+      );
     }
   }
 }

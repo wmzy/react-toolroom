@@ -98,14 +98,15 @@ import {
 import {
   InvalidateTarget,
   ValidatedTargets,
+  bindCacheRevalidation,
+  getPendingSet,
   invalidate,
-  recordCacheArgs,
-  useCacheInvalidation
+  isCacheProvider
 } from './invalidation';
 import createMemoryCacheProvider from './memory-cache-provider';
 
 export {useInject, useInjectBefore, getInjectContext, isInjectable};
-export type {AsyncFunc, Func, R, CacheProvider, CacheResult} from '@@/types';
+export type {AsyncFunc, Func, R, CacheProvider, CacheResult, CacheEvent} from '@@/types';
 
 export {useDedup} from './dedup';
 export {useOptimistic} from './optimistic';
@@ -306,11 +307,12 @@ export function useSuspenseResult<AF extends AsyncFunc>(
  * winning. Each consumer still registers its own wrapper, so a call still
  * performs the cache lookup once per consumer.
  *
- * Binding the provider here also registers the injectable for declarative
- * invalidation: `invalidate([injectableFn, ...])` and the `invalidates`
- * option of `useMutation` resolve their targets through exactly this
- * provider, purging matching entries and revalidating the arg tuples this
- * wrapper has seen (see {@link invalidate}).
+ * Invalidation is provider-driven: the `invalidates` option of
+ * `useMutation` and `invalidate()` only purge the provider, and this hook
+ * subscribes to its deletion events — whenever entries this consumer has
+ * seen are removed (by anything), it re-runs their tuples through the
+ * wrapper chain and broadcasts the fresh results (see
+ * {@link invalidate}).
  *
  * @param {AsyncFunc} injectableFn - the asynchronous function to memoize
  * @param {CacheProvider} cacheProvider - the cache provider for the function results
@@ -324,11 +326,13 @@ export function useCache<AF extends AsyncFunc>(
 ) {
   const store = getResultStore(injectableFn);
   const staleStore = getStaleStore(injectableFn);
-  // Bind the provider to the injectable for `invalidate` / the
-  // `invalidates` option of `useMutation`: every entry this wrapper caches
-  // becomes invalidatable by naming the injectable, and the arg tuples
-  // seen below are the queries a later invalidation revalidates.
-  const registry = useCacheInvalidation(injectableFn, cacheProvider);
+  // This consumer's own seen-set: every args tuple its wrapper below has
+  // fetched, structurally keyed with the latest raw tuple winning. It is
+  // hook-local state, dropped on unmount, so a departed consumer's queries
+  // are never re-run by a later purge of the provider.
+  const seenRef = useRef<Map<string, any[]>>(undefined);
+  if (!seenRef.current) seenRef.current = new Map();
+  const seen = seenRef.current;
   // The boolean snapshot is stable by nature, so unchanged emissions bail
   // out of re-renders exactly like the old local setState did.
   const stale = useStoreValue(
@@ -338,11 +342,25 @@ export function useCache<AF extends AsyncFunc>(
 
   useEffect(cacheProvider.use, []);
 
+  // Passive revalidation — the other half of the invalidation model:
+  // `invalidate()` (and the `invalidates` option of `useMutation`) only
+  // purge the provider; whenever entries THIS consumer has seen are removed
+  // (by anything — invalidate, deletePrefix, a devtools panel, expiry),
+  // their tuples are re-run through the injectable's full wrapper chain:
+  // a hard cache miss that refetches and broadcasts, exactly like a focus
+  // revalidation. Providers without the optional `subscribe` member get no
+  // passive revalidation — entries still purge, and the next explicit call
+  // fetches fresh.
+  useEffect(
+    () => bindCacheRevalidation(injectableFn, cacheProvider, seen),
+    [injectableFn, cacheProvider, seen]
+  );
+
   useInject(
     injectableFn,
     (f: AF) =>
       ((...args) => {
-        recordCacheArgs(registry, cacheProvider, args);
+        seen.set(stableHash(args), args);
         const seq = nextResultSeq(store);
         const refetch = () =>
           f(...args).then(
@@ -414,8 +432,19 @@ export function useInvalidate<AF extends AsyncFunc>(
 ): (...args: Parameters<AF>) => Promise<R<AF>> {
   return useCallback(
     (...args: Parameters<AF>) => {
+      // Claim the revalidation slot BEFORE the delete: the provider's
+      // deletion event would otherwise make mounted `useCache` consumers
+      // re-run the same args, fetching a second time. Our explicit call
+      // below is the one that refetches; the claim is released when it
+      // settles. (The old model never notified consumers at all — the new
+      // one refreshes them through the event for every other entry.)
+      const pending = getPendingSet(injectableFn, cacheProvider);
+      const key = stableHash(args);
+      pending.add(key);
       cacheProvider.delete(args);
-      return injectableFn(...args) as Promise<R<AF>>;
+      const call = injectableFn(...args) as Promise<R<AF>>;
+      call.finally(() => pending.delete(key));
+      return call;
     },
     [injectableFn, cacheProvider]
   );
@@ -536,12 +565,13 @@ export type MutationOptions<
     ...args: Parameters<M>
   ) => void;
   /**
-   * Cache targets to invalidate when the call succeeds — declarative
-   * `useInvalidate` for the common "write, then refresh what the write
-   * touched" flow. Each entry is an injectable (all of its cache) or an
-   * `[injectable, ...argsPrefix]` tuple (entries whose args extend the
-   * prefix); a failed mutation invalidates nothing. See
-   * {@link invalidate} for the full semantics.
+   * Cache targets to purge when the call succeeds — declarative
+   * invalidation for the common "write, then refresh what the write
+   * touched" flow. Each entry is a cache provider (all of its entries) or
+   * a `[provider, ...argsPrefix]` tuple (entries whose raw args tuple
+   * extends the prefix); a failed mutation invalidates nothing. Purging is
+   * a pure cache operation — mounted `useCache` consumers refresh through
+   * the provider's own deletion event. See {@link invalidate}.
    */
   invalidates?: readonly [...T] & ValidatedTargets<T>;
 };
@@ -577,9 +607,12 @@ export type MutationStatus = {
  * lands afterwards — reset only wipes what has already settled.
  *
  * `invalidates` is the declarative mutation→query link: on success (only)
- * each target — an injectable for its whole cache, or an
- * `[injectable, ...argsPrefix]` tuple for prefix-matching entries — is
- * purged and its live queries revalidated, exactly as `invalidate()` does.
+ * each target — a cache provider for its whole cache, or a
+ * `[provider, ...argsPrefix]` tuple for prefix-matching entries — is
+ * purged, exactly as `invalidate()` does. Mounted `useCache` consumers of
+ * that provider refresh themselves through its deletion event, so the
+ * mutation component needs no reference to any injectable — the provider
+ * (usually a module constant) is all it takes.
  * A rejected mutation invalidates nothing.
  *
  * Division of labor: `useMutation` owns the lifecycle and status;
@@ -600,7 +633,7 @@ export type MutationStatus = {
  * ```tsx
  * function RenameForm({id, name, fetchUsers}: Props) {
  *   const [rename, {isMutating, error}, reset] = useMutation(renameUser, {
- *     invalidates: [fetchUsers],
+ *     invalidates: [userCache],
  *     onError: () => toast('Save failed')
  *   });
  *   return (
@@ -634,16 +667,16 @@ export function useMutation<
   //    re-registering the wrapper or dragging options through effect deps.
   const optionsRef = useRef(options);
   optionsRef.current = options;
-  // Dev-only, fail fast: a raw (non-injectable) target would otherwise
-  // only blow up inside the success handler and turn a succeeded mutation
-  // into a rejection. Throwing during render points at the component.
+  // Dev-only, fail fast: a non-provider target would otherwise only blow
+  // up inside the success handler and turn a succeeded mutation into a
+  // rejection. Throwing during render points at the component.
   if (process.env.NODE_ENV !== 'production' && options?.invalidates) {
     for (const target of options.invalidates) {
-      const fn = Array.isArray(target) ? target[0] : target;
-      if (!isInjectable(fn)) {
+      const provider = Array.isArray(target) ? target[0] : target;
+      if (!isCacheProvider(provider)) {
         throw new Error(
-          'useMutation: invalidates expects injectables returned by ' +
-            'useInjectable() (optionally as [injectable, ...argsPrefix] ' +
+          'useMutation: invalidates expects cache providers (e.g. from ' +
+            'createMemoryCacheProvider(), optionally as [provider, ...argsPrefix] ' +
             'tuples), got something else.'
         );
       }

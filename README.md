@@ -382,45 +382,49 @@ const cache = createMemoryCacheProvider<unknown, any[]>({
 cache.deletePrefix('user:');
 ```
 
-`delete(key)` and `useInvalidate` target exactly one entry. `deletePrefix(prefix)` batches: it walks the hashed keys and removes every one starting with `prefix`. Pair it with a `hash` convention (`'user:' + stableHash(args)`) and a mutation that can affect many cached users at once — say a role change for a whole team — invalidates the entire `user:` namespace without touching `post:` or any other prefix.
+`delete(key)` and `useInvalidate` target exactly one entry. `deletePrefix(prefix)` batches: it walks the hashed keys and removes every one starting with `prefix`. Pair it with a `hash` convention (`'user:' + stableHash(args)`) and a mutation that can affect many cached users at once — say a role change for a whole team — invalidates the entire `user:` namespace without touching `post:` or any other prefix. The removal fires the same deletion event `invalidate` does, so mounted `useCache` consumers refetch — no extra wiring.
 
 ### Declare what a mutation invalidates — `invalidates` / `invalidate`
 
 `useInvalidate` is imperative: you call the invalidator yourself in the success handler. `invalidates` is the same flow declared where the mutation lives — the library runs it on success, and only on success:
 
 ```tsx
+// Module-level caches — invalidation targets them directly, so the editor
+// component never needs a reference to any injectable.
 const feedCache = createMemoryCacheProvider<Article[], any[]>({cacheTime: 60000});
+const articleCache = createMemoryCacheProvider<Article, any[]>({cacheTime: 60000});
 
-function Editor({fetchFeed, fetchArticle, slug}: Props) {
+function Editor({slug}: Props) {
   const [save, {isMutating}] = useMutation(saveArticle, {
     invalidates: [
-      fetchFeed,               // (a) by identity: every cache entry of the feed
-      [fetchArticle, slug]     // (b) by prefix: entries whose args start with slug
+      feedCache,               // (a) the whole provider
+      [articleCache, slug]     // (b) by prefix: entries whose args start with slug
     ]
   });
-  // save() resolves → the feed and this slug's cache are purged and
-  // revalidated. A rejected save invalidates nothing.
+  // save() resolves → both caches are purged and every mounted useCache
+  // consumer of them refetches and re-broadcasts. A rejected save
+  // invalidates nothing.
 }
 
 // The imperative twin, for non-mutation moments (a websocket push, a
 // logout, a manual refresh button):
-invalidate([fetchFeed]);
+invalidate([feedCache]);
 ```
 
-Both forms resolve their targets through the cache providers that `useCache` consumers bound to the target injectable — that binding is registered for you (it lives as long as the injectable, outliving mounts), and the prefix args are type-checked element-wise against the injectable's parameters at compile time. Per target:
+Invalidation addresses the **cache provider**, not any injectable: providers are the data's home (usually module constants), while injectables — hook-instance identities that are awkward to pass across the tree — own only the state broadcasts. The prefix args are type-checked element-wise against the provider's key tuple at compile time. Per target:
 
-1. **Purge.** A bare injectable clears every provider bound to it (keep one provider per entity, the pattern above, and clearing cannot hit anyone else). An `[injectable, ...argsPrefix]` tuple deletes exactly the entries whose call args structurally extend the prefix — `[fetchFeed, 'news']` leaves the `sports` entries alone — by exact `delete(args)`, which works under any `hash` convention. Entries keep being addressable after their consumer unmounted (a remount must never be served pre-mutation data).
-2. **Revalidate.** Every arg tuple a mounted `useCache` consumer has seen is re-run through the wrapper chain — a hard cache miss that refetches, rewrites the entry and broadcasts the fresh result to every subscriber, exactly like a focus revalidation. The shared `stale` flag rises first, so subscribers can render their refreshing indicator. If no consumer is mounted nothing is re-run — there is no wrapper chain to refetch through — but the purged cache already guarantees the next mount fetches fresh data instead of the pre-mutation value.
+1. **Purge.** A bare provider clears outright. A `[provider, ...argsPrefix]` tuple removes exactly the entries whose raw args tuple structurally extends the prefix — `[feedCache, 'news']` leaves the `sports` entries alone — via the provider's `deleteWhere`, which works under any `hash` convention because matching happens in args space. This is a pure cache operation: no injectable is touched, no request is issued, and no mounted consumer is required — which is also why an unmounted screen's entry can be purged with nothing but the provider in hand.
+2. **Revalidate — passively.** `useCache` subscribes to its provider's deletion events. Whenever entries a consumer has seen are removed — by `invalidate`, the `invalidates` option, `deletePrefix`, a DevTools panel button, expiry, any writer — their tuples are re-run through the injectable's wrapper chain: a hard cache miss that refetches and broadcasts the fresh result to every subscriber, exactly like a focus revalidation. The shared `stale` flag rises first, so subscribers can render their refreshing indicator. One delete event, however many consumers, still means one refetch per args tuple (in-flight revalidations dedupe). With no mounted consumer nothing is re-run, but the purged cache already guarantees the next mount fetches fresh.
 
 How this maps to TanStack Query's `invalidateQueries`:
 
 | | `invalidates` / `invalidate` | TanStack `invalidateQueries` |
 | --- | --- | --- |
 | Where the link lives | on the mutation, next to its write function | in `onSuccess`, calling a client method |
-| Addressing a query | the injectable + its args prefix (the args **are** the cache key) | hierarchical `queryKey` arrays, predicates |
-| Active queries | re-run through the wrapper chain (same mechanism as focus revalidate) | refetched immediately |
-| Inactive entries | purged from the bound providers — next mount fetches fresh | marked stale — refetch on next use |
-| Reach | providers bound by `useCache` on that injectable, no global state | the whole `QueryClient` cache |
+| Addressing a query | the cache provider + its args prefix (the args **are** the cache key) | hierarchical `queryKey` arrays, predicates |
+| Active queries | refetch through the provider's deletion event (same mechanism for every writer) | refetched immediately |
+| Inactive entries | purged from the provider — next mount fetches fresh | marked stale — refetch on next use |
+| Reach | exactly the providers you name, no global state | the whole `QueryClient` cache |
 | Failed mutation | invalidates nothing (declared, not guarded) | `onSuccess` never runs — same effect, you code it |
 
 `useOptimistic` composes on top: optimistic snapshots for edits you can predict locally, `invalidates` for the data you cannot.
@@ -573,13 +577,13 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
 | `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). Preset shorthand: `useRetry(fn, {retries = 3, backoff = 'exponential'})` — `'exponential'` waits 1s/2s/4s…, `'linear'` 1s/2s/3s…, or pass `(attempt) => ms` for custom delays; both signatures share one mechanism. |
 | `useRun(fn, args, options?)` | Run `fn(...args)` on mount and whenever `args` change. `{signal: true}` appends an `AbortSignal` as the last argument and aborts it on change/unmount. `{hash}` (e.g. `stableHash`) replaces the reference comparison with a structural key, so unstable references in `args` only re-run on real changes — the same key semantics as `useDedup`/`useCache`. Plain (non-injectable) functions are detected via `isInjectable` and run as-is. |
-| `useMutation(mutation, options?)` | The write-side counterpart of `useRun`: returns `[mutate, status, reset]` — a stable `mutate` (the injectable itself, rejections keep flowing), injectable-level shared status (`isMutating` / `error` / `failureCount`, same stores as `useLoading`/`useError`), and a `reset` that clears settled failure bookkeeping without invalidating in-flight tickets. Hook-level `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks fire with the latest closures (ref funnel — inline options objects are fine); per-call callbacks are simply `.then`/`.catch` on the returned promise. `invalidates: [fn, [fn, ...argsPrefix], …]` purges and revalidates the targets' caches on success (see `invalidate`). Compose `useOptimistic` / `useInvalidate` on the same injectable for optimistic snapshots and manual refresh. |
-| `useCache(fn, cacheProvider, staleTime = 0)` | SWR caching: cache hits broadcast immediately; stale entries revalidate in the background. Returns whether the current data is stale — a broadcast flag shared by every `useCache` consumer of the injectable, updating together (last verdict wins). Also binds the provider to the injectable, which is what `invalidate` and `invalidates` resolve their targets through. |
+| `useMutation(mutation, options?)` | The write-side counterpart of `useRun`: returns `[mutate, status, reset]` — a stable `mutate` (the injectable itself, rejections keep flowing), injectable-level shared status (`isMutating` / `error` / `failureCount`, same stores as `useLoading`/`useError`), and a `reset` that clears settled failure bookkeeping without invalidating in-flight tickets. Hook-level `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks fire with the latest closures (ref funnel — inline options objects are fine); per-call callbacks are simply `.then`/`.catch` on the returned promise. `invalidates: [cache, [cache, ...argsPrefix], …]` purges the target providers on success (see `invalidate`) — mounted consumers refresh through the deletion event. Compose `useOptimistic` / `useInvalidate` on the same injectable for optimistic snapshots and manual refresh. |
+| `useCache(fn, cacheProvider, staleTime = 0)` | SWR caching: cache hits broadcast immediately; stale entries revalidate in the background. Returns whether the current data is stale — a broadcast flag shared by every `useCache` consumer of the injectable, updating together (last verdict wins). Also subscribes to the provider's deletion events, so anything that purges the cache (`invalidate` / `invalidates`, `deletePrefix`, a DevTools panel button, expiry) makes mounted consumers refetch and re-broadcast. |
 | `useInvalidate(fn, cacheProvider)` | Returns a stable `(...args) => Promise<R>` that deletes the cache entry under `args` and immediately re-runs the injectable with them — hard invalidation for mutation success paths. Keys link to `useCache` via the same provider and args tuple. |
-| `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is an injectable (all of its cache is purged) or an `[injectable, ...argsPrefix]` tuple (only entries whose args structurally extend the prefix — purged by exact `delete(args)`, so any `hash` convention works). Matching entries are purged from every provider bound by `useCache`, then the arg tuples mounted consumers displayed are re-run through the wrapper chain — refetch, rewrite, broadcast; entries with no live consumer are purged but not re-run, so the next mount fetches fresh. A fire-and-forget API: revalidation errors surface through `useError` of the target, promises resolve immediately. |
+| `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is a cache provider (all of its entries are purged) or a `[provider, ...argsPrefix]` tuple (only entries whose raw args tuple structurally extends the prefix, removed via the provider's `deleteWhere` — any `hash` convention works). A pure cache operation: no injectable needed, no request issued; mounted `useCache` consumers of the provider refresh themselves through its deletion event (refetch via the wrapper chain, rewrite, broadcast). |
 | `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
 | `useInfinite(fn, {getNextPageParam})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` — a subset of TanStack's `useInfiniteQuery`. Only `fetchNextPage()` calls append; any direct call (e.g. a `useRun` rerun) resets `pages`. |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges), `deletePrefix` (batch invalidation by hashed-key prefix), and `subscribe`/`snapshot` — a read-only observation interface for the DevTools panel or your own (fires after every entry mutation; snapshots every entry as `{key, value, cachedAt}`); idle-garbage-collects entries after `cacheTime` once unused. |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | In-memory `CacheProvider` with `get/set/delete/clear/use`, plus `dehydrate`/`hydrate` (JSON-safe SSR transport; `hydrate` merges), `deletePrefix` (batch invalidation by hashed-key prefix), `deleteWhere` (batch invalidation by args predicate — what prefix `invalidates` targets use) and `subscribe`/`snapshot` — an observation interface driving both the DevTools panel and `useCache`'s passive revalidation (a `set` event fires after writes, a `delete` event after removals carrying the removed entries' raw args; `snapshot()` lists every entry as `{key, value, cachedAt}`); idle-garbage-collects entries after `cacheTime` once unused. |
 | `useDedup(fn, {hash = stableHash}?)` | Concurrent calls with the same key share one in-flight promise; the entry is dropped on settle, so failures are retryable. |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | Call `fn(...args)` every `interval` ms; skips ticks while the previous call is pending; pauses while the document is hidden unless `whenHidden`. Changing `interval` restarts the timer. `args` land on the same `useCache`/`useDedup` key as `useRun(fn, args)` — pass the keyed tuple when `useRun` uses one. |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | Refetch on window focus and on `visibilitychange` back to visible, throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. |
