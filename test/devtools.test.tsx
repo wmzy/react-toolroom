@@ -100,6 +100,40 @@ describe('InjectDevTools', () => {
     expect(screen.getByText(/\[2\]/, {selector: 'td'})).toBeTruthy();
   });
 
+  it('renders observed cache entries and truncates over-long values', async () => {
+    const cache = createMemoryCacheProvider<string, [number]>();
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[cache]} />;
+    }
+    render(<Host />);
+
+    await act(async () => {
+      cache.set([1], 'v1');
+    });
+    expect(screen.getByText('v1', {selector: 'td'})).toBeTruthy();
+
+    // A value past SUMMARY_LIMIT (80) is truncated with an ellipsis.
+    await act(async () => {
+      cache.set([2], 'x'.repeat(100));
+    });
+    const cell = screen.getByText('x'.repeat(79) + '…', {selector: 'td'});
+    expect(cell.textContent).toHaveLength(80);
+  });
+
+  it('silently skips caches without a snapshot member', () => {
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[{} as any]} />;
+    }
+    render(<Host />);
+    // the panel stays alive; no cache row was rendered from the bare object
+    expect(
+      screen.getByText(/no calls settled yet/i, {selector: 'p'})
+    ).toBeTruthy();
+    expect(screen.queryByText('v1', {selector: 'td'})).toBeNull();
+  });
+
   it('unsubscribes on unmount and stops recording', async () => {
     const unsubscribe = vi.fn();
     mocks.subscribe.mockImplementationOnce((fn: any, handlers: any) => {

@@ -693,7 +693,10 @@ describe('async hooks', () => {
       // Callers of the shared request still receive its result…
       expect(await promise).toBe('fetched');
       // …but the cache keeps the value written while it was in flight.
-      expect(await provider.get(['k'])).toEqual(['written', expect.any(Number)]);
+      expect(await provider.get(['k'])).toEqual([
+        'written',
+        expect.any(Number)
+      ]);
     });
 
     it('should not resurrect an entry deleted while its load was in flight', async () => {
@@ -759,6 +762,36 @@ describe('async hooks', () => {
       const peeked = provider.peek!(['k'])!;
       expect(peeked.value).toBe('v');
       expect(peeked.cachedAt).toEqual(expect.any(Number));
+    });
+
+    it('should mark snapshot rows pending while a load is in flight', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>();
+      let resolveFn!: (v: string) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      // an in-flight-only entry is invisible to snapshot()
+      expect(provider.snapshot!()).toEqual([]);
+
+      // a write-through set lands while the request is still pending
+      provider.set(['k'], 'v1');
+      const pending = provider.snapshot!();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toMatchObject({
+        value: 'v1',
+        cachedAt: expect.any(Number),
+        pending: true
+      });
+
+      resolveFn('v2');
+      await promise;
+      // the generation bump from set() made the late settle a no-op
+      const settled = provider.snapshot!();
+      expect(settled).toHaveLength(1);
+      expect(settled[0]!.value).toBe('v1');
+      expect(settled[0]!.pending).toBeUndefined();
     });
   });
 
@@ -1182,6 +1215,35 @@ describe('async hooks', () => {
         expect(screen.getByTestId('count').textContent).toBe('1');
       });
     });
+
+    it('should seed a late mounter from the store result, not from init', async () => {
+      const fetchPage = vi.fn(async () => ({articlesCount: 2}));
+      let injectable!: any;
+
+      function First() {
+        injectable = useInjectable(fetchPage);
+        const count = useResultSelect(injectable, (r) => r.articlesCount);
+        useRun(injectable, []);
+        return <div>{count === undefined ? 'loading' : count}</div>;
+      }
+
+      render(<First />);
+      await waitFor(() => {
+        expect(screen.getByText('2')).toBeDefined();
+      });
+
+      // A consumer mounting AFTER a result exists: the lazy initializer
+      // must take store.lastResult, never the init fallback.
+      function Late() {
+        const count = useResultSelect(injectable, (r) => r.articlesCount, {
+          articlesCount: 99
+        });
+        return <div data-testid='late'>{count}</div>;
+      }
+
+      render(<Late />);
+      expect(screen.getByTestId('late').textContent).toBe('2');
+    });
   });
 
   describe('useLoading', () => {
@@ -1511,6 +1573,36 @@ describe('async hooks', () => {
 
       render(<TestComponent />);
       expect(screen.getByText('test')).toBeDefined();
+    });
+
+    it('should catch a rejection and hand the transformed value onwards', async () => {
+      const fetchData = vi.fn(async (): Promise<string> => {
+        throw new Error('original');
+      });
+      const catcher = vi.fn((e: Error) => `caught: ${e.message}`);
+      let outcome: unknown;
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCatch(injectable, catcher);
+        useEffect(() => {
+          // thru semantics: the catcher runs as an interceptor, and the
+          // call still RESOLVES — with the original error object — so a
+          // fire-and-forget caller never sees an unhandled rejection.
+          injectable().then((v) => {
+            outcome = v;
+          });
+        }, [injectable]);
+        return <div>test</div>;
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(outcome).toBeInstanceOf(Error);
+      });
+      expect((outcome as Error).message).toBe('original');
+      expect(catcher).toHaveBeenCalledWith(expect.any(Error));
+      expect(catcher).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2191,6 +2283,51 @@ describe('async hooks', () => {
 
       expect(fetchData).toHaveBeenCalledTimes(1);
     });
+
+    it('should work with a legacy provider that has no load() (write-through set)', async () => {
+      const backing = new Map<string, [string, number]>();
+      // The minimal pre-load() provider surface: get/set/delete/clear. No
+      // load() (the routing layer calls through and write-through set()
+      // applies the result) and no subscribe()/deleteWhere() members.
+      const legacy = {
+        get: (args: [number]) => backing.get(JSON.stringify(args)),
+        set: (args: [number], value: string) =>
+          void backing.set(JSON.stringify(args), [value, Date.now()]),
+        delete: (args: [number]) => void backing.delete(JSON.stringify(args)),
+        clear: () => backing.clear(),
+        // useEffect(cacheProvider.use, []) runs on mount; a no-op keeps
+        // the minimal provider compatible without idle expiry.
+        use: () => () => {}
+      };
+
+      const fetchData = vi.fn(async (id: number) => `v:${id}`);
+
+      function Consumer({label}: {label: string}) {
+        const query = useInjectable(fetchData);
+        useCache(query, legacy as any, 60000);
+        const result = useResult(query);
+        useEffect(() => {
+          void query(1).catch(() => {});
+        }, [query]);
+        return <span data-testid={label}>{result ?? 'pending'}</span>;
+      }
+
+      const first = render(<Consumer label='a' />);
+      await waitFor(() => {
+        expect(screen.getByTestId('a').textContent).toBe('v:1');
+      });
+      // the legacy path wrote through to the provider itself
+      expect(legacy.get([1])).toEqual(['v:1', expect.any(Number)]);
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      // a remounted consumer hits the legacy cache and never refetches
+      first.unmount();
+      render(<Consumer label='b' />);
+      await waitFor(() => {
+        expect(screen.getByTestId('b').textContent).toBe('v:1');
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('useInvalidate', () => {
@@ -2775,6 +2912,36 @@ describe('async hooks', () => {
         expect(screen.getByTestId('feed-news').textContent).toBe('feed v2');
       });
     });
+
+    it('should throw on a non-provider invalidate target', () => {
+      expect(() => invalidate([{}] as any)).toThrow(
+        /invalidate expects cache providers/
+      );
+    });
+
+    it('should warn and skip a prefix target whose provider lacks deleteWhere', () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const backing = new Map<string, [string, number]>();
+        backing.set('news', ['v1', Date.now()]);
+        const bare = {
+          get: (args: [string]) => backing.get(args[0]),
+          set: (args: [string], v: string) =>
+            void backing.set(args[0], [v, Date.now()]),
+          delete: (args: [string]) => void backing.delete(args[0]),
+          clear: () => backing.clear()
+        };
+
+        invalidate([[bare as any, 'news']]);
+
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(errorSpy.mock.calls[0]![0]).toContain('deleteWhere');
+        // nothing was purged — the unusable target was skipped
+        expect(backing.get('news')).toEqual(['v1', expect.any(Number)]);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
   });
 
   describe('getInjectContext', () => {
@@ -2816,11 +2983,75 @@ describe('async hooks', () => {
       render(<TestComponent />);
       expect(screen.getByTestId('loading').textContent).toBe('idle');
     });
+
+    it('should track loading around a wrapped call', async () => {
+      let resolveFn!: (v: string) => void;
+      const fetchData = () =>
+        new Promise<string>((resolve) => {
+          resolveFn = resolve;
+        });
+
+      function TestComponent() {
+        const [loading, wrap] = useLoadingFn();
+        // Capture the wrapped fn once: the count it toggles lives in state.
+        const [wrapped] = useState(() => wrap(fetchData));
+        useEffect(() => {
+          void wrapped();
+        }, [wrapped]);
+        return (
+          <span data-testid='loading'>{loading ? 'loading' : 'idle'}</span>
+        );
+      }
+
+      render(<TestComponent />);
+      // the effect already fired the wrapped call inside act
+      expect(screen.getByTestId('loading').textContent).toBe('loading');
+
+      await act(async () => {
+        resolveFn('done');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('loading').textContent).toBe('idle');
+      });
+    });
   });
 
   describe('useInjectBefore', () => {
     it('should be defined', () => {
       expect(useInjectBefore).toBeDefined();
+    });
+
+    it('should apply each registered wrapper exactly once per call across StrictMode remounts', async () => {
+      const applied: number[] = [];
+      let calls = 0;
+
+      function TestComponent() {
+        const injectable = useInjectable(async (x: number) => {
+          calls++;
+          return x;
+        });
+        useInject(injectable, (f) => {
+          applied.push(1);
+          return f;
+        });
+        useEffect(() => {
+          void injectable(1);
+        }, [injectable]);
+        return null;
+      }
+
+      render(
+        <StrictMode>
+          <TestComponent />
+        </StrictMode>
+      );
+      await act(async () => {});
+
+      // StrictMode mounts, unmounts, remounts: the trampoline is re-added
+      // (not duplicated), and each of the two effect-driven calls runs the
+      // wrapper chain exactly once.
+      expect(calls).toBe(2);
+      expect(applied).toHaveLength(2);
     });
 
     it('should inject wrapper at the beginning (lines 41-42)', async () => {
@@ -3040,6 +3271,38 @@ describe('async hooks', () => {
       await waitFor(() => {
         expect(screen.getByTestId('value').textContent).toBe('42');
       });
+    });
+
+    it('should dedupe through a custom hash option', async () => {
+      let resolveFn!: (v: string) => void;
+      const fetchData = vi.fn(
+        (id: number) =>
+          new Promise<string>((resolve) => {
+            resolveFn = resolve;
+          })
+      );
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useDedup(injectable, {hash: () => 'one-bucket'});
+        const [joined, setJoined] = useState<string>();
+        useEffect(() => {
+          Promise.all([injectable(1), injectable(2)]).then((r) =>
+            setJoined(r.join(','))
+          );
+        }, [injectable]);
+        return <div>{joined ?? 'pending'}</div>;
+      }
+
+      render(<TestComponent />);
+      await act(async () => {
+        resolveFn('shared');
+      });
+      await waitFor(() => {
+        expect(screen.getByText('shared,shared')).toBeDefined();
+      });
+      // different args, one bucket: a single request serves both callers
+      expect(fetchData).toHaveBeenCalledTimes(1);
     });
 
     it('should ignore the trailing AbortSignal when hashing args', async () => {

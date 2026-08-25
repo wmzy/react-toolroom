@@ -186,6 +186,40 @@ describe('async/inject exports', () => {
     render(createElement(TestComponent));
     expect(isInjectable(injectable!)).toBe(true);
   });
+
+  // addWrapper's disposer is identity-checked and safe to over-call: it
+  // only ever drops its own registration, so removing twice — or after
+  // another addWrapper removed itself — never splices a foreign wrapper.
+  it('should remove only its own wrapper and tolerate repeated removals', async () => {
+    let injectable: (x: number) => Promise<number>;
+    function TestComponent() {
+      injectable = useInjectable(async (x: number) => x);
+      return null;
+    }
+    render(createElement(TestComponent));
+
+    const calls: string[] = [];
+    const removeA = addWrapper(injectable!, (f: any) => {
+      calls.push('a');
+      return f;
+    });
+    const removeB = addWrapper(injectable!, (f: any) => {
+      calls.push('b');
+      return f;
+    });
+
+    await injectable!(1);
+    expect(calls).toEqual(['a', 'b']);
+
+    removeA();
+    removeA(); // second call is a no-op — the wrapper is already gone
+    await injectable!(2);
+    expect(calls).toEqual(['a', 'b', 'b']);
+
+    removeB();
+    await injectable!(3);
+    expect(calls).toEqual(['a', 'b', 'b']);
+  });
 });
 
 describe('useRun signal option', () => {
@@ -568,6 +602,32 @@ describe('usePolling', () => {
       expect(fetchData).toHaveBeenCalledTimes(2);
     } finally {
       restoreHidden();
+      vi.useRealTimers();
+    }
+  });
+
+  it('should resume polling after a rejected call', async () => {
+    vi.useFakeTimers();
+    try {
+      let fail = true;
+      const fetchData = vi.fn(async () => {
+        if (fail) throw new Error('down');
+        return 'ok';
+      });
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        usePolling(injectable, 1000);
+        return null;
+      }
+      render(createElement(TestComponent));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      // the rejected call released the slot — the next tick fires again
+      fail = false;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchData).toHaveBeenCalledTimes(2);
+    } finally {
       vi.useRealTimers();
     }
   });
@@ -959,6 +1019,47 @@ describe('useOptimistic', () => {
     expect(screen.getByText('saved:bob')).toBeDefined();
     expect(screen.getByText('boom')).toBeDefined();
   });
+
+  it('should publish nothing when the updater returns undefined and no result exists yet', async () => {
+    const resolvers: (() => void)[] = [];
+    const saveName = vi.fn(
+      (name: string) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`saved:${name}`))
+        )
+    );
+
+    function TestComponent() {
+      const injectable = useInjectable(saveName);
+      // a void updater: no snapshot to publish (and later nothing to roll
+      // back to) — the call itself must still work end to end
+      useOptimistic(injectable, () => undefined);
+      const result = useResult(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, result ?? 'nothing'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void injectable('alice')},
+          'save'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      fireEvent.click(screen.getByText('save'));
+    });
+    // no optimistic snapshot was emitted: the display stays untouched
+    expect(screen.getByText('nothing')).toBeDefined();
+
+    await act(async () => {
+      resolvers[0]!();
+    });
+    // the real result still lands normally
+    expect(screen.getByText('saved:alice')).toBeDefined();
+  });
 });
 
 describe('useInfinite', () => {
@@ -1071,6 +1172,118 @@ describe('useInfinite', () => {
     });
     expect(screen.getByText('pages:p0')).toBeDefined();
   });
+
+  it('should return undefined from fetchNextPage with no pages and at the end', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+    const outcomes: unknown[] = [];
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage, isFetchingNextPage, hasNextPage} =
+        useInfinite(fetchPages, {getNextPageParam: nextCursor});
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `hasNext:${String(hasNextPage)}`),
+        createElement('span', null, `fetching:${String(isFetchingNextPage)}`),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () => void fetchNextPage().then((r) => outcomes.push(r))
+          },
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    // first page still in flight: no pages to derive a next param from —
+    // fetchNextPage is a no-op and never enters the fetching state
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    expect(outcomes[0]).toBeUndefined();
+    expect(fetchPage).toHaveBeenCalledTimes(1); // only the useRun first page
+    expect(screen.getByText('fetching:false')).toBeDefined();
+    expect(screen.getByText('hasNext:false')).toBeDefined();
+
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p0')).toBeDefined();
+
+    // walk to the end of the list
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    expect(screen.getByText('hasNext:false')).toBeDefined();
+
+    // getNextPageParam says undefined: no request was issued and the
+    // fetching flag never flipped
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('fetching:false')).toBeDefined();
+  });
+
+  it('should let two consumers of one injectable share the append verdict', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      // two consumers register two wrappers on the same call — the shared
+      // callContext verdict must keep them from double-appending the page
+      const first = useInfinite(fetchPages, {getNextPageParam: nextCursor});
+      const second = useInfinite(fetchPages, {getNextPageParam: nextCursor});
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `a:${first.pages.join(',')}`),
+        createElement('span', null, `b:${second.pages.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void first.fetchNextPage()},
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    // each consumer sees the appended page exactly once — no duplication
+    expect(screen.getByText('a:p0,p1')).toBeDefined();
+    expect(screen.getByText('b:p0,p1')).toBeDefined();
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('useRetry preset options', () => {
@@ -1141,6 +1354,141 @@ describe('useRetry preset options', () => {
     // 1 initial attempt + 1 retry, then the rejection wins
     expect(flaky).toHaveBeenCalledTimes(2);
     expect(screen.getByText('always fails')).toBeDefined();
+  });
+
+  it('should wait the linear backoff delay between attempts', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const flaky = vi.fn(() => {
+        calls++;
+        return calls < 3
+          ? Promise.reject(new Error(`fail ${calls}`))
+          : Promise.resolve('ok');
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(flaky);
+        useRetry(injectable, {retries: 3, backoff: 'linear'});
+        const result = useResult(injectable);
+        return createElement(
+          'div',
+          null,
+          createElement('span', null, result ?? 'nothing'),
+          createElement(
+            'button',
+            {type: 'button', onClick: () => void injectable()},
+            'run'
+          )
+        );
+      }
+
+      render(createElement(TestComponent));
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+        await Promise.resolve();
+      });
+      expect(flaky).toHaveBeenCalledTimes(1);
+
+      // linear waits: 1000ms (attempt 0), then 2000ms (attempt 1)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2999);
+      });
+      expect(flaky).toHaveBeenCalledTimes(2); // retry 1 fired at t=1000
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(flaky).toHaveBeenCalledTimes(3); // retry 2 fired at t=3000
+      expect(screen.getByText('ok')).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should wait the exponential backoff delay between attempts', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const flaky = vi.fn(() => {
+        calls++;
+        return calls < 3
+          ? Promise.reject(new Error(`fail ${calls}`))
+          : Promise.resolve('ok');
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(flaky);
+        // no backoff option: the exponential preset is the default
+        useRetry(injectable, {retries: 3, backoff: 'exponential'});
+        const result = useResult(injectable);
+        return createElement(
+          'div',
+          null,
+          createElement('span', null, result ?? 'nothing'),
+          createElement(
+            'button',
+            {type: 'button', onClick: () => void injectable()},
+            'run'
+          )
+        );
+      }
+
+      render(createElement(TestComponent));
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+        await Promise.resolve();
+      });
+      expect(flaky).toHaveBeenCalledTimes(1);
+
+      // exponential waits: 1000ms (2^0), then 2000ms (2^1), then 4000ms
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2999);
+      });
+      expect(flaky).toHaveBeenCalledTimes(2); // retry 1 fired at t=1000
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2001);
+      });
+      expect(flaky).toHaveBeenCalledTimes(3); // retry 2 fired at t=3000
+      expect(screen.getByText('ok')).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should default to 3 retries when only backoff is given', async () => {
+    let calls = 0;
+    const flaky = vi.fn(() => {
+      calls++;
+      return calls < 4
+        ? Promise.reject(new Error(`fail ${calls}`))
+        : Promise.resolve('ok');
+    });
+
+    function TestComponent() {
+      const injectable = useInjectable(flaky);
+      // no retries key: the preset default of 3 applies
+      useRetry(injectable, {backoff: () => 0});
+      const result = useResult(injectable);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, result ?? 'nothing'),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void injectable()},
+          'run'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      fireEvent.click(screen.getByText('run'));
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    // 1 initial attempt + 3 default retries
+    expect(flaky).toHaveBeenCalledTimes(4);
+    expect(screen.getByText('ok')).toBeDefined();
   });
 });
 
@@ -1384,5 +1732,18 @@ describe('useMutation', () => {
       await expect(captured).rejects.toThrow('nope');
     });
     expect(screen.getByText('nope')).toBeTruthy();
+  });
+
+  it('should fail fast during render when an invalidates target is not a provider', () => {
+    // Dev-only guard: the bad target throws during render, pointing at the
+    // component, instead of turning a succeeded mutation into a rejection.
+    expect(() =>
+      render(
+        createElement(MutationView, {
+          save: () => Promise.resolve('saved'),
+          options: {invalidates: [{} as any]}
+        })
+      )
+    ).toThrow(/useMutation: invalidates/);
   });
 });

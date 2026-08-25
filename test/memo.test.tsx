@@ -193,6 +193,35 @@ describe('memo', () => {
       expect(screen.getByText('test')).toBeDefined();
       expect(screen.getByTestId('data-value')).toBeDefined();
     });
+
+    it('should reuse an already-fixed handler arriving from another memo', () => {
+      const handler = vi.fn();
+      const childProps: (() => void)[] = [];
+      const ChildInner = ({onChange}: {onChange: () => void}) => {
+        childProps.push(onChange);
+        return <button onClick={onChange}>child</button>;
+      };
+      const ChildMemo = memoBase(ChildInner, {
+        testEvent: (k) => k === 'onChange'
+      });
+      const ParentInner = ({onChange}: {onChange: () => void}) => (
+        <ChildMemo onChange={onChange} />
+      );
+      const ParentMemo = memoBase(ParentInner, {
+        testEvent: (k) => k === 'onChange'
+      });
+
+      const {rerender} = render(<ParentMemo onChange={handler} />);
+      // rerender with the same handler: memo bails out, the child renders
+      // nothing new — but the click path below still dispatches once
+      rerender(<ParentMemo onChange={handler} />);
+
+      // The parent already fixed the handler, and the child re-fixes the
+      // FIXED handler into its own stable wrapper — the chain stays
+      // indirection-only, so a single click still dispatches exactly once.
+      fireEvent.click(screen.getByText('child'));
+      expect(handler).toHaveBeenCalledTimes(1); // exactly one invocation
+    });
   });
 
   describe('default memo export', () => {

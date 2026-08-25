@@ -263,6 +263,20 @@ describe('util', () => {
       );
       expect(stableHash(new Set([1, 2]))).not.toBe(stableHash(new Set([1, 3])));
     });
+
+    it('should hash every symbol to one placeholder', () => {
+      expect(stableHash(Symbol('a'))).toBe('sym');
+      expect(stableHash(Symbol('b'))).toBe(stableHash(Symbol('a')));
+      expect(stableHash({tag: Symbol('a')})).toBe(
+        stableHash({tag: Symbol('b')})
+      );
+    });
+
+    it('should mark invalid dates distinctly from valid ones', () => {
+      const invalid = new Date(Number.NaN);
+      expect(stableHash(invalid)).toBe(stableHash(new Date('not a date')));
+      expect(stableHash(invalid)).not.toBe(stableHash(new Date(1000)));
+    });
   });
 
   describe('isAbortSignal', () => {

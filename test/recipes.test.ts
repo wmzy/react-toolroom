@@ -17,17 +17,18 @@ import {useProjectQuery} from '../recipes/useProjectQuery';
 import {useProjectSWRQuery} from '../recipes/useProjectSWRQuery';
 import {useProjectPollingQuery} from '../recipes/useProjectPollingQuery';
 import {useProjectPaginatedQuery} from '../recipes/useProjectPaginatedQuery';
-import {useProjectMutation} from '../recipes/useProjectMutation';
+import {useProjectMutation, renameProject} from '../recipes/useProjectMutation';
 import {createLocalCacheProvider} from '../recipes/createLocalCacheProvider';
 
-const {fetchListMock, fetchTickerMock} = vi.hoisted(() => ({
+const {fetchListMock, fetchTickerMock, fetchByIdMock} = vi.hoisted(() => ({
   fetchListMock: vi.fn(),
-  fetchTickerMock: vi.fn()
+  fetchTickerMock: vi.fn(),
+  fetchByIdMock: vi.fn()
 }));
 
 vi.mock('@/services/user', () => ({
   fetchList: fetchListMock,
-  fetchById: vi.fn()
+  fetchById: fetchByIdMock
 }));
 
 vi.mock('@/services/metrics', () => ({
@@ -79,6 +80,25 @@ describe('recipes/useProjectQuery', () => {
     expect(screen.queryByText('skeleton')).toBeNull();
     expect(fetchListMock).toHaveBeenCalledTimes(1);
   });
+
+  it('should forward an explicit size (plus the trailing AbortSignal) to fetchList', async () => {
+    fetchListMock.mockImplementation(async () => projects);
+
+    function SizedView() {
+      const {data} = useProjectQuery({size: 2});
+      return createElement(
+        'ul',
+        null,
+        ...(data ?? []).map((p) => createElement('li', {key: p.id}, p.username))
+      );
+    }
+
+    render(createElement(SizedView));
+    expect(await screen.findByText('alpha')).toBeTruthy();
+    expect(fetchListMock).toHaveBeenCalledTimes(1);
+    // signal: true appends an AbortSignal after the size argument
+    expect(fetchListMock).toHaveBeenCalledWith(2, expect.any(AbortSignal));
+  });
 });
 
 describe('recipes/useProjectSWRQuery', () => {
@@ -111,6 +131,34 @@ describe('recipes/useProjectSWRQuery', () => {
     // focus revalidation goes through the same [] cache line
     fireEvent(window, new Event('focus'));
     await waitFor(() => expect(fetchListMock).toHaveBeenCalledTimes(3));
+  });
+
+  it('should serve a fresh entry across remounts at the default staleTime', async () => {
+    fetchListMock.mockImplementation(async () => projects);
+
+    // No options at all: the default 5000ms freshness window applies.
+    function DefaultStaleView() {
+      const {data, initialLoading} = useProjectSWRQuery();
+      if (initialLoading) return createElement('p', null, 'skeleton');
+      return createElement(
+        'ul',
+        null,
+        ...(data ?? []).map((p) => createElement('li', {key: p.id}, p.username))
+      );
+    }
+
+    const {unmount} = render(createElement(DefaultStaleView));
+    expect(await screen.findByText('alpha')).toBeTruthy();
+    const callsAfterFirstMount = fetchListMock.mock.calls.length;
+
+    unmount();
+    render(createElement(DefaultStaleView));
+    expect(await screen.findByText('alpha')).toBeTruthy();
+    // the entry is still inside its freshness window: no revalidation
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(fetchListMock.mock.calls.length).toBe(callsAfterFirstMount);
   });
 });
 
@@ -249,6 +297,40 @@ describe('recipes/useProjectPaginatedQuery', () => {
     expect(screen.queryByText('placeholder')).toBeNull();
     expect(screen.getByText('user 1')).toBeTruthy();
   });
+
+  it('should default to page size 10 when called without one', async () => {
+    const all = Array.from({length: 35}, (_, i) => ({
+      id: i + 1,
+      username: `user ${i + 1}`,
+      description: '',
+      updatedAt: 0
+    }));
+    const first = deferred<typeof all>();
+    fetchListMock.mockImplementationOnce(() => first.promise);
+
+    function TwoArgView() {
+      // the (page, options) overload: no pageSize anywhere
+      const {data} = useProjectPaginatedQuery(1);
+      return createElement(
+        'ul',
+        null,
+        ...(data ?? []).map((p) => createElement('li', {key: p.id}, p.username))
+      );
+    }
+
+    render(createElement(TwoArgView));
+    await act(async () => {
+      first.resolve(all);
+    });
+    expect(screen.getByText('user 1')).toBeTruthy();
+    // page 1 of the DEFAULT size: rows 1-10 only, no row 11
+    expect(screen.getByText('user 10')).toBeTruthy();
+    expect(screen.queryByText('user 11')).toBeNull();
+    expect(fetchListMock).toHaveBeenCalledTimes(1);
+    // fetchProjectPage fetched the full list (no args) and sliced to the
+    // default page size 10 client-side
+    expect(fetchListMock).toHaveBeenCalledWith();
+  });
 });
 
 // The mutation template (recipes/useProjectMutation.ts). Since the
@@ -320,6 +402,34 @@ describe('recipes/useProjectMutation', () => {
     } finally {
       reported.mockRestore();
     }
+  });
+
+  it('should rename through fetchById and resolve the merged user without options', async () => {
+    const user = projects[0]!;
+    fetchByIdMock.mockImplementation(async () => user);
+    let captured!: Promise<typeof user>;
+
+    function Renamer() {
+      // no options object: the default reporter wiring path
+      const [rename] = useProjectMutation(renameProject);
+      return createElement(
+        'button',
+        {
+          type: 'button',
+          onClick: () => {
+            captured = rename(user.id, 'renamed');
+          }
+        },
+        'rename'
+      );
+    }
+
+    render(createElement(Renamer));
+    fireEvent.click(screen.getByText('rename'));
+    const result = await act(async () => captured);
+
+    expect(fetchByIdMock).toHaveBeenCalledWith(user.id);
+    expect(result).toEqual({...user, username: 'renamed'});
   });
 });
 
@@ -401,5 +511,18 @@ describe('recipes/createLocalCacheProvider', () => {
     const b = createLocalCacheProvider<string, any[]>({key: 'rt:test:late'});
     expect(b.get(['x'])).toEqual(['hello', expect.any(Number)]); // last good write
     expect(b.get(['y'])).toBeUndefined(); // the failed write did not persist
+  });
+
+  it('should return the plain memory provider when window is undefined (SSR)', () => {
+    vi.stubGlobal('window', undefined);
+    try {
+      const p = createLocalCacheProvider<string, any[]>({key: 'rt:test:ssr'});
+      p.set(['x'], 'hello');
+      expect(p.get(['x'])).toEqual(['hello', expect.any(Number)]);
+      // storage was never touched — no probe, no mirror write
+      expect(storage.getItem('rt:test:ssr')).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
