@@ -793,6 +793,246 @@ describe('async hooks', () => {
       expect(settled[0]!.value).toBe('v1');
       expect(settled[0]!.pending).toBeUndefined();
     });
+
+    describe('patchWhere', () => {
+      it('patches matching settled entries and returns what was written', () => {
+        const provider = createMemoryCacheProvider<{n: number}, [string]>();
+        provider.set(['a'], {n: 1});
+        provider.set(['b'], {n: 2});
+        provider.set(['c'], {n: 3});
+        const written = provider.patchWhere!(
+          (k) => k[0] !== 'c',
+          (v) => ({n: v.n + 10})
+        );
+        expect(written).toEqual([
+          {args: ['a'], prev: {n: 1}, next: {n: 11}},
+          {args: ['b'], prev: {n: 2}, next: {n: 12}}
+        ]);
+        expect(provider.peek!(['a'])!.value).toEqual({n: 11});
+        expect(provider.peek!(['c'])!.value).toEqual({n: 3});
+      });
+
+      it('skips void-returning updaters and fires one set event for the batch', () => {
+        const provider = createMemoryCacheProvider<number, [string]>();
+        provider.set(['a'], 1);
+        provider.set(['b'], 2);
+        const events: string[] = [];
+        provider.subscribe!((e) => events.push(e.type));
+        provider.patchWhere!(
+          () => true,
+          (v, k) => (k[0] === 'b' ? undefined : v + 1)
+        );
+        expect(provider.peek!(['a'])!.value).toBe(2);
+        expect(provider.peek!(['b'])!.value).toBe(2);
+        expect(events).toEqual(['set']);
+      });
+
+      it('bumps generation so a late in-flight settle cannot clobber the patch', async () => {
+        const provider = createMemoryCacheProvider<string, [string]>();
+        // A settled entry first — patchWhere addresses settled halves only;
+        // a fresh-miss (inflight-only) entry is nothing visible to patch.
+        provider.set(['a'], 'v1');
+        let resolveFetch!: (v: string) => void;
+        const promise = provider.load!(
+          ['a'],
+          () => new Promise<string>((r) => (resolveFetch = r))
+        );
+        provider.patchWhere!(
+          () => true,
+          () => 'patched'
+        );
+        resolveFetch!('late-server-value');
+        await expect(promise).resolves.toBe('late-server-value');
+        // The in-flight response predates the patch write; generation moved on.
+        expect(provider.peek!(['a'])!.value).toBe('patched');
+      });
+    });
+
+    describe('mutation', () => {
+      it('runs update optimistically, applies the response, journals nothing on success', async () => {
+        const provider = createMemoryCacheProvider<
+          {favorited: boolean; count: number},
+          [string]
+        >();
+        provider.set(['slug-1'], {favorited: false, count: 4});
+        const favorite = provider.mutation!((slug: string, on: boolean) => ({
+          mutate: () => Promise.resolve({favorited: on, count: 5}),
+          key: [slug],
+          update: (old) => ({...old, favorited: on}),
+          apply: (old, resp) => ({
+            ...old,
+            favorited: resp.favorited,
+            count: resp.count
+          })
+        }));
+        const p = favorite('slug-1', true);
+        // Optimistic step landed before the call resolved
+        expect(provider.peek!(['slug-1'])!.value).toEqual({
+          favorited: true,
+          count: 4
+        });
+        await expect(p).resolves.toEqual({favorited: true, count: 5});
+        expect(provider.peek!(['slug-1'])!.value).toEqual({
+          favorited: true,
+          count: 5
+        });
+      });
+
+      it('rolls back to prev on failure, keeps the rejection traveling', async () => {
+        const provider = createMemoryCacheProvider<
+          {favorited: boolean},
+          [string]
+        >();
+        provider.set(['slug-1'], {favorited: false});
+        const favorite = provider.mutation!((slug: string, on: boolean) => ({
+          mutate: () => Promise.reject(new Error('offline')),
+          key: [slug],
+          update: (old) => ({...old, favorited: on})
+        }));
+        await expect(favorite('slug-1', true)).rejects.toThrow('offline');
+        expect(provider.peek!(['slug-1'])!.value).toEqual({favorited: false});
+      });
+
+      it('skips entries without a baseline (never fabricates), still runs the call', async () => {
+        const provider = createMemoryCacheProvider<{n: number}, [string]>();
+        const mutate = vi.fn(() => Promise.resolve({n: 1}));
+        const run = provider.mutation!((slug: string) => ({
+          mutate,
+          key: [slug],
+          update: (old) => ({...old, n: 99})
+        }));
+        await run('ghost');
+        expect(mutate).toHaveBeenCalledTimes(1);
+        expect(provider.peek!(['ghost'])).toBeUndefined();
+      });
+
+      it('omitted key patches every settled entry (projection across pages)', async () => {
+        const provider = createMemoryCacheProvider<
+          {articles: {slug: string; favorited: boolean}[]},
+          [{offset: number}]
+        >();
+        provider.set([{offset: 0}], {
+          articles: [{slug: 'a', favorited: false}]
+        });
+        provider.set([{offset: 10}], {
+          articles: [
+            {slug: 'b', favorited: true},
+            {slug: 'a', favorited: false}
+          ]
+        });
+        const patchOne = (
+          page: {articles: {slug: string; favorited: boolean}[]},
+          slug: string
+        ) => ({
+          articles: page.articles.map((x) =>
+            x.slug === slug ? {...x, favorited: !x.favorited} : x
+          )
+        });
+        const favorite = provider.mutation!((slug: string) => ({
+          mutate: () => Promise.resolve({slug, favorited: true}),
+          update: (page, slug) => patchOne(page, slug),
+          // field-selecting from the response, not toggling again — the
+          // optimistic toggle already ran
+          apply: (page, resp, slug) => ({
+            articles: page.articles.map((x) =>
+              x.slug === slug ? {...x, favorited: resp.favorited} : x
+            )
+          })
+        }));
+        await favorite('a');
+        expect(provider.peek!([{offset: 0}])!.value.articles[0]).toEqual({
+          slug: 'a',
+          favorited: true
+        });
+        expect(provider.peek!([{offset: 10}])!.value.articles[0]).toEqual({
+          slug: 'b',
+          favorited: true
+        });
+      });
+
+      it('rejection unwinds every composed layer (nested mutations)', async () => {
+        const article = createMemoryCacheProvider<
+          {favorited: boolean},
+          [string]
+        >();
+        const home = createMemoryCacheProvider<
+          {articles: {slug: string; favorited: boolean}[]},
+          [{offset: number}]
+        >();
+        article.set(['a'], {favorited: false});
+        home.set([{offset: 0}], {articles: [{slug: 'a', favorited: false}]});
+        const favoriteOnArticle = article.mutation!(
+          (slug: string, on: boolean) => ({
+            mutate: () => Promise.reject(new Error('offline')),
+            key: [slug],
+            update: (old) => ({...old, favorited: on})
+          })
+        );
+        const favoriteOnHome = home.mutation!((slug: string, on: boolean) => ({
+          mutate: () => favoriteOnArticle(slug, on),
+          update: (page) => ({
+            articles: page.articles.map((x) =>
+              x.slug === slug ? {...x, favorited: on} : x
+            )
+          })
+        }));
+        await expect(favoriteOnHome('a', true)).rejects.toThrow('offline');
+        expect(article.peek!(['a'])!.value).toEqual({favorited: false});
+        expect(home.peek!([{offset: 0}])!.value.articles[0]).toEqual({
+          slug: 'a',
+          favorited: false
+        });
+      });
+
+      it('apply receives the current value at settle time (concurrent write survives)', async () => {
+        const provider = createMemoryCacheProvider<
+          {favorited: boolean; following: boolean},
+          [string]
+        >();
+        provider.set(['a'], {favorited: false, following: false});
+        let resolveMutate!: (v: {favorited: boolean}) => void;
+        const favorite = provider.mutation!((slug: string, on: boolean) => ({
+          mutate: () =>
+            new Promise<{favorited: boolean}>((r) => (resolveMutate = r)),
+          key: [slug],
+          update: (old) => ({...old, favorited: on}),
+          apply: (old, resp) => ({...old, favorited: resp.favorited})
+        }));
+        const p = favorite('a', true);
+        // While the request is in flight another writer patches `following`
+        provider.set(['a'], {favorited: true, following: true});
+        resolveMutate!({favorited: true});
+        await p;
+        // Field-selecting apply keeps the concurrent write; the journal's
+        // rollback is not involved on success
+        expect(provider.peek!(['a'])!.value).toEqual({
+          favorited: true,
+          following: true
+        });
+      });
+
+      it('rollback does not clobber a concurrent writer (identity guard)', async () => {
+        const provider = createMemoryCacheProvider<
+          {favorited: boolean},
+          [string]
+        >();
+        provider.set(['a'], {favorited: false});
+        let rejectMutate!: (e: Error) => void;
+        const favorite = provider.mutation!((slug: string, on: boolean) => ({
+          mutate: () =>
+            new Promise<{favorited: boolean}>((_, rej) => (rejectMutate = rej)),
+          key: [slug],
+          update: (old) => ({...old, favorited: on})
+        }));
+        const p = favorite('a', true);
+        // A newer writer replaces our optimistic value while we are in flight
+        provider.set(['a'], {favorited: true});
+        rejectMutate!(new Error('offline'));
+        await expect(p).rejects.toThrow('offline');
+        // The newer writer's value survives our rollback
+        expect(provider.peek!(['a'])!.value).toEqual({favorited: true});
+      });
+    });
   });
 
   describe('useResult', () => {

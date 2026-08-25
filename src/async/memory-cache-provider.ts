@@ -1,6 +1,8 @@
 import {CacheEvent, CacheProvider} from '@@/types';
 import {noop, stableHash} from '@@/util';
 
+import createMutationBinder from './mutation';
+
 /**
  * One cache entry in any mixture of its two halves: `settled` data and an
  * `inflight` request. An entry can hold either alone (a fresh miss being
@@ -83,7 +85,7 @@ export default function create<T, K extends any[]>({
       .filter((args): args is K => args !== undefined);
     for (const listener of listeners) listener({type: 'delete', deleted});
   };
-  return {
+  const provider: CacheProvider<T, K> = {
     // In-flight requests are invisible to get: it only ever reports settled
     // data, exactly like the pre-load provider did.
     get(key: K) {
@@ -251,6 +253,30 @@ export default function create<T, K extends any[]>({
       }
       notifyDelete(deleted);
     },
+    // Batch write-side twin of deleteWhere: same addressing (raw args
+    // predicate, hydrated entries skipped), but the entry survives with the
+    // updater's value. In-place entry mutation + generation bump keep the
+    // write identical to set()'s; one batched 'set' event fires when
+    // anything changed, so subscribers read a consistent post-state.
+    patchWhere(
+      predicate: (k: K) => boolean,
+      updater: (value: T, k: K) => T | void
+    ) {
+      const patched: {args: K; prev: T; next: T}[] = [];
+      for (const [h, entry] of map) {
+        const {args, settled} = entry;
+        if (args === undefined || settled === undefined) continue;
+        if (!predicate(args)) continue;
+        const next = updater(settled.value, args);
+        if (next === undefined) continue;
+        const prev = settled.value;
+        entry.settled = {value: next, cachedAt: Date.now()};
+        gens.set(h, (gens.get(h) ?? 0) + 1);
+        patched.push({args, prev, next});
+      }
+      if (patched.length) notifySet();
+      return patched;
+    },
     // Read-only observation surface for devtools: registers a listener that
     // fires after every mutation (set/delete/clear/deleteWhere/deletePrefix/
     // load register & settle/expiry) with what changed.
@@ -278,4 +304,9 @@ export default function create<T, K extends any[]>({
       });
     }
   };
+  // cache.mutation lives as a lazy method so the object above stays a plain
+  // data surface; the binder only needs peek/set/patchWhere, all closed
+  // over already. Assigned after the literal — self-reference at call time.
+  provider.mutation = createMutationBinder(provider).mutation;
+  return provider;
 }

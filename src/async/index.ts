@@ -1221,4 +1221,6 @@ export {
 } from './polling';
 
 export {useInjectable, createMemoryCacheProvider};
+export {default as createMutationBinder} from './mutation';
+export type {MutationSpec, BoundMutation, CreateMutationBinder} from '@@/types';
 export {stableHash, isAbortSignal} from '@@/util';
