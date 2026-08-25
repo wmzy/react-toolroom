@@ -1284,6 +1284,414 @@ describe('useInfinite', () => {
     expect(screen.getByText('b:p0,p1')).toBeDefined();
     expect(fetchPage).toHaveBeenCalledTimes(2);
   });
+
+  // A pageParam worth of pages: page n is only fetched through the
+  // boundary derived from its neighbors, so the walk below exercises
+  // every direction of the bidirectional window.
+  const prevCursor = (first: string) => {
+    const n = Number(first.slice(1));
+    return n > 0 ? n - 1 : undefined;
+  };
+
+  it('should record pageParams parallel to pages', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, pageParams, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor
+      });
+      useRun(fetchPages, [7]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `params:${pageParams.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    // the reset path seeds params too — the initial useRun call's arg
+    expect(screen.getByText('pages:p7')).toBeDefined();
+    expect(screen.getByText('params:7')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    // index i of pageParams names the param that fetched pages[i]
+    expect(screen.getByText('pages:p7,p8')).toBeDefined();
+    expect(screen.getByText('params:7,8')).toBeDefined();
+  });
+
+  it('should prepend pages through fetchPreviousPage and flag the boundary', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {
+        pages,
+        pageParams,
+        fetchPreviousPage,
+        isFetchingPreviousPage,
+        hasPreviousPage
+      } = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor,
+        getPreviousPageParam: prevCursor
+      });
+      useRun(fetchPages, [2]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `params:${pageParams.join(',')}`),
+        createElement('span', null, `hasPrev:${String(hasPreviousPage)}`),
+        createElement(
+          'span',
+          null,
+          `fetchingPrev:${String(isFetchingPreviousPage)}`
+        ),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPreviousPage()},
+          'earlier'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p2')).toBeDefined();
+    expect(screen.getByText('hasPrev:true')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1]).toEqual([1]);
+    expect(screen.getByText('fetchingPrev:true')).toBeDefined();
+    expect(screen.getByText('pages:p2')).toBeDefined();
+
+    await act(async () => {
+      resolvers[1]!();
+    });
+    // the new page lands at the head, its param at the head of pageParams
+    expect(screen.getByText('pages:p1,p2')).toBeDefined();
+    expect(screen.getByText('params:1,2')).toBeDefined();
+    expect(screen.getByText('fetchingPrev:false')).toBeDefined();
+
+    // walk to the front: getPreviousPageParam(0) is undefined — no
+    // request, no fetching flip, hasPreviousPage false
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p0,p1,p2')).toBeDefined();
+    expect(screen.getByText('hasPrev:false')).toBeDefined();
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('fetchingPrev:false')).toBeDefined();
+    expect(screen.getByText('pages:p0,p1,p2')).toBeDefined();
+  });
+
+  it('should keep fetchPreviousPage a no-op without getPreviousPageParam', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+    const outcomes: unknown[] = [];
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {
+        pages,
+        fetchPreviousPage,
+        isFetchingPreviousPage,
+        hasPreviousPage
+      } = useInfinite(fetchPages, {getNextPageParam: nextCursor});
+      useRun(fetchPages, [1]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `hasPrev:${String(hasPreviousPage)}`),
+        createElement(
+          'span',
+          null,
+          `fetchingPrev:${String(isFetchingPreviousPage)}`
+        ),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () =>
+              void fetchPreviousPage().then((r) => outcomes.push(r))
+          },
+          'earlier'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p1')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    expect(outcomes[0]).toBeUndefined();
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('hasPrev:false')).toBeDefined();
+    expect(screen.getByText('fetchingPrev:false')).toBeDefined();
+    expect(screen.getByText('pages:p1')).toBeDefined();
+  });
+
+  it('should trim the opposite end when maxPages is exceeded', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, pageParams, fetchNextPage, hasNextPage} = useInfinite(
+        fetchPages,
+        {
+          getNextPageParam: (last) => Number(last.slice(1)) + 1,
+          getPreviousPageParam: prevCursor,
+          maxPages: 2
+        }
+      );
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `params:${pageParams.join(',')}`),
+        createElement('span', null, `hasNext:${String(hasNextPage)}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p0')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    expect(screen.getByText('params:0,1')).toBeDefined();
+
+    // the window is full: a forward fetch sheds the OLDEST page
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p1,p2')).toBeDefined();
+    expect(screen.getByText('params:1,2')).toBeDefined();
+  });
+
+  it('should trim the newest pages when prepending past maxPages', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, pageParams, fetchPreviousPage, hasPreviousPage} =
+        useInfinite(fetchPages, {
+          getNextPageParam: nextCursor,
+          getPreviousPageParam: prevCursor,
+          maxPages: 2
+        });
+      useRun(fetchPages, [2]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `params:${pageParams.join(',')}`),
+        createElement('span', null, `hasPrev:${String(hasPreviousPage)}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPreviousPage()},
+          'earlier'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p1,p2')).toBeDefined();
+    expect(screen.getByText('params:1,2')).toBeDefined();
+
+    // the window is full: a backward fetch sheds the NEWEST pages
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    expect(screen.getByText('params:0,1')).toBeDefined();
+    // the trimmed-away newest page is derivable again: the window moved
+    expect(screen.getByText('hasPrev:false')).toBeDefined();
+  });
+
+  it('should stay unbounded without maxPages', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = (cursor: number) =>
+      new Promise<string>((resolve) =>
+        resolvers.push(() => resolve(`p${cursor}`))
+      );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: (last) => Number(last.slice(1)) + 1
+      });
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        fireEvent.click(screen.getByText('more'));
+      });
+      await act(async () => {
+        resolvers[i + 1]!();
+      });
+    }
+    expect(screen.getByText('pages:p0,p1,p2,p3,p4')).toBeDefined();
+  });
+
+  it('should reset pages and pageParams on a direct re-run', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = (cursor: number) =>
+      new Promise<string>((resolve) =>
+        resolvers.push(() => resolve(`p${cursor}`))
+      );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, pageParams, fetchPreviousPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor,
+        getPreviousPageParam: prevCursor
+      });
+      useRun(fetchPages, [1]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement('span', null, `params:${pageParams.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPreviousPage()},
+          'earlier'
+        ),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPages(5)},
+          'restart'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    expect(screen.getByText('params:0,1')).toBeDefined();
+
+    // a direct call resets BOTH arrays to the single fresh result
+    await act(async () => {
+      fireEvent.click(screen.getByText('restart'));
+    });
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p5')).toBeDefined();
+    expect(screen.getByText('params:5')).toBeDefined();
+  });
 });
 
 describe('useRetry preset options', () => {

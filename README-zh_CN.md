@@ -542,7 +542,11 @@ function ProjectFeed() {
 }
 ```
 
-该 hook 把已取到的页聚合为数组并发布到 injectable 的 result store；请从它的返回值读取 pages，而不是 `useResult`（store 里存的是整个数组，不是单页）。返回形状是 TanStack `useInfiniteQuery` 的子集——`{pages, fetchNextPage, isFetchingNextPage, hasNextPage}` 语义一致——去掉了所有预设 query-client 的部分。只有经 `fetchNextPage()` 发起的调用会追加；其它任何调用（`useRun` 重跑、手动调用、焦点重验证）都会把 `pages` 重置为该次结果，因此 refetch 天然从头开始。`getNextPageParam(lastPage, allPages)` 返回 `undefined` 即到末尾（`hasNextPage` 变为 `false`）。
+该 hook 把已取到的页聚合为数组并发布到 injectable 的 result store；请从它的返回值读取 pages，而不是 `useResult`（store 里存的是整个数组，不是单页）。返回形状是 TanStack `useInfiniteQuery` 的子集——`{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}` 语义一致——去掉了所有预设 query-client 的部分。`pageParams` 与 `pages` 平行（下标 `i` 即取回 `pages[i]` 所用的参数）。
+
+双向分页：可选传入 `getPreviousPageParam(firstPage, allPages, firstPageParam, allPageParams)`，`fetchPreviousPage()` 会把新页前插到 `pages` 头部；不传则 `hasPreviousPage` 恒为 `false`，`fetchPreviousPage()` 是空操作。可选 `maxPages`（默认 `Infinity` 不设限）给窗口设上限：前向抓取超限时裁掉最旧的页，后向抓取裁掉最新的页，`pages` 与 `pageParams` 同步裁剪——由于边界标志是每次渲染从当前页推导的，被裁掉的一端只要还能推导出参数就重新变为可抓取。
+
+只有经 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；其它任何调用（`useRun` 重跑、手动调用、焦点重验证）都会把 `pages`/`pageParams` 重置为该次结果，因此 refetch 天然从头开始。`getNextPageParam(lastPage, allPages, lastPageParam, allPageParams)` 返回 `undefined` 即到末尾（`hasNextPage` 变为 `false`）。
 
 ### 观察每一次调用 — `subscribeInjectEvents`
 
@@ -599,7 +603,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
-| `useInfinite(fn, {getNextPageParam})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, fetchNextPage, isFetchingNextPage, hasNextPage}`——TanStack `useInfiniteQuery` 的子集。只有 `fetchNextPage()` 发起的调用会追加；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
+| `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
 | `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）、`deletePrefix`（按哈希键前缀批量失效）与 `deleteWhere`（按参数谓词批量失效——前缀型 `invalidates` 目标使用的原语）；还实现了可观察接口 `subscribe`/`snapshot`——写入后发 `set` 事件，删除后发携带被删条目原始参数元组的 `delete` 事件，同时驱动 DevTools 面板与 `useCache` 的被动重验证，`snapshot()` 返回 `{key, value, cachedAt}[]` 条目列表；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
 | `useDedup(fn, {hash = stableHash}?)` | 同键并发调用共享同一个 in-flight promise；落定即删条目，失败可重试。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache`/`useDedup` 键——`useRun` 带键时请传相同元组。 |
