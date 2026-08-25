@@ -1,6 +1,6 @@
 {
   "name": "react-toolroom",
-  "version": "0.4.0",
+  "version": "0.0.0-development",
   "description": "Zero-dependency React toolset: runtime memoization without useCallback, and composable data-fetching hooks without a Provider.",
   "exports": {
     ".": {

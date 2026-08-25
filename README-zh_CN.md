@@ -4,6 +4,9 @@
 
 [English](./README.md) | [中文](./README-zh_CN.md)
 
+[![npm](https://img.shields.io/npm/v/react-toolroom)](https://www.npmjs.com/package/react-toolroom)
+[![CI](https://github.com/wmzy/react-toolroom/actions/workflows/ci.yml/badge.svg)](https://github.com/wmzy/react-toolroom/actions/workflows/ci.yml)
+
 ## 特性
 
 - **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 4.72 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。

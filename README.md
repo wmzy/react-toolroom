@@ -4,6 +4,9 @@
 
 [English](./README.md) | [中文](./README-zh_CN.md)
 
+[![npm](https://img.shields.io/npm/v/react-toolroom)](https://www.npmjs.com/package/react-toolroom)
+[![CI](https://github.com/wmzy/react-toolroom/actions/workflows/ci.yml/badge.svg)](https://github.com/wmzy/react-toolroom/actions/workflows/ci.yml)
+
 ## Highlights
 
 - **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 4.72 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
