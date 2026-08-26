@@ -752,6 +752,20 @@ export type MutationOptions<
     ...args: Parameters<M>
   ) => void;
   /**
+   * Serialize calls that resolve to the same scope key — TanStack Query's
+   * `mutationKey` + `scope` semantics. A string queues as-is; a function
+   * is evaluated with the mutate arguments at call time, so the queue
+   * position (FIFO) follows call order. Calls sharing a key execute one
+   * after another — a queued call waits until every earlier same-scope
+   * call settles — while different keys run in parallel; scope-less calls
+   * are untouched. The chain is module-level: queued calls still run after
+   * the calling component unmounts, and a failure never breaks the chain
+   * (later calls keep executing). `isMutating` counts a queued call from
+   * the moment it is made. A scope function that throws — or resolves to
+   * a falsy key — falls back to scope-less parallel behavior.
+   */
+  scope?: string | ((...args: Parameters<M>) => string);
+  /**
    * Cache targets to purge when the call succeeds — declarative
    * invalidation for the common "write, then refresh what the write
    * touched" flow. Each entry is a cache provider (all of its entries) or
@@ -771,6 +785,34 @@ export type MutationStatus = {
   error: Error | undefined;
   /** Consecutive failures so far; a success resets it to `0`. */
   failureCount: number;
+};
+
+// Module-level FIFO chains, one per scope key: the tail promise of every
+// call queued under the key. Module scope is deliberate — like TanStack
+// Query's mutation scopes, the chain does not live on any component, so
+// unmounting never abandons queued calls (they run to completion).
+const scopeQueues = new Map<string, Promise<unknown>>();
+
+// Appends `start` to the chain under `key` and returns its promise. The
+// previous tail is awaited with its failure swallowed (`noop`): a queued
+// call starts after the previous same-scope call SETTLES — success or
+// failure — so one rejection never breaks the chain. `tail` mirrors `run`
+// with the rejection stripped (the caller keeps owning it), and deletes
+// the entry once it is still the tail — a newer queued call has already
+// replaced the entry and owns the cleanup — so keys never accumulate.
+const enqueueByScope = <T>(
+  key: string,
+  start: () => Promise<T>
+): Promise<T> => {
+  const run = (scopeQueues.get(key) ?? Promise.resolve())
+    .catch(noop)
+    .then(start);
+  const tail = run.then(noop, noop);
+  scopeQueues.set(key, tail);
+  tail.then(() => {
+    if (scopeQueues.get(key) === tail) scopeQueues.delete(key);
+  });
+  return run;
 };
 
 /**
@@ -805,13 +847,17 @@ export type MutationStatus = {
  * Division of labor: `useMutation` owns the lifecycle and status;
  * `useOptimistic` adds optimistic snapshots for locally predictable edits;
  * `invalidates` (or `useInvalidate` / `deletePrefix`) refreshes cached
- * reads — compose them on the same injectables.
+ * reads — compose them on the same injectables. `scope` serializes
+ * same-key calls (see {@link MutationOptions.scope}); it wraps the
+ * lifecycle, so `onMutate` and a bound mutation's optimistic step run
+ * when a queued call's turn comes, and each call's `invalidates` still
+ * fires — in order — at its own success.
  *
  * @param {AsyncFunc} mutation - the write function to wrap; inline arrows
  *   are fine — `useInjectable` adopts the latest closure every render.
  * @param {MutationOptions} [options] - `onMutate` / `onSuccess` /
- *   `onError` / `onSettled` callbacks and `invalidates` cache targets; all
- *   optional.
+ *   `onError` / `onSettled` callbacks, `invalidates` cache targets and an
+ *   optional `scope` serializing same-key calls; all optional.
  * @return {[M, MutationStatus, function]} `[mutate, status, reset]` —
  *   call `mutate` from event handlers; render `isMutating` on the submit
  *   button and `error` / `failureCount` for feedback UI; `reset` clears
@@ -895,6 +941,33 @@ export function useMutation<
             throw e;
           }
         );
+      }) as M
+  );
+
+  // 2.5 The scope queue — registered between the loading store and the
+  //     lifecycle wrapper, so the onion runs (outer→inner) loading →
+  //     queue → lifecycle → fn. Two properties follow: the loading count
+  //     rises the moment the call is MADE (a queued call is mutating
+  //     while it waits), while everything below the queue — `onMutate`,
+  //     a bound mutation's optimistic `update` step, the call itself —
+  //     runs only when the call's turn comes, so same-scope writes never
+  //     interleave. `scope` is read through the ref funnel, like the
+  //     callbacks above.
+  useInject(
+    mutate,
+    (f: M) =>
+      ((...args: Parameters<M>) => {
+        const {scope} = optionsRef.current ?? {};
+        if (scope === undefined) return f(...args);
+        let key: string | undefined;
+        try {
+          key = typeof scope === 'function' ? scope(...args) : scope;
+        } catch {
+          // A throwing scope resolver must not take the caller down with
+          // it: run the call scope-less (parallel), exactly as before.
+          return f(...args);
+        }
+        return key ? enqueueByScope(key, () => f(...args)) : f(...args);
       }) as M
   );
 

@@ -9,7 +9,7 @@
 
 ## Highlights
 
-- **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 4.72 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
+- **Zero dependencies, tiny footprint** — the full entries are 1.4 kB (`react-toolroom`) and 5.64 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
 - **No Provider, no Context** — every hook works standalone; state lives on the functions you pass in, so there is nothing to mount at the app root.
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
@@ -26,7 +26,7 @@ Two entries: `react-toolroom` (core: `memo`, `stableHash`) and `react-toolroom/a
 
 ## When to choose this library
 
-React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus and reconnect revalidation, cancellation, mutation-linked invalidation — in ~4.3 kB with no Provider (less when you cherry-pick). This is an honest comparison:
+React Toolroom does not try to be a full server-state manager. It gives you the highest-frequency 20% — caching, deduplication, polling, focus and reconnect revalidation, cancellation, mutation-linked invalidation — in ~5.6 kB with no Provider (less when you cherry-pick). This is an honest comparison:
 
 | Capability | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
-| Bundle size¹ | **1.4 kB** + **4.72 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| Bundle size¹ | **1.4 kB** + **5.64 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ Minified + compressed, full entry without tree-shaking — an upper bound; cherry-picked imports are smaller. react-toolroom numbers are exact, measured from the CI build; competitor numbers are approximate and vary by version — check their docs.
 
@@ -458,6 +458,36 @@ How this maps to TanStack Query's `invalidateQueries`:
 
 `useOptimistic` composes on top: optimistic snapshots for edits you can predict locally, `invalidates` for the data you cannot.
 
+### Serialize rapid-fire mutations — `scope`
+
+A favorite button fired twice in a row is two racing writes: the second request can settle before the first, and the article ends up showing whatever landed last — not what the user clicked. `scope` serializes those calls — the semantics of TanStack Query's `mutationKey` + `scope`:
+
+```tsx
+function FavoriteButton({slug}: Props) {
+  const [toggle, {isMutating}] = useMutation(toggleFavorite, {
+    // The mutate arguments ARE the key: one chain per article.
+    scope: (id: string) => `favorite:${id}`
+  });
+  return (
+    <button disabled={isMutating} onClick={() => toggle(slug).catch(() => {})}>
+      ♥
+    </button>
+  );
+}
+```
+
+Semantics:
+
+1. **Same key ⇒ one FIFO chain.** A queued call waits until every earlier same-scope call *settles* — success or failure — and nothing is dropped. Different keys run in parallel, and scope-less calls keep exactly today's behavior.
+2. **`isMutating` counts from the click.** The queue sits inside the loading store, so a queued call is mutating while it *waits*, not only while it runs.
+3. **The chain is module-level.** Unmounting the caller never abandons queued calls — they run to completion, matching TanStack's mutation scopes.
+4. **Failures don't break the chain.** A rejected call hands the queue to the next one, while its own rejection still travels to its caller (`.catch` it, or let `onError` report it).
+5. **A scope function that throws — or resolves falsy — falls back to scope-less** parallel execution: a broken keyer must not take the caller down.
+
+The signature is `scope?: string | ((...args) => string)` — a literal key, a zero-arg keyer, or a function receiving the mutate arguments. It resolves at call time, so FIFO follows call order.
+
+How it composes with the rest of the pipeline: the queue wraps the mutation *lifecycle*, so a queued call's `onMutate` — and a bound mutation's optimistic `update` step — run when the call's turn comes, not at click time; `onSuccess` / `invalidates` fire per call, in call order, at each call's own success. Reads are untouched: `invalidates` still just purges providers, and the refetches it triggers observe whatever the serial writes have landed by then.
+
 ### `useLoading` vs `useInitialLoading`
 
 ```tsx
@@ -628,7 +658,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
 | `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). Preset shorthand: `useRetry(fn, {retries = 3, backoff = 'exponential'})` — `'exponential'` waits 1s/2s/4s…, `'linear'` 1s/2s/3s…, or pass `(attempt) => ms` for custom delays; both signatures share one mechanism. |
 | `useRun(fn, args, options?)` | Run `fn(...args)` on mount and whenever `args` change. `{signal: true}` appends an `AbortSignal` as the last argument and aborts it on change/unmount. `{hash}` (e.g. `stableHash`) replaces the reference comparison with a structural key, so unstable references in `args` only re-run on real changes — the same key semantics as `useDedup`/`useCache`. Plain (non-injectable) functions are detected via `isInjectable` and run as-is. |
-| `useMutation(mutation, options?)` | The write-side counterpart of `useRun`: returns `[mutate, status, reset]` — a stable `mutate` (the injectable itself, rejections keep flowing), injectable-level shared status (`isMutating` / `error` / `failureCount`, same stores as `useLoading`/`useError`), and a `reset` that clears settled failure bookkeeping without invalidating in-flight tickets. Hook-level `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks fire with the latest closures (ref funnel — inline options objects are fine); per-call callbacks are simply `.then`/`.catch` on the returned promise. `invalidates: [cache, [cache, ...argsPrefix], …]` purges the target providers on success (see `invalidate`) — mounted consumers refresh through the deletion event. Compose `useOptimistic` / `useInvalidate` on the same injectable for optimistic snapshots and manual refresh. |
+| `useMutation(mutation, options?)` | The write-side counterpart of `useRun`: returns `[mutate, status, reset]` — a stable `mutate` (the injectable itself, rejections keep flowing), injectable-level shared status (`isMutating` / `error` / `failureCount`, same stores as `useLoading`/`useError`), and a `reset` that clears settled failure bookkeeping without invalidating in-flight tickets. Hook-level `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks fire with the latest closures (ref funnel — inline options objects are fine); per-call callbacks are simply `.then`/`.catch` on the returned promise. `invalidates: [cache, [cache, ...argsPrefix], …]` purges the target providers on success (see `invalidate`) — mounted consumers refresh through the deletion event. `scope: key | ((…args) => key)` serializes same-key calls into a FIFO chain (TanStack `mutationKey` + `scope`): a queued call runs after every earlier same-scope call settles — failures don't break the chain, the module-level chain survives unmount, and `isMutating` counts a queued call from the moment it is made; different keys run parallel, no `scope` changes nothing. Compose `useOptimistic` / `useInvalidate` on the same injectable for optimistic snapshots and manual refresh. |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR caching: cache hits broadcast immediately; stale entries revalidate in the background. Returns whether the current data is stale — a broadcast flag shared by every `useCache` consumer of the injectable, updating together (last verdict wins). Also subscribes to the provider's deletion events, so anything that purges the cache (`invalidate` / `invalidates`, `deletePrefix`, a DevTools panel button, expiry) makes mounted consumers refetch and re-broadcast. |
 | `useInvalidate(fn, cacheProvider)` | Returns a stable `(...args) => Promise<R>` that deletes the cache entry under `args` and immediately re-runs the injectable with them — hard invalidation for mutation success paths. Keys link to `useCache` via the same provider and args tuple. |
 | `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is a cache provider (all of its entries are purged) or a `[provider, ...argsPrefix]` tuple (only entries whose raw args tuple structurally extends the prefix, removed via the provider's `deleteWhere` — any `hash` convention works). A pure cache operation: no injectable needed, no request issued; mounted `useCache` consumers of the provider refresh themselves through its deletion event (refetch via the wrapper chain, rewrite, broadcast). |
@@ -664,7 +694,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 4.72 kB.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 5.64 kB.
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.

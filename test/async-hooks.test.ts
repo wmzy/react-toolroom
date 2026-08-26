@@ -2155,3 +2155,319 @@ describe('useMutation', () => {
     ).toThrow(/useMutation: invalidates/);
   });
 });
+
+describe('useMutation scope (serial queue)', () => {
+  // Minimal deferred for driving in-flight calls deterministically — same
+  // shape as the helper above, kept local so this block stands alone.
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: any) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return {promise, resolve, reject};
+  }
+
+  type AnyMutation = (...args: any[]) => Promise<string>;
+
+  // Records the runs each call starts, so FIFO/parallel order is directly
+  // observable regardless of when the promises settle.
+  function recordingSave(
+    started: string[],
+    calls: ReturnType<typeof deferred<string>>[]
+  ) {
+    return (name: string) => {
+      started.push(name);
+      const d = deferred<string>();
+      calls.push(d);
+      return d.promise;
+    };
+  }
+
+  function ScopeView({
+    save,
+    options,
+    fire
+  }: {
+    save: AnyMutation;
+    options?: MutationOptions<AnyMutation>;
+    fire?: {current?: (...args: any[]) => void};
+  }) {
+    const [mutate, {isMutating}] = useMutation(save, options);
+    if (fire) {
+      // Imperative trigger: the test fires calls with the args it chooses.
+      fire.current = (...args: any[]) => {
+        mutate(...args).catch(() => {});
+      };
+    }
+    return createElement('p', null, isMutating ? 'mutating' : 'idle');
+  }
+
+  it('should run same-scope calls FIFO — the second starts only after the first settles', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: 'job'},
+        fire
+      })
+    );
+    expect(screen.getByText('idle')).toBeTruthy();
+
+    await act(async () => {
+      fire.current!('first');
+      fire.current!('second');
+    });
+    expect(started).toEqual(['first']); // the second call is still waiting
+    // The queued call counts as mutating from the moment it was made.
+    expect(screen.getByText('mutating')).toBeTruthy();
+
+    await act(async () => {
+      calls[0]!.resolve('one');
+    });
+    expect(started).toEqual(['first', 'second']); // FIFO after settle
+    expect(screen.getByText('mutating')).toBeTruthy(); // second in flight
+
+    await act(async () => {
+      calls[1]!.resolve('two');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should keep the chain going after a failure', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: 'chain'},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    await act(async () => {
+      calls[0]!.reject(new Error('boom')); // the first call fails…
+    });
+    expect(started).toEqual(['a', 'b']); // …the queued second still ran
+
+    await act(async () => {
+      calls[1]!.resolve('ok');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should run different scopes in parallel', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        // Args-taking scope: the mutate argument IS the key.
+        options: {scope: (name: string) => name},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('x');
+      fire.current!('y');
+    });
+    // Both are in flight together — different keys never queue.
+    expect(started).toEqual(['x', 'y']);
+
+    await act(async () => {
+      calls[0]!.resolve('x');
+      calls[1]!.resolve('y');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should pass the mutate arguments to the scope function', async () => {
+    const scopeFn = vi.fn((slug: string) => `fav:${slug}`);
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: scopeFn},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('a');
+      fire.current!('b');
+    });
+    // Resolved in call order — the queue position follows call order.
+    expect(scopeFn.mock.calls).toEqual([['a'], ['a'], ['b']]);
+    // Same scope ('a') serialized; the different-scope call ('b') ran.
+    expect(started).toEqual(['a', 'b']);
+
+    await act(async () => {
+      calls[0]!.resolve('a'); // unblocks the queued second 'a'
+    });
+    await act(async () => {
+      calls[1]!.resolve('b');
+      calls[2]!.resolve('a2');
+    });
+    expect(started).toEqual(['a', 'b', 'a']);
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should accept a zero-argument scope function', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: () => 'zero'},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    expect(started).toEqual(['a']); // still one chain, one key
+
+    await act(async () => {
+      calls[0]!.resolve('a');
+    });
+    await act(async () => {
+      calls[1]!.resolve('b');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should still execute queued calls after the component unmounts', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    const {unmount} = render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: 'outlive'},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    unmount();
+
+    // The chain is module-level: settling the first call with the
+    // component gone still starts the queued second one.
+    await act(async () => {
+      calls[0]!.resolve('one');
+    });
+    expect(started).toEqual(['a', 'b']);
+    await act(async () => {
+      calls[1]!.resolve('two');
+    });
+    expect(started).toEqual(['a', 'b']);
+  });
+
+  it('should fall back to parallel execution when the scope function throws', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {
+          scope: () => {
+            throw new Error('bad scope');
+          }
+        },
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    // No queue, no crash: both calls run scope-less (parallel).
+    expect(started).toEqual(['a', 'b']);
+
+    await act(async () => {
+      calls[0]!.resolve('a');
+      calls[1]!.resolve('b');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should fall back to parallel execution when the scope resolves falsy', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: () => ''},
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    expect(started).toEqual(['a', 'b']);
+
+    await act(async () => {
+      calls[0]!.resolve('a');
+      calls[1]!.resolve('b');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should stay parallel without a scope', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        fire
+      })
+    );
+
+    await act(async () => {
+      fire.current!('a');
+      fire.current!('b');
+    });
+    // Unscoped: zero behavior change — both start immediately.
+    expect(started).toEqual(['a', 'b']);
+
+    await act(async () => {
+      calls[0]!.resolve('a');
+      calls[1]!.resolve('b');
+    });
+    expect(screen.getByText('idle')).toBeTruthy();
+  });
+});

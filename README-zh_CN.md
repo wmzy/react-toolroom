@@ -9,7 +9,7 @@
 
 ## 特性
 
-- **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 4.72 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
+- **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 5.64 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
 - **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `useDedup` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
@@ -26,7 +26,7 @@ npm i react-toolroom
 
 ## 什么时候选这个库
 
-React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、断网重连重验证、取消、与 mutation 联动的失效——用约 4.3 kB、无 Provider 的代价交付给你（按需引入更低）。下面是一份诚实的对比：
+React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、断网重连重验证、取消、与 mutation 联动的失效——用约 5.6 kB、无 Provider 的代价交付给你（按需引入更低）。下面是一份诚实的对比：
 
 | 能力 | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **1.4 kB** + **4.72 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **1.4 kB** + **5.64 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、全量入口（未 tree-shaking）的体积，是按需引入的上界。react-toolroom 的数字是 CI 构建产物的实测值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -428,6 +428,36 @@ invalidate([feedCache]);
 
 `useOptimistic` 可叠加组合：本地可预测的编辑用乐观快照，无法本地推算的数据用 `invalidates`。
 
+### 串行化连点 mutation — `scope`
+
+收藏按钮被连点两次就是两笔竞态写：第二个请求可能先于第一个落库，文章最终显示的是"最后到达的"，而不是"用户最后点的"。`scope` 把这些调用串行化——语义对标 TanStack Query 的 `mutationKey` + `scope`：
+
+```tsx
+function FavoriteButton({slug}: Props) {
+  const [toggle, {isMutating}] = useMutation(toggleFavorite, {
+    // mutate 的参数就是 key：每篇文章一条链。
+    scope: (id: string) => `favorite:${id}`
+  });
+  return (
+    <button disabled={isMutating} onClick={() => toggle(slug).catch(() => {})}>
+      ♥
+    </button>
+  );
+}
+```
+
+语义：
+
+1. **同 key ⇒ 一条 FIFO 链。** 排队中的调用等到所有更早的同 scope 调用 *settle*（成功或失败）才执行，不丢弃任何调用。不同 key 并行；不传 `scope` 的调用保持原行为不变。
+2. **`isMutating` 从点击那一刻就计数。** 队列位于 loading store 内层，排队中的调用在*等待期间*就是 mutating，而非只有真正执行时才算。
+3. **链是模块级的。** 调用方卸载不会丢弃排队中的调用——它们会执行到底，与 TanStack 的 mutation scope 行为一致。
+4. **失败不断链。** 被拒绝的调用把队列交给下一个，它自己的 rejection 照常传给调用方（`.catch` 掉，或交给 `onError` 上报）。
+5. **scope 函数抛错——或解析出假值——回退为无 scope 的并行执行**：坏掉的 keyer 不能把调用方炸掉。
+
+签名为 `scope?: string | ((...args) => string)`——字面量 key、零参 keyer、或接收 mutate 参数的函数。它在调用时求值，因此 FIFO 跟随调用顺序。
+
+与管道其余部分的关系：队列包裹的是 mutation 的*生命周期*，排队调用的 `onMutate`——以及 bound mutation 的乐观 `update` 步骤——在轮到它执行时才运行，而不是点击时；`onSuccess` / `invalidates` 按调用顺序、在各自成功时逐次触发。读取侧不受影响：`invalidates` 仍然只是清除 provider，其触发的重取观察到的是串行写入到那一刻为止落下的结果。
+
 ### `useLoading` 与 `useInitialLoading` 的区别
 
 ```tsx
@@ -598,7 +628,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useFinally(fn, handler)` | 调用落定时执行 `handler`，无论成败。 |
 | `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。 |
 | `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useDedup`/`useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
-| `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
+| `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。`scope: key | ((…args) => key)` 把同 key 调用串成 FIFO 链（TanStack `mutationKey` + `scope`）：排队中的调用等所有更早的同 scope 调用 settle 后才执行——失败不断链、模块级链在卸载后依然执行、排队中的调用从发起就计入 `isMutating`；不同 key 并行，不传 `scope` 行为不变。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——该标志是同一 injectable 所有 `useCache` 消费者共享的广播状态，一起更新（最后一次判定生效）。同时订阅 provider 的删除事件——任何清除缓存的写入者（`invalidate` / `invalidates`、`deletePrefix`、DevTools 面板按钮、过期）都会让挂载中的消费者重新请求并广播。 |
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
@@ -634,7 +664,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 ## 工程事实
 
 - **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
-- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 6 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 1.4 kB / 4.72 kB。
+- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 6 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 1.4 kB / 5.64 kB。
 - **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useDedup` + `useResult` 读取套件约 1.7 kB。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。
