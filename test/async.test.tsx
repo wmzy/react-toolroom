@@ -2176,6 +2176,113 @@ describe('async hooks', () => {
       vi.useRealTimers();
     });
 
+    it('should keep a shared-key entry observed until the last consumer unmounts (P3)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Consumer({id, tag}: {id: number; tag: string}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span data-testid={`consumer-${tag}`}>{tag}</span>;
+      }
+
+      // 两个消费者观察同一个 key：观察按消费者计数，
+      // 任一卸载都不解除豁免（对齐 TanStack 的观察者计数）。
+      const first = render(<Consumer id={1} tag='a' />);
+      render(<Consumer id={1} tag='b' />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      first.unmount();
+      // 卸载其一后闲置 2 个 cacheTime 周期：另一消费者仍在观察，
+      // 零多余 fetch、条目原样存活。
+      for (let period = 1; period <= 2; period++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(cache.snapshot!()).toHaveLength(1);
+      }
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim a shared-key entry after every consumer unmounts (P3)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Consumer({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span>x</span>;
+      }
+
+      const first = render(<Consumer id={1} />);
+      const second = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      // 卸载其一：计数 2→1，条目仍豁免。
+      first.unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      // 全部卸载：计数归零，cacheTime 内回收。
+      second.unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
+    it('should not let a mounted-but-never-called consumer strand loader-written entries (P3)', async () => {
+      vi.useFakeTimers();
+
+      const loaderFetch = vi.fn(async () => 'loader data');
+      const cache = createMemoryCacheProvider<string, [string]>({cacheTime: 1000});
+
+      function Idle() {
+        const injectable = useInjectable(async () => 'never fetched');
+        useCache(injectable, cache as never, 60000);
+        return <span>idle</span>;
+      }
+
+      // 挂载一个从不调用 injectable 的消费者（空元组观察）
+      render(<Idle />);
+
+      // 路由 loader 直写一个与该消费者无关的条目
+      cache.load!(['loader-page'], () => loaderFetch());
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      // 闲置推进 3 个 cacheTime 周期：空元组观察不得搁浅无关条目。
+      for (let period = 1; period <= 3; period++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+        expect(cache.snapshot!()).toEqual([]);
+      }
+      expect(loaderFetch).toHaveBeenCalledTimes(1);
+
+      vi.useRealTimers();
+    });
+
     it('should return cached data on cache hit', async () => {
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
       const cache = createMemoryCacheProvider<string, [number]>({

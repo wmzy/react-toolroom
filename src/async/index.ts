@@ -521,38 +521,32 @@ export function useCache<AF extends AsyncFunc>(
   // GC exemption while mounted: the tuples this consumer has fetched stay
   // observed for as long as it is on screen, so the provider's per-entry
   // sweep never reaps an entry someone is watching (TanStack Query keeps a
-  // query with observers alive the same way). A tail wrapper — registered
-  // during render like every hook of the chain — marks each call's tuple
-  // both on the provider (the GC exemption) and in the injectable's
-  // observed-set (so passive revalidation can tell a GC deletion of a live
-  // entry from a real invalidation); the effect below catches up with
-  // pre-existing tuples and unmarks everything on unmount, handing the
-  // entries back to the provider's GC clock. Providers without the
+  // query with observers alive the same way). Observation is counted per
+  // consumer — the fetch wrapper records the reference for its consumer
+  // (wrapperRefSet) whenever it records `seen`, and the consumer's unmount
+  // releases them. The provider-side `observe` marks the key exempt; the
+  // provider counts references per key, so with several consumers sharing
+  // a key the exemption outlives each of them until the last one unmounts.
+  // The wrapper chain is shared by every consumer of the same underlying
+  // function, so the wrapper marks eagerly and each consumer's own cleanup
+  // effect releases its references at unmount. Providers without the
   // optional `observe` member simply skip this — the sweep stays args-blind
   // for them.
   const observe = cacheProvider.observe;
   const observedSet = getObservedSet(injectableFn, cacheProvider);
-  useInject(
-    injectableFn,
-    (f: AF) => {
-      if (!observe) return f;
-      return ((...callArgs: Parameters<AF>) => {
-        observe([callArgs], true);
-        observedSet.add(stableHash(callArgs));
-        return f(...callArgs);
-      }) as AF;
-    }
-  );
   useEffect(() => {
     if (!observe) return;
-    // Catch up with anything fetched before this effect ran (the wrapper
-    // only sees calls made after its registration).
+    // Catch up with anything fetched before this effect ran.
     const tuples = [...seen.values()] as Parameters<AF>[];
-    observe(tuples, true);
+    if (tuples.length) observe(tuples, true);
     for (const tuple of tuples) observedSet.add(stableHash(tuple));
     return () => {
-      observe([...seen.values()] as Parameters<AF>[], false);
-      observedSet.clear();
+      // Release this consumer's references. `seen` is this consumer's own
+      // map, dropped with the hook instance — the tuples it releases are
+      // exactly the ones its wrapper observed.
+      const released = [...seen.values()] as Parameters<AF>[];
+      if (released.length) observe(released, false);
+      for (const tuple of released) observedSet.delete(stableHash(tuple));
     };
   }, [cacheProvider, seen, observe, observedSet]);
 
@@ -575,6 +569,14 @@ export function useCache<AF extends AsyncFunc>(
     (f: AF) =>
       ((...args: Parameters<AF>) => {
         seen.set(stableHash(args), args);
+        // GC exemption: mark the tuple observed the moment this consumer
+        // fetches it. The wrapper chain is shared by every consumer of the
+        // same underlying function, so this mark covers all of them — each
+        // consumer's unmount effect releases exactly its own `seen`
+        // references, and the provider counts per key: the exemption
+        // outlives every consumer until the last one unmounts.
+        observe?.([args], true);
+        observedSet.add(stableHash(args));
         const seq = nextResultSeq(store);
         const refetch = () => {
           const publish = thru<R<AF>>((r) => {

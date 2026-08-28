@@ -162,20 +162,32 @@ export default function create<T, K extends any[]>({
   // mounted consumer has fetched (and unmarks on unmount). Observed KEYS
   // (not just entries) are tracked so a key re-created later by `set`/
   // `load` inherits the exemption — an observer watches the data identity,
-  // not one entry object. Observing cancels any pending write-driven scan:
-  // while an observer is mounted its entries are exempt from GC anyway,
-  // and per-entry exemption means the single global sweep deadline can
-  // never resurrect the refetch loop. Unobserving re-arms the sweep
-  // (channel ②) so the released entries are reclaimed after their idle
-  // window even with no further writes.
-  const observedKeys = new Set<string>();
+  // not one entry object. The set holds per-key observer COUNTS: several
+  // consumers may share one key, and the exemption must outlive each of
+  // them until the last one unmounts (TanStack counts observers the same
+  // way). Observing cancels any pending write-driven scan: while an
+  // observer is mounted its entries are exempt from GC anyway, and
+  // per-entry exemption means the single global sweep deadline can never
+  // resurrect the refetch loop. Unobserving re-arms the sweep (channel ②)
+  // once the count reaches zero, so the released entries are reclaimed
+  // after their idle window even with no further writes.
+  const observedRefs = new Map<string, number>();
   const applyObserved = (h: string, on: boolean) => {
-    if (on) observedKeys.add(h);
-    else observedKeys.delete(h);
+    if (on) {
+      observedRefs.set(h, (observedRefs.get(h) ?? 0) + 1);
+    } else {
+      const n = (observedRefs.get(h) ?? 0) - 1;
+      if (n <= 0) observedRefs.delete(h);
+      else observedRefs.set(h, n);
+    }
     const entry = map.get(h);
-    if (entry) entry.observed = on;
+    if (entry) entry.observed = observedRefs.has(h);
   };
   const observeArgs = (args: K[], on: boolean) => {
+    // An empty batch observes nothing — it must not cancel a pending scan
+    // either, or a mounted-but-never-called consumer would strand unrelated
+    // loader-written entries for as long as it stays mounted.
+    if (args.length === 0) return;
     for (const tuple of args) applyObserved(hash(tuple), on);
     if (on && sweepTimer !== undefined) {
       clearTimeout(sweepTimer);
@@ -218,7 +230,7 @@ export default function create<T, K extends any[]>({
           args: key,
           settled: {value, cachedAt: Date.now()},
           lastUsedAt: Date.now(),
-          observed: observedKeys.has(h)
+          observed: observedRefs.has(h)
         });
       }
       gens.set(h, (gens.get(h) ?? 0) + 1);
@@ -250,7 +262,7 @@ export default function create<T, K extends any[]>({
           args: key,
           inflight: {promise, gen},
           lastUsedAt: Date.now(),
-          observed: observedKeys.has(h)
+          observed: observedRefs.has(h)
         });
       }
       scheduleSweep();
