@@ -156,20 +156,8 @@ export function bindCacheRevalidation<K extends any[]>(
         if (seen.has(key) && !pending.has(key)) hits.push(args);
       }
       if (hits.length === 0) return;
-      // GC-exempt entries are never deleted by the sweep (they are never in
-      // `e.deleted`), so every deletion that reaches here is a real
-      // invalidation — purge-and-refetch runs exactly as before. The
-      // observed-set below only repairs bookkeeping when a deletion races a
-      // revalidation's own settle.
-      const observed = getObservedSet(injectableFn, cacheProvider);
       emitStale(getStaleStore(injectableFn), true);
       for (const args of hits) {
-        // The deleted entry may carry a stale observation record (deleted →
-        // refetch rewrote it). Re-mark so the refetch's fresh entry stays
-        // exempt while the consumer remains mounted.
-        if (observed.has(stableHash(args))) {
-          (cacheProvider.observe as (a: any[][], on: boolean) => void)?.([args], true);
-        }
         pending.add(stableHash(args));
         // Fire-and-forget like the old active revalidation: failures surface
         // through the target's error store (useError), never as an unhandled

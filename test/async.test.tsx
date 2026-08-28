@@ -2283,6 +2283,129 @@ describe('async hooks', () => {
       vi.useRealTimers();
     });
 
+    it('should reclaim after StrictMode double effects and unmount (T3)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Consumer({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span>x</span>;
+      }
+
+      // StrictMode 双效应：观察 catch-up/cleanup 各跑两次，幂等配对必须保证
+      // 卸载后计数归零、条目按时回收。
+      const {unmount} = render(
+        <StrictMode>
+          <Consumer id={1} />
+        </StrictMode>
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim after repeated same-key calls then unmount (T4)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Consumer({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span>x</span>;
+      }
+
+      // 同 key 多轮挂载（每轮 wrapper on 候选 +1）：幂等 on 保证计数不虚增，
+      // 前一轮消费者仍在时条目存活，最后一个消费者卸载后按时回收。
+      const first = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+
+      const second = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5);
+      });
+      second.unmount();
+
+      const third = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5);
+      });
+      third.unmount();
+
+      // first 仍挂载：条目必须豁免。
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      first.unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim after invalidate-driven refetches then unmount (T5)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      let invalidateOne!: (id: number) => Promise<unknown>;
+      function Consumer({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        invalidateOne = useInvalidate(injectable, cache);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span>x</span>;
+      }
+
+      const {unmount} = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      // 两轮硬失效重取：每次 delete+refetch 后条目重建（继承 key 计数），
+      // 卸载后必须按时回收，不得残留永久豁免。
+      await act(async () => {
+        await invalidateOne(1);
+      });
+      await act(async () => {
+        await invalidateOne(1);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(3);
+      expect(cache.get([1])).toEqual(['data 1', expect.any(Number)]);
+
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
     it('should return cached data on cache hit', async () => {
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
       const cache = createMemoryCacheProvider<string, [number]>({

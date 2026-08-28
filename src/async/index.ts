@@ -568,15 +568,18 @@ export function useCache<AF extends AsyncFunc>(
     injectableFn,
     (f: AF) =>
       ((...args: Parameters<AF>) => {
-        seen.set(stableHash(args), args);
+        const key = stableHash(args);
         // GC exemption: mark the tuple observed the moment this consumer
-        // fetches it. The wrapper chain is shared by every consumer of the
-        // same underlying function, so this mark covers all of them — each
-        // consumer's unmount effect releases exactly its own `seen`
-        // references, and the provider counts per key: the exemption
-        // outlives every consumer until the last one unmounts.
-        observe?.([args], true);
-        observedSet.add(stableHash(args));
+        // fetches it. Idempotent per key — `on` fires only when the key is
+        // new to this consumer's `seen`, no matter how often the key is
+        // re-called (polling, refocus, stale revalidation, cache hits), so
+        // the provider's per-key reference count stays balanced with the
+        // consumer's single release-on-unmount. StrictMode's double-invoked
+        // effects are safe the same way: catch-up and cleanup touch the
+        // same seen-key set and pair exactly.
+        if (!seen.has(key)) observe?.([args], true);
+        seen.set(key, args);
+        observedSet.add(key);
         const seq = nextResultSeq(store);
         const refetch = () => {
           const publish = thru<R<AF>>((r) => {
