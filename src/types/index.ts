@@ -63,9 +63,9 @@ export type CreateMutationBinder<T, K extends any[]> = {
 /**
  * What a cache provider tells its listeners about one mutation. `set` fires
  * after an entry was written (`set`/`hydrate`); `delete` fires after entries
- * were removed (`delete`/`clear`/`deleteWhere`/`deletePrefix`/expiry) and
- * carries the raw args tuples of the removed entries. Entries whose raw
- * tuple the provider cannot recover (SSR `hydrate` writes only store the
+ * were removed (`delete`/`clear`/`deleteWhere`/`deletePrefix`/the per-entry
+ * GC) and carries the raw args tuples of the removed entries. Entries whose
+ * raw tuple the provider cannot recover (SSR `hydrate` writes only store the
  * hashed key) are omitted from `deleted` — a `useCache` subscriber has only
  * ever seen entries written through its own wrapper, so it always finds its
  * own tuples there.

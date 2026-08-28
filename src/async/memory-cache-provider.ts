@@ -17,6 +17,8 @@ type Entry<T, K extends any[]> = {
   args?: K;
   settled?: {value: T; cachedAt: number};
   inflight?: {promise: Promise<T>; gen: number};
+  /** Last activity timestamp — the per-entry GC clock (see {@link touch}). */
+  lastUsedAt: number;
 };
 
 /**
@@ -32,9 +34,22 @@ type Entry<T, K extends any[]> = {
  * that was written while the request was in flight. `peek` reads settled data
  * without observing or starting requests.
  *
+ * Reclamation is per entry, not per table. Every entry carries a
+ * `lastUsedAt` clock refreshed by every access (`get`/`peek`) and every
+ * write or settle (`set`/`load` register & settle/`patchWhere`/`hydrate`).
+ * When a finite `cacheTime` is set, two channels sweep: the last unmounted
+ * `use()` consumer schedules one final scan, and every write debounce-schedules
+ * a scan so entries nobody consumes (a router loader priming the cache)
+ * are reclaimed too. An entry is deleted when it has been idle — no access,
+ * no write — for the full `cacheTime` and carries no in-flight request;
+ * the sweep emits the same `{type: 'delete', deleted: [...]}` events as
+ * `delete`. `cacheTime: Infinity` never reclaims.
+ *
  * @param {object} [options] - The cache provider options.
- * @param {number} [options.cacheTime=Infinity] - The time in milliseconds for the cache to
- * expire. Defaults to Infinity, meaning the cache never expires on its own.
+ * @param {number} [options.cacheTime=Infinity] - The time in milliseconds an idle
+ * entry is kept before being reclaimed (per-entry, like TanStack Query's
+ * `gcTime`). Every access or write refreshes the entry's clock; `Infinity`
+ * (the default) means entries are never reclaimed on their own.
  * @param {(k: K) => string} [options.hash=stableHash] - The hash function used to generate
  * a unique key for each value. Defaults to {@link stableHash}, which serializes keys
  * deterministically (sorted object keys, structural recursion).
@@ -85,20 +100,76 @@ export default function create<T, K extends any[]>({
       .filter((args): args is K => args !== undefined);
     for (const listener of listeners) listener({type: 'delete', deleted});
   };
+  // The per-entry GC clock. Every access or write refreshes it, so an
+  // entry stays alive as long as anything keeps touching it — the direct
+  // analogue of TanStack Query refreshing `gcTime` on each observation.
+  const touch = (entry: Entry<T, K>) => {
+    entry.lastUsedAt = Date.now();
+    // A read proves somebody still cares about this entry: let the sweep
+    // channel know the deadline moved. (get/peek route through here too,
+    // so polling readers keep their entries alive indefinitely.)
+    scheduleSweep();
+  };
+  // An entry is reclaimable when it sat idle for the full `cacheTime` and
+  // carries no pending request (an inflight request is live work — never
+  // collect it, matching TanStack Query keeping a fetching observer's
+  // query alive). `cacheTime === Infinity` never reaches the sweep.
+  const expired = (entry: Entry<T, K>) =>
+    entry.inflight === undefined &&
+    Date.now() - entry.lastUsedAt >= cacheTime;
+  // Per-entry sweep: delete every idle entry, then notify once — batched
+  // so listeners revalidate against the fully swept state, not a mix.
+  const sweep = () => {
+    if (cacheTime === Infinity) return;
+    const deleted: Entry<T, K>[] = [];
+    for (const [h, entry] of map) {
+      if (expired(entry)) {
+        deleted.push(entry);
+        map.delete(h);
+      }
+    }
+    if (deleted.length) notifyDelete(deleted);
+  };
+  // Channel ② — the write-driven debounce sweep. `use()` only observes
+  // component consumers; entries written through channels nobody mounts
+  // (a router loader priming the cache) would otherwise sit forever. Every
+  // write schedules one scan at `cacheTime` from now; a later write
+  // postpones it. The channel-① timer, while consumers are mounted, keeps
+  // entries young enough that the scans find nothing — the channels are
+  // independent and idempotent. With `reset = false` an already pending
+  // scan is left alone (its earlier deadline sweeps later writes too);
+  // `use()`'s re-arm passes it so it never extends its own deadline.
+  let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleSweep = (reset = true) => {
+    if (cacheTime === Infinity) return;
+    if (sweepTimer !== undefined) {
+      if (!reset) return;
+      clearTimeout(sweepTimer);
+    }
+    sweepTimer = setTimeout(() => {
+      sweepTimer = undefined;
+      sweep();
+    }, cacheTime);
+  };
   const provider: CacheProvider<T, K> = {
     // In-flight requests are invisible to get: it only ever reports settled
     // data, exactly like the pre-load provider did.
     get(key: K) {
-      const {settled} = map.get(hash(key)) ?? {};
-      return settled && ([settled.value, settled.cachedAt] as [T, number]);
+      const entry = map.get(hash(key));
+      if (!entry?.settled) return undefined;
+      touch(entry);
+      return [entry.settled.value, entry.settled.cachedAt] as [T, number];
     },
     // Read-only settled lookup — no in-flight observation, no request
     // creation. The routing layer uses it to check a cache synchronously
     // without ever triggering a fetch. The record is copied so callers
     // cannot reach into the entry.
     peek(key: K) {
-      const {settled} = map.get(hash(key)) ?? {};
-      return settled && {value: settled.value, cachedAt: settled.cachedAt};
+      const entry = map.get(hash(key));
+      if (!entry?.settled) return undefined;
+      touch(entry);
+      const {value, cachedAt} = entry.settled;
+      return {value, cachedAt};
     },
     set(key: K, value: T) {
       const h = hash(key);
@@ -109,10 +180,16 @@ export default function create<T, K extends any[]>({
         // generation bump below makes its late settlement a no-op.
         entry.args = key;
         entry.settled = {value, cachedAt: Date.now()};
+        touch(entry);
       } else {
-        map.set(h, {args: key, settled: {value, cachedAt: Date.now()}});
+        map.set(h, {
+          args: key,
+          settled: {value, cachedAt: Date.now()},
+          lastUsedAt: Date.now()
+        });
       }
       gens.set(h, (gens.get(h) ?? 0) + 1);
+      scheduleSweep();
       notifySet();
     },
     // Atomic get-or-insert of the in-flight slot: concurrent loads with the
@@ -134,9 +211,15 @@ export default function create<T, K extends any[]>({
         // Hydrated entries pick up the raw tuple they never had.
         entry.args ??= key;
         entry.inflight = {promise, gen};
+        touch(entry);
       } else {
-        map.set(h, {args: key, inflight: {promise, gen}});
+        map.set(h, {
+          args: key,
+          inflight: {promise, gen},
+          lastUsedAt: Date.now()
+        });
       }
+      scheduleSweep();
       notifySet();
       const finish = (value?: {v: T}) => {
         const cur = map.get(h);
@@ -151,6 +234,7 @@ export default function create<T, K extends any[]>({
           // cacheTime/staleTime budget.
           cur.settled = {value: value.v, cachedAt: Date.now()};
         }
+        touch(cur);
         // A record holding neither data nor a pending request is not an
         // entry — drop it so snapshots and get stay honest.
         if (!cur.settled) map.delete(h);
@@ -196,12 +280,15 @@ export default function create<T, K extends any[]>({
         called = true;
         if (--useCount === 0) {
           timer = setTimeout(() => {
-            // Delete before notify — same invariant as clear().
-            const deleted = [...map.values()];
-            map.clear();
-            gens.clear();
-            notifyDelete(deleted);
             timer = undefined;
+            // Per-entry reclamation instead of a wholesale clear: sweep
+            // entries idle for the full `cacheTime` (an in-flight request
+            // keeps its entry alive). Before going idle, re-arm once —
+            // without resetting an earlier deadline — so a write that lands
+            // during this final window still gets channel ② coverage.
+            scheduleSweep(false);
+            // Delete before notify — same invariant as clear().
+            sweep();
           }, cacheTime);
         }
       };
@@ -225,9 +312,18 @@ export default function create<T, K extends any[]>({
       for (const k in data) {
         const [value, cachedAt] = data[k];
         const entry = map.get(k);
-        if (entry) entry.settled = {value, cachedAt};
-        else map.set(k, {args: undefined, settled: {value, cachedAt}});
+        if (entry) {
+          entry.settled = {value, cachedAt};
+          touch(entry);
+        } else {
+          map.set(k, {
+            args: undefined,
+            settled: {value, cachedAt},
+            lastUsedAt: Date.now()
+          });
+        }
       }
+      scheduleSweep();
     },
     // Deleting while iterating a Map is safe per spec (visited keys removed
     // earlier are skipped, later ones still seen), so no intermediate array.
@@ -271,15 +367,19 @@ export default function create<T, K extends any[]>({
         if (next === undefined) continue;
         const prev = settled.value;
         entry.settled = {value: next, cachedAt: Date.now()};
+        touch(entry);
         gens.set(h, (gens.get(h) ?? 0) + 1);
         patched.push({args, prev, next});
       }
-      if (patched.length) notifySet();
+      if (patched.length) {
+        scheduleSweep();
+        notifySet();
+      }
       return patched;
     },
     // Read-only observation surface for devtools: registers a listener that
     // fires after every mutation (set/delete/clear/deleteWhere/deletePrefix/
-    // load register & settle/expiry) with what changed.
+    // load register & settle/per-entry GC) with what changed.
     subscribe(listener: (e: CacheEvent<K>) => void) {
       (listeners ??= new Set()).add(listener);
       return () => {
@@ -289,6 +389,7 @@ export default function create<T, K extends any[]>({
     // On-demand shallow copy — never exposes the live Map to consumers.
     // In-flight-only entries are omitted (no data to show); entries that
     // carry data while a request runs get an additive `pending` marker.
+    // Deletion events from the per-entry GC read like `delete`'s.
     snapshot() {
       return [...map].flatMap(([key, entry]) => {
         const {settled} = entry;

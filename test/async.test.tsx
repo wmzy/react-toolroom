@@ -485,7 +485,7 @@ describe('async hooks', () => {
       expect(cleanup).toBeDefined();
     });
 
-    it('should clear timer when use() is called multiple times (line 45)', async () => {
+    it('should not extend the sweep deadline while extra consumers mount (line 45)', async () => {
       vi.useFakeTimers();
 
       const provider = createMemoryCacheProvider<string, [string]>({
@@ -505,15 +505,26 @@ describe('async hooks', () => {
       expect(provider.get(['test'])).toBeDefined();
 
       vi.advanceTimersByTime(600);
-
-      await vi.waitFor(() => {
-        expect(provider.get(['test'])).toBeUndefined();
+      // the use()-channel sweep at t=1000 kept the entry — its clock was
+      // reset by the t=500 read. The write channel's rescheduled scan runs
+      // at t=1500 (1000ms after that read) and reaps the now-idle entry.
+      // (No reads past this point: an access would refresh the GC clock.)
+      let reaped = false;
+      provider.subscribe!(() => {
+        reaped = true;
       });
+      vi.advanceTimersByTime(399); // t=1499: one ms before the scan
+      expect(reaped).toBe(false);
+      vi.advanceTimersByTime(2); // t=1501: the scan has fired
+      await vi.waitFor(() => {
+        expect(reaped).toBe(true);
+      });
+      expect(provider.snapshot!()).toEqual([]);
 
       vi.useRealTimers();
     });
 
-    it('should set timer and clear cache after cacheTime (lines 51-54)', async () => {
+    it('should reclaim per-entry after cacheTime once idle (lines 51-54)', async () => {
       vi.useFakeTimers();
 
       const provider = createMemoryCacheProvider<string, [string]>({
@@ -528,10 +539,15 @@ describe('async hooks', () => {
       cleanup();
 
       vi.advanceTimersByTime(500);
+      // an access keeps the entry young — the GC clock refreshes on read
       expect(provider.get(['test'])).toBeDefined();
 
       vi.advanceTimersByTime(600);
+      // the use()-channel sweep ran at t=1000, but the read at t=500 reset
+      // the entry's clock, so it is still alive
+      expect(provider.get(['test'])).toBeDefined();
 
+      vi.advanceTimersByTime(1000);
       await vi.waitFor(() => {
         expect(provider.get(['test'])).toBeUndefined();
       });
@@ -539,7 +555,7 @@ describe('async hooks', () => {
       vi.useRealTimers();
     });
 
-    it('should reset timer when new use() is called after cleanup', async () => {
+    it('should reclaim from the re-armed use() timer after remount', async () => {
       vi.useFakeTimers();
 
       const provider = createMemoryCacheProvider<string, [string]>({
@@ -560,13 +576,139 @@ describe('async hooks', () => {
       cleanup2();
 
       vi.advanceTimersByTime(500);
+      // no access since the t=500 read; t=1000 sweep finds it 500ms idle
       expect(provider.get(['test'])).toBeDefined();
 
-      vi.advanceTimersByTime(600);
-
+      vi.advanceTimersByTime(1000);
       await vi.waitFor(() => {
         expect(provider.get(['test'])).toBeUndefined();
       });
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim entries written with no consumer via the debounce sweep (router-loader channel)', async () => {
+      vi.useFakeTimers();
+
+      // 关键场景：路由 loader 直写缓存 —— 没有任何组件 use() 过这个 provider，
+      // 旧「整表 GC」依赖 useCount 归零，这类条目永远不会被回收。
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 1000,
+        hash: (key) => JSON.stringify(key)
+      });
+
+      const deleted: string[][] = [];
+      provider.subscribe!((e) => {
+        if (e.type === 'delete') deleted.push(...e.deleted.map((k) => k as string[]));
+      });
+
+      // loader 通道：不经 use()，直接 set + load
+      provider.set(['loader-page'], 'primed');
+      const pending = provider.load!(['loader-async'], async () => 'fetched');
+      await pending;
+
+      expect(provider.get(['loader-page'])).toBeDefined();
+      expect(provider.get(['loader-async'])).toBeDefined();
+
+      // 停在回收前一刻：set 通道的扫描挂在 t=1000（settle 又重置过一次）
+      vi.advanceTimersByTime(999);
+      expect(provider.snapshot!()).toHaveLength(2);
+
+      vi.advanceTimersByTime(2);
+      await vi.waitFor(() => {
+        expect(provider.snapshot!()).toEqual([]);
+      });
+      // 逐条删除按契约携带被删条目的原始 args
+      expect(deleted.sort()).toEqual([['loader-async'], ['loader-page']]);
+
+      vi.useRealTimers();
+    });
+
+    it('should not reclaim an entry while its load is in flight', async () => {
+      vi.useFakeTimers();
+
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 1000,
+        hash: (key) => JSON.stringify(key)
+      });
+
+      let resolveFn!: (v: string) => void;
+      const pending = provider.load!(['slow'], () => new Promise<string>((r) => (resolveFn = r)));
+      vi.advanceTimersByTime(5000);
+
+      // 请求仍在途：即便已远超 cacheTime，条目也不回收。
+      // snapshot 契约是省略 in-flight-only 条目（无数据可展示），
+      // 所以「未被回收」要用 delete 事件从未发生来证明。
+      let deleted = false;
+      provider.subscribe!((e) => {
+        if (e.type === 'delete') deleted = true;
+      });
+      vi.advanceTimersByTime(5000);
+      expect(deleted).toBe(false);
+      expect(provider.peek!(['slow'])).toBeUndefined(); // 尚无 settled 数据
+
+      resolveFn('done');
+      await pending;
+      // settle 后扫描通道重新计时；此刻数据刚落地，不会被回收
+      expect(provider.get(['slow'])).toEqual(['done', expect.any(Number)]);
+
+      vi.advanceTimersByTime(999);
+      expect(provider.peek!(['slow'])).toBeDefined();
+      vi.advanceTimersByTime(2);
+      await vi.waitFor(() => {
+        expect(provider.snapshot!()).toEqual([]);
+      });
+
+      vi.useRealTimers();
+    });
+
+    it('should never reclaim when cacheTime is Infinity', async () => {
+      vi.useFakeTimers();
+
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: Infinity,
+        hash: (key) => JSON.stringify(key)
+      });
+
+      provider.set(['forever'], 'kept');
+      await provider.load!(['forever-async'], async () => 'kept too');
+
+      // 无消费者、长时间推进：没有任何回收通道被安排
+      vi.advanceTimersByTime(1_000_000);
+      expect(provider.get(['forever'])).toBeDefined();
+      expect(provider.get(['forever-async'])).toBeDefined();
+      expect(vi.getTimerCount()).toBe(0);
+
+      vi.useRealTimers();
+    });
+
+    it('should carry the raw args of swept entries on the delete event', async () => {
+      vi.useFakeTimers();
+
+      const provider = createMemoryCacheProvider<{id: string}, [string, number]>({
+        cacheTime: 500,
+        hash: (key) => JSON.stringify(key)
+      });
+
+      const events: Array<{type: string; deleted?: readonly unknown[]}> = [];
+      provider.subscribe!((e) => events.push(e));
+
+      provider.set(['alice', 1], {id: 'a1'});
+      provider.set(['bob', 2], {id: 'b2'});
+      // hydrate 条目没有原始 args，与 clear 行为一致：不进 deleted 列表
+      provider.hydrate!({[`["carol",3]`]: [{id: 'c3'}, 42]});
+
+      vi.advanceTimersByTime(501);
+      await vi.waitFor(() => {
+        expect(provider.snapshot!()).toEqual([]);
+      });
+
+      const deletes = events.filter((e) => e.type === 'delete');
+      expect(deletes).toHaveLength(1);
+      expect(deletes[0]!.deleted).toEqual([
+        ['alice', 1],
+        ['bob', 2]
+      ]);
 
       vi.useRealTimers();
     });
