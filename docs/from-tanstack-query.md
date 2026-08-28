@@ -1,0 +1,154 @@
+# Migrating from TanStack Query
+
+react-toolroom's async layer covers the same ground as TanStack Query —
+declarative data fetching, caching, background revalidation, invalidation,
+optimistic updates — but it is plain React hooks composed around **your**
+functions, not a query-key-driven declarative cache. This page maps the
+concepts.
+
+A mental model that transfers: TanStack Query keys a **Query** (an entry in
+one big cache) by a `queryKey` tree and attaches observers to it with a
+`gcTime` after the last observer unsubscribes. react-toolroom keys a
+**cache entry** by the raw arguments tuple you pass to your function, inside
+a per-entity `CacheProvider` you create, and reclaims idle entries with the
+same two-phase idea — but the cache is per entity, not one global store.
+
+## The core mapping
+
+| TanStack Query | react-toolroom | Notes |
+| --- | --- | --- |
+| `useQuery({queryKey, queryFn})` | `useCache(fetcher, cache)` + `useInjectable(fetcher)` + `useResult`/`useLoading`/`useError` | The fetcher is a plain function; the hook reads/writes the provider keyed by the call arguments. |
+| `queryKey` tree (`['users', id]`) | raw args tuple (`[id]`) + one provider per entity | No key serialization layer — the tuple *is* the key; `stableHash` handles structural hashing (or supply `hash`). |
+| one global `QueryClient` | one `createMemoryCacheProvider()` per entity | Providers are module-scope singletons you create and wire explicitly. |
+| `queryFn` receives `{queryKey, signal}` | your function receives its args + trailing `AbortSignal` | `useInjectable` wires the signal; cancellation works the same. |
+| `enabled: !!id` | conditional rendering / early return, or guard inside the fetcher | No declarative `enabled` — compose hooks the normal React way. |
+| `select` | `useResultSelect(fn, select)` | Same idea: derive a slice without breaking cache identity. |
+| `placeholderData: keepPreviousData` | default behavior + `usePlaceholderData(fn)` flag | Keeping the previous data on a key change is already the default; the flag tells you WHICH data is on screen. |
+| `initialData` / SSR hydration | `dehydrate()` / `hydrate()` on the provider | Server stamps `cachedAt`; client hydrates before first render. |
+| `useSuspenseQuery` | `useCache` + `useSuspenseResult` | Suspends until the first result resolves. |
+| `refetchInterval` | `usePolling(fn, interval, {args})` | Timer re-arms on args change; pauses while hidden by default (`whenHidden`). |
+| `refetchOnWindowFocus` | `useFocusRevalidate(fn, args)` | Same trigger, explicit composition. |
+| `retry` / exponential backoff | `useRetry(fn, {retries, backoff})` | Preset backoff strategies (`exponential`: 1s, 2s, 4s… / `linear` / custom). |
+
+## Queries: `useQuery` → `useCache`
+
+```tsx
+// TanStack
+const {data, isPending, error} = useQuery({
+  queryKey: ['users', id],
+  queryFn: () => api.user(id),
+});
+
+// react-toolroom
+const userCache = createMemoryCacheProvider<User, [string]>({cacheTime: 60_000});
+
+function useUser(id: string) {
+  const fetchUser = useInjectable((id: string, signal: AbortSignal) => api.user(id, signal));
+  useCache(fetchUser, userCache);
+  const user = useResult(fetchUser, [id]);
+  const loading = useLoading(fetchUser, [id]);
+  const error = useError(fetchUser, [id]);
+  return {user, isPending: loading, error};
+}
+```
+
+Cache identity is the args tuple: `fetchUser` called with `['u1']` shares one
+entry everywhere. On a cache hit the value broadcasts immediately; if it is
+older than `staleTime` (default `0`), a background refetch follows (SWR), and
+its failure keeps the stale value on screen.
+
+### `gcTime` / `staleTime` semantics
+
+| Concept | TanStack Query | react-toolroom |
+| --- | --- | --- |
+| Entry lifetime | `gcTime` (default 5 min) after the last observer unsubscribes | `cacheTime` (default `Infinity`) of idle time, measured per entry |
+| Activity refresh | every observer attach refreshes the GC timer | every `get`/`peek`/`set`/`load` settle refreshes the entry's `lastUsedAt` |
+| No observers at all | entry is garbage after `gcTime` | entry is reclaimed too: every write debounce-schedules a sweep `cacheTime` out, so loader-primed entries with zero components still expire |
+| In-flight request | query with fetchStatus `fetching` is not collected | an entry with an in-flight request is never collected |
+| Freshness | `staleTime` (default 0) | `staleTime` on `useCache` (default 0) — identical meaning; `cachedAt` is stamped from settle, not request start |
+| Forever | `gcTime: Infinity` | `cacheTime: Infinity` (the default) |
+
+`delete` events carry the removed entries' raw args tuples
+(`{type: 'delete', deleted: [args]}`), emitted after removal — the analogue
+of Query Cache's `removed` event, with args instead of query keys.
+
+## Mutations: `useMutation` → `useMutation` / `cache.mutation`
+
+```tsx
+// TanStack
+const mutation = useMutation({
+  mutationFn: (name: string) => api.rename(name),
+  onSuccess: () => queryClient.invalidateQueries({queryKey: ['users']}),
+});
+
+// react-toolroom — declare invalidation up front
+const [rename] = useMutation(
+  useInjectable(api.rename),
+  {invalidates: [userCache, [usersCache, 'list-prefix']]} // providers (+ optional args prefix)
+);
+```
+
+| TanStack | react-toolroom | Notes |
+| --- | --- | --- |
+| `useMutation({mutationFn})` | `useMutation(mutate, {invalidates})` | `invalidates` lists the cache providers (or `[provider, ...argsPrefix]` slices) to purge on success. Returns `[mutate, status, unmount]`. |
+| `queryClient.invalidateQueries({queryKey})` | `useInvalidate(fetcher, cache)(...args)` (hook) / `invalidate([targets])` (imperative) | Invalidate by args; a `[provider, ...prefix]` target sweeps every entry whose args start with the prefix. |
+| `queryClient.setQueryData(key, updater)` | `cache.patchWhere(pred, updater)` | Batch write with per-entry generation guard. |
+| `queryClient.getQueryData(key)` | `cache.peek(args)` / `cache.get(args)` | `peek` never observes or starts requests. |
+| `mutation.isPending` | `useLoading(mutate)` / the tuple's status | Same shape. |
+| `mutationKey` + serial `scope` | `scope` option | Queue same-scope mutations instead of racing them. |
+
+### Optimistic updates
+
+```tsx
+// TanStack: onMutate snapshot + onError rollback + onSettled invalidate
+useMutation({
+  mutationFn: api.rename,
+  onMutate: async (next) => {
+    await queryClient.cancelQueries({queryKey: ['user', next.id]});
+    const prev = queryClient.getQueryData(['user', next.id]);
+    queryClient.setQueryData(['user', next.id], next);
+    return {prev};
+  },
+  onError: (_e, vars, ctx) => queryClient.setQueryData(['user', vars.id], ctx?.prev),
+  onSettled: () => queryClient.invalidateQueries({queryKey: ['user']}),
+});
+
+// react-toolroom: cache.mutation — the pipeline is built in
+const rename = userCache.mutation((vars: {id: string; name: string}) => ({
+  where: (user: User) => user.id === vars.id,
+  update: (user: User) => ({...user, name: vars.name}),   // applied optimistically
+  call: () => api.rename(vars.id, vars.name),              // the real request
+  apply: (user: User, resp: Partial<User>) => ({...user, ...resp}), // reconcile with the response
+  // rollback to the pre-mutation value on failure is automatic,
+  // and a concurrent write during flight is never clobbered
+}));
+const [runRename] = useMutation(useInjectable(rename));
+```
+
+The `cache.mutation(spec)` binder layers the whole TanStack `onMutate` /
+`onError` / `onSettled` ritual into one spec: optimistic `update`, real
+`call`, response `apply`, automatic rollback with a generation-guarded
+identity check.
+
+## DevTools
+
+TanStack Query Devtools → `react-toolroom/devtools`: mount the panel, pass
+`caches: [userCache, ...]` (any provider with `snapshot`/`subscribe` — the
+memory provider qualifies) and see every entry, its `cachedAt`, and pending
+markers.
+
+## Not in scope (by design)
+
+- **A global query client / provider.** Caches are plain objects you create
+  and pass; there is no context, no `<QueryClientProvider>`.
+- **Query key serialization & partial matching.** Keys are your raw argument
+  tuples; "partial matching" is expressed as `deletePrefix` (hashed-key
+  prefix) or `deleteWhere` (args predicate) instead of a fuzzy key matcher.
+- **Declarative `enabled`/`select`/`placeholderData` per call site.** These
+  are composed with regular React (conditional hooks, `useResultSelect`,
+  `keepPreviousData`) rather than configured on one hook.
+- **Persistence adapters, offline mutation queue, request deduplication
+  across tabs.** The provider is in-memory; bring your own storage-backed
+  `CacheProvider` (the interface is five required members + opt-ins).
+- **Retry token buckets / circuit breakers.** `useRetry` covers bounded
+  exponential backoff only.
