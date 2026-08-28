@@ -20,7 +20,7 @@ same two-phase idea — but the cache is per entity, not one global store.
 | `useQuery({queryKey, queryFn})` | `useCache(fetcher, cache)` + `useInjectable(fetcher)` + `useResult`/`useLoading`/`useError` | The fetcher is a plain function; the hook reads/writes the provider keyed by the call arguments. |
 | `queryKey` tree (`['users', id]`) | raw args tuple (`[id]`) + one provider per entity | No key serialization layer — the tuple *is* the key; `stableHash` handles structural hashing (or supply `hash`). |
 | one global `QueryClient` | one `createMemoryCacheProvider()` per entity | Providers are module-scope singletons you create and wire explicitly. |
-| `queryFn` receives `{queryKey, signal}` | your function receives its args + trailing `AbortSignal` | `useInjectable` wires the signal; cancellation works the same. |
+| `queryFn` receives `{queryKey, signal}` | your function receives its args + trailing `AbortSignal` | `useRun(fn, args, {signal: true})` (and the hooks built on it) appends the signal as the trailing argument; cancellation works the same. |
 | `enabled: !!id` | conditional rendering / early return, or guard inside the fetcher | No declarative `enabled` — compose hooks the normal React way. |
 | `select` | `useResultSelect(fn, select)` | Same idea: derive a slice without breaking cache identity. |
 | `placeholderData: keepPreviousData` | default behavior + `usePlaceholderData(fn)` flag | Keeping the previous data on a key change is already the default; the flag tells you WHICH data is on screen. |
@@ -62,11 +62,17 @@ its failure keeps the stale value on screen.
 | Concept | TanStack Query | react-toolroom |
 | --- | --- | --- |
 | Entry lifetime | `gcTime` (default 5 min) after the last observer unsubscribes | `cacheTime` (default `Infinity`) of idle time, measured per entry |
+| Mounted observers | query with observers is never collected | entry observed by a mounted `useCache` consumer is exempt until it unmounts (`provider.observe(args, on)`) |
 | Activity refresh | every observer attach refreshes the GC timer | every `get`/`peek`/`set`/`load` settle refreshes the entry's `lastUsedAt` |
 | No observers at all | entry is garbage after `gcTime` | entry is reclaimed too: every write debounce-schedules a sweep `cacheTime` out, so loader-primed entries with zero components still expire |
 | In-flight request | query with fetchStatus `fetching` is not collected | an entry with an in-flight request is never collected |
 | Freshness | `staleTime` (default 0) | `staleTime` on `useCache` (default 0) — identical meaning; `cachedAt` is stamped from settle, not request start |
 | Forever | `gcTime: Infinity` | `cacheTime: Infinity` (the default) |
+
+Trade-off vs. TanStack's per-query timers: the sweep is one shared deadline
+that every access reschedules, so a periodically read entry (polling,
+keep-alive) postpones reclamation indefinitely — for itself and for any
+other unobserved entries riding the same scan.
 
 `delete` events carry the removed entries' raw args tuples
 (`{type: 'delete', deleted: [args]}`), emitted after removal — the analogue
@@ -114,21 +120,25 @@ useMutation({
 });
 
 // react-toolroom: cache.mutation — the pipeline is built in
-const rename = userCache.mutation((vars: {id: string; name: string}) => ({
-  where: (user: User) => user.id === vars.id,
-  update: (user: User) => ({...user, name: vars.name}),   // applied optimistically
-  call: () => api.rename(vars.id, vars.name),              // the real request
-  apply: (user: User, resp: Partial<User>) => ({...user, ...resp}), // reconcile with the response
+const favorite = articleCache.mutation((slug: string, on: boolean) => ({
+  mutate: () => api.favorite(slug, on),                     // the real request (zero-arg closure)
+  key: [slug],                                              // which entry to patch; omit to patch every settled entry via update/apply
+  update: (old: Article) => ({...old, favorited: on}),      // applied optimistically
+  apply: (old: Article, resp: {favorited: boolean; count: number}) => ({
+    ...old,
+    favorited: resp.favorited,
+    count: resp.count
+  })                                                        // reconciled with the response
   // rollback to the pre-mutation value on failure is automatic,
   // and a concurrent write during flight is never clobbered
 }));
-const [runRename] = useMutation(useInjectable(rename));
+const [runFavorite] = useMutation(useInjectable(favorite));
 ```
 
 The `cache.mutation(spec)` binder layers the whole TanStack `onMutate` /
-`onError` / `onSettled` ritual into one spec: optimistic `update`, real
-`call`, response `apply`, automatic rollback with a generation-guarded
-identity check.
+`onError` / `onSettled` ritual into one spec: optimistic `update`, the real
+request in `mutate`, response `apply`, automatic rollback with a
+generation-guarded identity check.
 
 ## DevTools
 
