@@ -2109,6 +2109,73 @@ describe('async hooks', () => {
       expect(useCache).toBeDefined();
     });
 
+    it('should never GC an entry observed by a mounted useCache consumer (P1)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async () => 'data');
+      const cache = createMemoryCacheProvider<string, []>({cacheTime: 1000});
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        // staleTime 远大于 cacheTime：排除 stale 重验的干扰，
+        // 唯一可能的 refetch 来源就是 GC 删除事件。
+        useCache(injectable, cache, 60000);
+        useRun(injectable, []);
+        const result = useResult(injectable);
+        return <span data-testid='result'>{result ?? 'none'}</span>;
+      }
+
+      render(<TestComponent />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      // 闲置推进 5 个 cacheTime 周期：挂载观察者豁免 GC，
+      // 条目必须原样存活，绝不出现「删除 → 被动重取」的循环。
+      for (let period = 1; period <= 5; period++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(cache.snapshot!()).toHaveLength(1);
+      }
+      expect(screen.getByTestId('result').textContent).toBe('data');
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim the entry after the useCache consumer unmounts (P1)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async () => 'data');
+      const cache = createMemoryCacheProvider<string, []>({cacheTime: 1000});
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        useRun(injectable, []);
+        return <span data-testid='result'>{useResult(injectable)}</span>;
+      }
+
+      const {unmount} = render(<TestComponent />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      // 卸载即解除观察：条目回到 GC 时钟，cacheTime 后被回收，
+      // 且没有新的 fetch（消费者已离场，被动重验不会触发）。
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      vi.useRealTimers();
+    });
+
     it('should return cached data on cache hit', async () => {
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
       const cache = createMemoryCacheProvider<string, [number]>({

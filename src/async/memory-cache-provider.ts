@@ -19,6 +19,8 @@ type Entry<T, K extends any[]> = {
   inflight?: {promise: Promise<T>; gen: number};
   /** Last activity timestamp — the per-entry GC clock (see {@link touch}). */
   lastUsedAt: number;
+  /** True while a mounted `useCache` observer has consumed this entry — exempt from GC. */
+  observed?: boolean;
 };
 
 /**
@@ -42,8 +44,10 @@ type Entry<T, K extends any[]> = {
  * a scan so entries nobody consumes (a router loader priming the cache)
  * are reclaimed too. An entry is deleted when it has been idle — no access,
  * no write — for the full `cacheTime` and carries no in-flight request;
- * the sweep emits the same `{type: 'delete', deleted: [...]}` events as
- * `delete`. `cacheTime: Infinity` never reclaims.
+ * an entry observed by a mounted `useCache` consumer (marked via `observe`)
+ * is exempt until unobserved. The sweep emits the same
+ * `{type: 'delete', deleted: [...]}` events as `delete`.
+ * `cacheTime: Infinity` never reclaims.
  *
  * @param {object} [options] - The cache provider options.
  * @param {number} [options.cacheTime=Infinity] - The time in milliseconds an idle
@@ -110,12 +114,15 @@ export default function create<T, K extends any[]>({
     // so polling readers keep their entries alive indefinitely.)
     scheduleSweep();
   };
-  // An entry is reclaimable when it sat idle for the full `cacheTime` and
+  // An entry is reclaimable when it sat idle for the full `cacheTime`,
   // carries no pending request (an inflight request is live work — never
-  // collect it, matching TanStack Query keeping a fetching observer's
-  // query alive). `cacheTime === Infinity` never reaches the sweep.
+  // collect it) and has no observed consumer (a mounted `useCache`
+  // observer keeps its entry alive exactly like TanStack Query's gcTime
+  // keeps a query with observers). `cacheTime === Infinity` never reaches
+  // the sweep.
   const expired = (entry: Entry<T, K>) =>
     entry.inflight === undefined &&
+    entry.observed !== true &&
     Date.now() - entry.lastUsedAt >= cacheTime;
   // Per-entry sweep: delete every idle entry, then notify once — batched
   // so listeners revalidate against the fully swept state, not a mix.
@@ -151,6 +158,31 @@ export default function create<T, K extends any[]>({
       sweep();
     }, cacheTime);
   };
+  // Observer bookkeeping — the `use` observer API marks the tuples its
+  // mounted consumer has fetched (and unmarks on unmount). Observed KEYS
+  // (not just entries) are tracked so a key re-created later by `set`/
+  // `load` inherits the exemption — an observer watches the data identity,
+  // not one entry object. Observing cancels any pending write-driven scan:
+  // while an observer is mounted its entries are exempt from GC anyway,
+  // and per-entry exemption means the single global sweep deadline can
+  // never resurrect the refetch loop. Unobserving re-arms the sweep
+  // (channel ②) so the released entries are reclaimed after their idle
+  // window even with no further writes.
+  const observedKeys = new Set<string>();
+  const applyObserved = (h: string, on: boolean) => {
+    if (on) observedKeys.add(h);
+    else observedKeys.delete(h);
+    const entry = map.get(h);
+    if (entry) entry.observed = on;
+  };
+  const observeArgs = (args: K[], on: boolean) => {
+    for (const tuple of args) applyObserved(hash(tuple), on);
+    if (on && sweepTimer !== undefined) {
+      clearTimeout(sweepTimer);
+      sweepTimer = undefined;
+    }
+    if (!on) scheduleSweep();
+  };
   const provider: CacheProvider<T, K> = {
     // In-flight requests are invisible to get: it only ever reports settled
     // data, exactly like the pre-load provider did.
@@ -185,7 +217,8 @@ export default function create<T, K extends any[]>({
         map.set(h, {
           args: key,
           settled: {value, cachedAt: Date.now()},
-          lastUsedAt: Date.now()
+          lastUsedAt: Date.now(),
+          observed: observedKeys.has(h)
         });
       }
       gens.set(h, (gens.get(h) ?? 0) + 1);
@@ -216,7 +249,8 @@ export default function create<T, K extends any[]>({
         map.set(h, {
           args: key,
           inflight: {promise, gen},
-          lastUsedAt: Date.now()
+          lastUsedAt: Date.now(),
+          observed: observedKeys.has(h)
         });
       }
       scheduleSweep();
@@ -267,6 +301,13 @@ export default function create<T, K extends any[]>({
       map.clear();
       gens.clear();
       notifyDelete(deleted);
+    },
+    // Marks/unmarks args tuples as observed by a mounted `useCache`
+    // consumer. Observed entries are exempt from per-entry GC — exactly
+    // TanStack Query's "a query with observers is never collected".
+    // Optional extension; custom providers may omit it.
+    observe(args: K[], on: boolean) {
+      observeArgs(args, on);
     },
     use() {
       if (cacheTime === Infinity) return noop;

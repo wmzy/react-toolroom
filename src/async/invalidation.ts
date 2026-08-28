@@ -94,6 +94,31 @@ export function getPendingSet<K extends any[]>(
   return pending;
 }
 
+const observedKey = Symbol('useCache observed args');
+
+/**
+ * Lazily creates and returns the observed-args set of an injectable×provider
+ * pair — the hashed tuples a mounted `useCache` consumer currently watches.
+ * Passive revalidation consults it: a deletion of an observed entry is the
+ * provider's GC collecting a live entry, not invalidation, so re-running it
+ * would start a perpetual refetch loop (delete → refetch → delete → …).
+ * Instead the observation is refreshed and nothing re-runs.
+ */
+export function getObservedSet<K extends any[]>(
+  fn: Func,
+  cacheProvider: CacheProvider<any, K>
+): Set<string> {
+  const context = getInjectContext(fn);
+  let registry = context[observedKey] as PendingRegistry | undefined;
+  if (!registry) {
+    registry = new Map();
+    context[observedKey] = registry;
+  }
+  let observed = registry.get(cacheProvider);
+  if (!observed) registry.set(cacheProvider, (observed = new Set()));
+  return observed;
+}
+
 /**
  * Subscribes a `useCache` consumer to its provider's deletion events — the
  * passive half of the invalidation model. Whenever entries are removed
@@ -131,8 +156,20 @@ export function bindCacheRevalidation<K extends any[]>(
         if (seen.has(key) && !pending.has(key)) hits.push(args);
       }
       if (hits.length === 0) return;
+      // GC-exempt entries are never deleted by the sweep (they are never in
+      // `e.deleted`), so every deletion that reaches here is a real
+      // invalidation — purge-and-refetch runs exactly as before. The
+      // observed-set below only repairs bookkeeping when a deletion races a
+      // revalidation's own settle.
+      const observed = getObservedSet(injectableFn, cacheProvider);
       emitStale(getStaleStore(injectableFn), true);
       for (const args of hits) {
+        // The deleted entry may carry a stale observation record (deleted →
+        // refetch rewrote it). Re-mark so the refetch's fresh entry stays
+        // exempt while the consumer remains mounted.
+        if (observed.has(stableHash(args))) {
+          (cacheProvider.observe as (a: any[][], on: boolean) => void)?.([args], true);
+        }
         pending.add(stableHash(args));
         // Fire-and-forget like the old active revalidation: failures surface
         // through the target's error store (useError), never as an unhandled

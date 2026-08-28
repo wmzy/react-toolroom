@@ -99,6 +99,7 @@ import {
   InvalidateTarget,
   ValidatedTargets,
   bindCacheRevalidation,
+  getObservedSet,
   getPendingSet,
   invalidate,
   isCacheProvider
@@ -516,6 +517,44 @@ export function useCache<AF extends AsyncFunc>(
   );
 
   useEffect(cacheProvider.use, []);
+
+  // GC exemption while mounted: the tuples this consumer has fetched stay
+  // observed for as long as it is on screen, so the provider's per-entry
+  // sweep never reaps an entry someone is watching (TanStack Query keeps a
+  // query with observers alive the same way). A tail wrapper — registered
+  // during render like every hook of the chain — marks each call's tuple
+  // both on the provider (the GC exemption) and in the injectable's
+  // observed-set (so passive revalidation can tell a GC deletion of a live
+  // entry from a real invalidation); the effect below catches up with
+  // pre-existing tuples and unmarks everything on unmount, handing the
+  // entries back to the provider's GC clock. Providers without the
+  // optional `observe` member simply skip this — the sweep stays args-blind
+  // for them.
+  const observe = cacheProvider.observe;
+  const observedSet = getObservedSet(injectableFn, cacheProvider);
+  useInject(
+    injectableFn,
+    (f: AF) => {
+      if (!observe) return f;
+      return ((...callArgs: Parameters<AF>) => {
+        observe([callArgs], true);
+        observedSet.add(stableHash(callArgs));
+        return f(...callArgs);
+      }) as AF;
+    }
+  );
+  useEffect(() => {
+    if (!observe) return;
+    // Catch up with anything fetched before this effect ran (the wrapper
+    // only sees calls made after its registration).
+    const tuples = [...seen.values()] as Parameters<AF>[];
+    observe(tuples, true);
+    for (const tuple of tuples) observedSet.add(stableHash(tuple));
+    return () => {
+      observe([...seen.values()] as Parameters<AF>[], false);
+      observedSet.clear();
+    };
+  }, [cacheProvider, seen, observe, observedSet]);
 
   // Passive revalidation — the other half of the invalidation model:
   // `invalidate()` (and the `invalidates` option of `useMutation`) only

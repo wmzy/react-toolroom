@@ -80,6 +80,15 @@ export type CacheProvider<T, K extends any[]> = {
   delete: (k: K) => void;
   clear: () => void;
   use: () => () => void;
+  /**
+   * Marks/unmarks args tuples as observed by a mounted `useCache`
+   * consumer. Observed entries are exempt from garbage collection — the
+   * memory provider's per-entry sweep (`cacheTime`) skips them, exactly
+   * TanStack Query's "a query with observers is never collected";
+   * unobserving hands them back to the GC clock. Optional: custom
+   * providers may omit it, and callers must feature-detect.
+   */
+  observe?: (args: K[], on: boolean) => void;
   // The members below are optional so existing custom providers (localStorage,
   // IndexedDB, no-op stubs, …) keep compiling and stay semantically valid —
   // only the memory provider ships them. Callers must feature-detect
