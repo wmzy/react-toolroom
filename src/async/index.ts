@@ -523,23 +523,25 @@ export function useCache<AF extends AsyncFunc>(
   // sweep never reaps an entry someone is watching (TanStack Query keeps a
   // query with observers alive the same way). Observation is counted per
   // consumer — the fetch wrapper records the reference for its consumer
-  // (wrapperRefSet) whenever it records `seen`, and the consumer's unmount
-  // releases them. The provider-side `observe` marks the key exempt; the
-  // provider counts references per key, so with several consumers sharing
-  // a key the exemption outlives each of them until the last one unmounts.
-  // The wrapper chain is shared by every consumer of the same underlying
-  // function, so the wrapper marks eagerly and each consumer's own cleanup
-  // effect releases its references at unmount. Providers without the
-  // optional `observe` member simply skip this — the sweep stays args-blind
-  // for them.
+  // whenever it records `seen` (idempotently per key), and the consumer's
+  // unmount releases them. The wrapper chain is shared by every consumer
+  // of the same underlying function, so the wrapper marks eagerly and each
+  // consumer's own cleanup effect releases its references at unmount.
+  // Providers without the optional `observe` member simply skip this —
+  // the sweep stays args-blind for them.
   const observe = cacheProvider.observe;
   const observedSet = getObservedSet(injectableFn, cacheProvider);
   useEffect(() => {
     if (!observe) return;
-    // Catch up with anything fetched before this effect ran.
-    const tuples = [...seen.values()] as Parameters<AF>[];
-    if (tuples.length) observe(tuples, true);
-    for (const tuple of tuples) observedSet.add(stableHash(tuple));
+    // No observe-on here: the wrapper is the only marking point, and it is
+    // idempotent per key (`if (!seen.has(key))`). The useInject wrapper is
+    // installed during the insertion-effect phase, before any passive
+    // effect — including this one — runs, so any call made before this
+    // effect already passed through the wrapper and was counted. Marking
+    // again here would double-count keys first fetched before this effect
+    // ran (trigger hook declared above `useCache`, or a child calling while
+    // a parent holds `useCache`), leaking permanent exemptions.
+    for (const tuple of seen.values()) observedSet.add(stableHash(tuple));
     return () => {
       // Release this consumer's references. `seen` is this consumer's own
       // map, dropped with the hook instance — the tuples it releases are

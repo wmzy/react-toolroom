@@ -2406,6 +2406,73 @@ describe('async hooks', () => {
       vi.useRealTimers();
     });
 
+    it('should reclaim when the trigger hook is declared before useCache (T6)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Consumer({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        // 触发 hook 声明在 useCache 之前：首次调用发生在 catch-up
+        // effect 运行前。wrapper 的幂等 on 必须是唯一计数点。
+        useRun(injectable, [id]);
+        useCache(injectable, cache, 60000);
+        return <span>x</span>;
+      }
+
+      const {unmount} = render(<Consumer id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(cache.snapshot!()).toHaveLength(1);
+
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      // 无残留计数：条目按时回收。
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
+    it('should reclaim when a child calls while the parent holds useCache (T7)', async () => {
+      vi.useFakeTimers();
+
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+
+      function Child({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        // 子组件 effect 先于父组件 effect 运行：调用先于父的 catch-up。
+        useEffect(() => {
+          void injectable(id);
+        }, [injectable, id]);
+        return <span>x</span>;
+      }
+
+      function Parent({id}: {id: number}) {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        return <Child id={id} />;
+      }
+
+      const {unmount} = render(<Parent id={1} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(cache.snapshot!()).toEqual([]);
+
+      vi.useRealTimers();
+    });
+
     it('should return cached data on cache hit', async () => {
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
       const cache = createMemoryCacheProvider<string, [number]>({
