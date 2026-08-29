@@ -86,7 +86,10 @@ export type ErrorStore = {
  * other's injectable-level `loading`/`error`. Never rendered directly.
  */
 export type KeyedStore = {
-  /** One entry per key any live call has started under. */
+  /** One entry per key any live call has started under. Bounded: clean
+   * fully-drained keys are reclaimed by the store's own settle/release
+   * paths, and failure slots (observable by contract) are capped at
+   * {@link KEYED_SLOTS_LIMIT} with oldest-quiescent-first eviction. */
   keyed: Map<string, {count: number; error: any; failureCount: number}>;
   /**
    * Monotonic version bumped on EVERY keyed mutation; the single
@@ -285,6 +288,13 @@ export function beginKeyedCall(store: KeyedStore, key: string): () => void {
   if (!slot) {
     slot = {count: 0, error: undefined, failureCount: 0};
     store.keyed.set(key, slot);
+    evictKeyedSlots(store, key);
+  } else {
+    // LRU refresh: re-inserting an existing key moves it to the back of
+    // the map's insertion order, so eviction (below) drops the key whose
+    // last CALL is oldest — retention follows last use, not first insert.
+    store.keyed.delete(key);
+    store.keyed.set(key, slot);
   }
   slot.count += 1;
   store.version += 1;
@@ -294,7 +304,20 @@ export function beginKeyedCall(store: KeyedStore, key: string): () => void {
     if (done) return;
     done = true;
     const current = store.keyed.get(key);
-    if (current) current.count -= 1;
+    if (current) {
+      current.count -= 1;
+      // The release is the terminal event of an out-of-order-settled key
+      // (the older call's emission was dropped before this ran), so it
+      // probes the same clean-drained reclaim the emission paths probe —
+      // otherwise a `{count: 0, failureCount: 0}` husk would sit in the
+      // map forever: nothing observable, pure retention.
+      reclaimKeyedSlot(store, key);
+      // Draining is also what un-blocks eviction: a burst of concurrent
+      // distinct keys overshoots the cap while in flight (nothing is
+      // evictable), and without this probe the overshoot would persist
+      // until some LATER insertion ran one.
+      evictKeyedSlots(store, key);
+    }
     store.version += 1;
     for (const listener of store.listeners) listener(store.version);
   };
@@ -306,6 +329,10 @@ export function beginKeyedCall(store: KeyedStore, key: string): () => void {
  * a slow old call can never clobber the outcome of a newer call of the
  * same args — the per-key analogue of {@link emitError}'s guard.
  * `undefined` error clears the slot's bookkeeping; a failure tallies it.
+ * Every path — applied success, applied failure, dropped — first counts
+ * the ticket as emitted and then probes {@link reclaimKeyedSlot}: a
+ * clean, fully drained key must not outlive the last event that quiesced
+ * it, no matter which of the three paths that event took.
  */
 export function emitKeyedError(
   store: KeyedStore,
@@ -314,7 +341,15 @@ export function emitKeyedError(
   seq: number
 ) {
   const guard = keyedSeqOf(store, key);
-  if (seq < guard.applied) return;
+  guard.emitted += 1;
+  const stale = seq < guard.applied;
+  if (stale) {
+    // A dropped emission is still an EMITTED ticket (it counts toward
+    // quiescence above) and, for out-of-order-settled keys, the terminal
+    // event after which nobody would probe the reclaim — probe it here.
+    reclaimKeyedSlot(store, key);
+    return;
+  }
   guard.applied = seq;
   let slot = store.keyed.get(key);
   if (!slot) {
@@ -325,21 +360,32 @@ export function emitKeyedError(
     // observable (loading reads count, error reads this emission).
     slot = {count: 0, error: undefined, failureCount: 0};
     store.keyed.set(key, slot);
+    evictKeyedSlots(store, key);
   }
   slot.error = error;
   slot.failureCount = error === undefined ? 0 : slot.failureCount + 1;
-  // A success on a fully drained slot leaves nothing observable — reclaim
-  // it (its failure tally was that drained slot's outcome).
-  if (error === undefined && slot.count <= 0) store.keyed.delete(key);
+  // A success on a fully drained key leaves nothing observable — reclaim
+  // the slot together with its guard entry (bounded retention). A failure
+  // keeps the slot observable by contract; it leaves via the cap.
+  reclaimKeyedSlot(store, key);
   store.version += 1;
   for (const listener of store.listeners) listener(store.version);
 }
 
 // Per-store, per-key error sequencing: the failure of an older call must
 // never overwrite the settled outcome of a newer call OF THE SAME KEY.
-const keyedSeqs = new WeakMap<
+// `emitted` counts the tickets that already ran their (applied or dropped)
+// emission; `next === emitted` is therefore exactly "no ticket of this
+// numbering can still arrive" — the safety condition under which the
+// entry itself may be deleted (a late old ticket re-applied against a
+// FRESH entry's numbering would compare against `applied: 0` and wrongly
+// win). `applied` alone cannot express it: tickets below `applied` may
+// still be pending when emissions land out of order.
+// Exported for the retention regression tests only — base.ts is an
+// internal module (the package entry points re-export nothing from it).
+export const keyedSeqs = new WeakMap<
   KeyedStore,
-  Map<string, {next: number; applied: number}>
+  Map<string, {next: number; applied: number; emitted: number}>
 >();
 
 function keyedSeqOf(store: KeyedStore, key: string) {
@@ -350,10 +396,77 @@ function keyedSeqOf(store: KeyedStore, key: string) {
   }
   let seq = perStore.get(key);
   if (!seq) {
-    seq = {next: 0, applied: 0};
+    seq = {next: 0, applied: 0, emitted: 0};
     perStore.set(key, seq);
   }
   return seq;
+}
+
+// The seq-guard entry of one key WITHOUT creating it: probing must not
+// materialize entries for keys that are then kept (that would itself be
+// the leak the probing exists to prevent).
+const keyedSeqEntry = (
+  store: KeyedStore,
+  key: string
+): {next: number; applied: number; emitted: number} | undefined =>
+  keyedSeqs.get(store)?.get(key);
+
+// A key is QUIESCENT when no call is in flight (`count <= 0`) and every
+// reserved ticket has emitted (`next === emitted`): nothing about the old
+// numbering can still arrive, so both the slot and its guard entry may go.
+const keyedQuiescent = (
+  store: KeyedStore,
+  key: string,
+  slot: {count: number}
+) => {
+  if (slot.count > 0) return false;
+  const seq = keyedSeqEntry(store, key);
+  return seq === undefined || seq.next === seq.emitted;
+};
+
+// Reclaims `key` — slot AND guard entry together — when the key is
+// quiescent and the slot holds nothing observable (a success settled, or
+// nothing). A clean slot and an absent one read identically through the
+// keyed status hooks, so no version bump accompanies the reclaim.
+// Failure slots are NOT reclaimable here: their outcome is contract state
+// ("a later same-args success clears it") — they leave through the cap
+// below instead.
+function reclaimKeyedSlot(store: KeyedStore, key: string): boolean {
+  const slot = store.keyed.get(key);
+  if (!slot || slot.error !== undefined || slot.failureCount !== 0)
+    return false;
+  if (!keyedQuiescent(store, key, slot)) return false;
+  store.keyed.delete(key);
+  keyedSeqs.get(store)?.delete(key);
+  return true;
+}
+
+// Retention cap of one injectable's keyed slots. Without it the map grows
+// without bound: a failure slot is kept observable by contract, so an app
+// enumerating many distinct args (infinite scroll, filter churn) would
+// retain one slot — key string, Error reference and all — per args tuple
+// it ever failed on, forever. When an insertion exceeds the cap the
+// OLDEST quiescent slot (never one with live calls or pending tickets, so
+// the begin/release pairing invariants are untouched) is evicted, slot
+// and guard entry together. Eviction is observable (a displayed per-key
+// error disappears) — the trade every bounded observability surface makes;
+// insertion order doubles as the LRU clock, refreshed on every begin.
+export const KEYED_SLOTS_LIMIT = 100;
+
+// Enforces {@link KEYED_SLOTS_LIMIT}: called after `keep` was inserted
+// and whenever a release drains a call — both the moments an over-limit
+// map can have become evictable. Evicts oldest-first among quiescent
+// keys. All-busy maps overshoot transiently — the next probe retries;
+// in-flight keys are bounded by real concurrency. Callers (begin/emit/
+// release) all version-bump afterwards, which carries the eviction to
+// observers.
+function evictKeyedSlots(store: KeyedStore, keep: string) {
+  for (const [candidate, slot] of store.keyed) {
+    if (store.keyed.size <= KEYED_SLOTS_LIMIT) break;
+    if (candidate === keep || !keyedQuiescent(store, candidate, slot)) continue;
+    store.keyed.delete(candidate);
+    keyedSeqs.get(store)?.delete(candidate);
+  }
 }
 
 /** Reserves the per-key error ticket of a call (call order, per key). */

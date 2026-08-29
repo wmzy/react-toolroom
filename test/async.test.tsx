@@ -4837,4 +4837,177 @@ describe('useArgsStatus (per-key loading and error)', () => {
     expect(latest.loading).toBe(false);
     expect(latest.error).toBeUndefined();
   });
+
+  it('clean settled keys reclaim their slots — no permanent per-key retention', async () => {
+    const fetchData = vi.fn(async (n: number) => `v${n}`);
+    let injectable!: (n: number) => Promise<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      return null;
+    }
+    render(<TestComponent />);
+
+    // The reviewer's A/B heap measurement (every args key permanently
+    // retained ~65B — slot plus seq-guard entry) restated as the
+    // deterministic observable: after 20 distinct keys each settle and
+    // drain, the keyed map must be EMPTY — the guard-entry half of the
+    // reclaim is covered behaviorally by the slot-reuse test below.
+    for (let i = 0; i < 20; i++) {
+      await act(async () => {
+        await injectable(i);
+      });
+    }
+    const {getKeyedStore, keyedSeqs} = await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.size).toBe(0);
+    // The guard-entry half of the retention: keyedSeqs' per-key entries
+    // must go WITH their slots — 0.14.0 kept one entry (key string plus
+    // {next, applied}) per args key forever, the reviewer's ~65B/key
+    // A/B heap delta.
+    expect(keyedSeqs.get(keyed)?.size ?? 0).toBe(0);
+  });
+
+  it('failure slots are capped: 300 failed distinct args retain at most KEYED_SLOTS_LIMIT', async () => {
+    const fetchData = vi.fn(async (n: number) => {
+      throw new Error(`boom-${n}`);
+    });
+    let injectable!: (n: number) => Promise<string>;
+    let latest!: {loading: boolean; error: unknown; failureCount: number};
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latest = useArgsStatus(fn, [299]);
+      return null;
+    }
+    render(<TestComponent />);
+
+    // The reviewer's repro: 300 failing args left 300 slots — Error
+    // references included — in the map forever. With the cap, sequential
+    // inserts evict oldest-first quiescent slots, so exactly the newest
+    // LIMIT keys survive.
+    for (let i = 0; i < 300; i++) {
+      await act(async () => {
+        await injectable(i).catch(() => {});
+      });
+    }
+    const {getKeyedStore, KEYED_SLOTS_LIMIT, keyedSeqs} =
+      await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.size).toBe(KEYED_SLOTS_LIMIT);
+    // Evicted keys took their guard entries along — the cap bounds BOTH
+    // maps, not just the slot map.
+    expect(keyedSeqs.get(keyed)?.size ?? 0).toBeLessThanOrEqual(
+      KEYED_SLOTS_LIMIT
+    );
+    // The LIVE tail keeps its contract state: the newest failure stays
+    // observable — eviction drops the oldest, never the fresh outcome.
+    expect(keyed.keyed.get(stableHash([299]))).toBeDefined();
+    expect(latest.error).toBeInstanceOf(Error);
+    expect(latest.failureCount).toBe(1);
+  });
+
+  it('a concurrent burst of failed keys drains back under the cap', async () => {
+    const fetchData = vi.fn((n: number) => Promise.reject(new Error(`x${n}`)));
+    let injectable!: (n: number) => Promise<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      return null;
+    }
+    render(<TestComponent />);
+
+    // 150 DISTINCT keys fired without waiting: while in flight nothing is
+    // evictable, so the map overshoots — but the overshoot must not
+    // OUTLIVE the burst (0.14.0 never evicted on drain at all).
+    await act(async () => {
+      await Promise.all(
+        Array.from({length: 150}, (_, i) => injectable(i).catch(() => {}))
+      );
+    });
+    const {getKeyedStore, KEYED_SLOTS_LIMIT} =
+      await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.size).toBeLessThanOrEqual(KEYED_SLOTS_LIMIT);
+  });
+
+  it('out-of-order settlement leaves no husk, and slot reuse keeps the seq guard honest', async () => {
+    const resolvers: ((v: string) => void)[] = [];
+    const fetchData = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+    let injectable!: () => Promise<string>;
+    let latest!: {loading: boolean; error: unknown; failureCount: number};
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latest = useArgsStatus(fn, []);
+      return null;
+    }
+    render(<TestComponent />);
+
+    // The reviewer's husk repro: the NEWER call settles first (success,
+    // but the older call is still in flight → no reclaim then); the older
+    // call settles LAST — its emission is dropped by the per-key guard,
+    // the exact path whose reclaim branch never ran in 0.14.0.
+    let p1!: Promise<string>;
+    let p2!: Promise<string>;
+    await act(async () => {
+      p1 = injectable();
+    });
+    await act(async () => {
+      p2 = injectable();
+    });
+    await act(async () => {
+      resolvers[1]!('newer-ok');
+      await p2;
+    });
+    expect(latest.loading).toBe(true); // the older call still runs
+    await act(async () => {
+      resolvers[0]!('older-ok');
+      await p1;
+    });
+    expect(latest.loading).toBe(false);
+    expect(latest.error).toBeUndefined();
+    const {getKeyedStore} = await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.get(stableHash([]))).toBeUndefined();
+    expect(keyed.keyed.size).toBe(0);
+
+    // The slot AND its guard entry were reclaimed together, so the key is
+    // reused under a FRESH ticket numbering. The guard must stay honest
+    // there: an older call settling LAST with a failure must not surface
+    // over a newer success — the exact regression a guard-entry deletion
+    // with a ticket still pending would produce.
+    const settles: Array<(v?: string) => void> = [];
+    fetchData.mockImplementation(
+      () =>
+        new Promise<string>((resolve, reject) => {
+          settles.push((v) =>
+            v === undefined ? reject(new Error('old-fail')) : resolve(v)
+          );
+        })
+    );
+    let p3!: Promise<string>;
+    let p4!: Promise<string>;
+    await act(async () => {
+      p3 = injectable().catch(() => 'caught-old-fail');
+      p4 = injectable();
+    });
+    await act(async () => {
+      settles[1]!('fresh-ok');
+      await p4;
+    });
+    await act(async () => {
+      settles[0]!(); // the older call now rejects — stale ticket
+      await p3;
+    });
+    expect(latest.error).toBeUndefined();
+    expect(latest.failureCount).toBe(0);
+    expect(keyed.keyed.get(stableHash([]))).toBeUndefined();
+    expect(keyed.keyed.size).toBe(0);
+  });
 });

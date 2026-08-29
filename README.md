@@ -515,7 +515,7 @@ function Row({id}: {id: number}) {
 }
 ```
 
-The keyed slots ride the same wrapper chain as everything else (the hook registers the read-stack wrappers itself, `useCache`-style), observability never changes call semantics, and each key's slot is reclaimed once its calls drain and its outcome is superseded.
+The keyed slots ride the same wrapper chain as everything else (the hook registers the read-stack wrappers itself, `useCache`-style), observability never changes call semantics, and each key's slot is reclaimed once its calls drain and its outcome is superseded. Retention is bounded: a key holding a failure outcome stays observable until a same-key success clears it, and the store keeps at most 100 such keys per injectable, evicting the longest-idle drained ones first — a screen enumerating many distinct args (infinite scroll, filter churn) cannot grow the map without bound.
 
 ### Suspend instead of a skeleton — `useSuspenseResult`
 
@@ -714,7 +714,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6.5 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 5.64 kB.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6.75 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 6.59 kB.
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
