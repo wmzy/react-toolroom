@@ -32,6 +32,7 @@ import {
   useDedup,
   usePolling,
   useFocusRevalidate,
+  useArgsStatus,
   stableHash
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
@@ -4455,5 +4456,305 @@ describe('async hooks', () => {
         expect(screen.getByTestId('result').textContent).toBe('page 2 fresh');
       });
     });
+  });
+});
+
+describe('useArgsStatus (per-key loading and error)', () => {
+  // THE regression this hook exists for: before it, loading/error lived on
+  // injectable-level stores, so two concurrent calls of one injectable with
+  // different args shared one flag and one error slot — whichever settled
+  // last won, and a sibling row's spinner/error was clobbered.
+  // Note: each Row below creates its OWN injectable instance (useInjectable
+  // per component), so the shared-slot scenario requires one host that both
+  // observers and callers go through — that is the shape every test here
+  // uses (one `useInjectable`, lifted to the test via closure capture).
+
+  it('independent loading across two consumers sharing one injectable', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    const fetchData = vi.fn(async (id: string) => {
+      return new Promise<string>((resolve) => {
+        resolvers[id] = resolve;
+      });
+    });
+
+    let injectable!: (id: string) => Promise<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      const a = useArgsStatus(fn, ['a']);
+      const b = useArgsStatus(fn, ['b']);
+      return (
+        <div>
+          <div data-testid='row-a'>{a.loading ? 'loading' : 'done'}</div>
+          <div data-testid='row-b'>{b.loading ? 'loading' : 'done'}</div>
+        </div>
+      );
+    }
+
+    render(<TestComponent />);
+
+    // Two concurrent calls, different args, same injectable.
+    await act(async () => {
+      void injectable('a');
+      void injectable('b');
+    });
+    expect(screen.getByTestId('row-a').textContent).toBe('loading');
+    expect(screen.getByTestId('row-b').textContent).toBe('loading');
+
+    // `a` settles: ONLY row a clears — the injectable-level loading flag
+    // (count > 0) is still true, but row b's keyed slot is untouched.
+    await act(async () => {
+      resolvers['a']!('A');
+    });
+    expect(screen.getByTestId('row-a').textContent).toBe('done');
+    expect(screen.getByTestId('row-b').textContent).toBe('loading');
+
+    await act(async () => {
+      resolvers['b']!('B');
+    });
+    expect(screen.getByTestId('row-a').textContent).toBe('done');
+    expect(screen.getByTestId('row-b').textContent).toBe('done');
+  });
+
+  it('independent errors: one args failure never shows on the sibling key', async () => {
+    const resolvers: Record<string, () => void> = {};
+    const fetchData = vi.fn(async (id: string): Promise<void> => {
+      return new Promise<void>((resolve, reject) => {
+        resolvers[id] =
+          id === 'bad' ? () => reject(new Error('boom')) : resolve;
+      });
+    });
+
+    let injectable!: (id: string) => Promise<void>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      const good = useArgsStatus(fn, ['good']);
+      const bad = useArgsStatus(fn, ['bad']);
+      return (
+        <div>
+          <div data-testid='good'>{good.error ? 'failed' : 'ok'}</div>
+          <div data-testid='bad'>{bad.error ? 'failed' : 'ok'}</div>
+        </div>
+      );
+    }
+
+    render(<TestComponent />);
+
+    await act(async () => {
+      void injectable('good');
+      void injectable('bad');
+    });
+    await act(async () => {
+      resolvers['bad']!();
+    });
+
+    // The failure of `bad` is visible ONLY on the bad row.
+    expect(screen.getByTestId('bad').textContent).toBe('failed');
+    expect(screen.getByTestId('good').textContent).toBe('ok');
+
+    // A same-args success clears its own slot only.
+    await act(async () => {
+      resolvers['good']!();
+    });
+    expect(screen.getByTestId('good').textContent).toBe('ok');
+    expect(screen.getByTestId('bad').textContent).toBe('failed');
+  });
+
+  it('reports the result scoped to its own key (data provenance)', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    const fetchData = vi.fn(
+      (id: string) =>
+        new Promise<string>((resolve) => {
+          resolvers[id] = resolve;
+        })
+    );
+    let injectable!: (id: string) => Promise<string>;
+    let key = 'a';
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      const status = useArgsStatus(fn, [key]);
+      return <div data-testid='out'>{status.data ?? 'none'}</div>;
+    }
+
+    render(<TestComponent />);
+    expect(screen.getByTestId('out').textContent).toBe('none');
+
+    let promise!: Promise<string>;
+    await act(async () => {
+      promise = injectable('a');
+    });
+    await act(async () => {
+      resolvers['a']!('result-for-a');
+      await promise;
+    });
+    expect(screen.getByTestId('out').textContent).toBe('result-for-a');
+
+    // While `b`'s call is in flight and `a`'s result is on display, the
+    // scoped view shows nothing (provenance mismatch), not the stale key.
+    key = 'b';
+    await act(async () => {
+      promise = injectable('b');
+    });
+    expect(screen.getByTestId('out').textContent).toBe('none');
+    await act(async () => {
+      resolvers['b']!('result-for-b');
+      await promise;
+    });
+    expect(screen.getByTestId('out').textContent).toBe('result-for-b');
+  });
+
+  it('StrictMode double effects and repeated calls pair begin/end exactly once per call', async () => {
+    // Per-call resolver queue: every invocation registers its own resolve.
+    const resolvers: ((v: string) => void)[] = [];
+    const fetchData = vi.fn(async (id: string) => {
+      return new Promise<string>((resolve) => {
+        resolvers.push(resolve);
+      });
+    });
+
+    let injectable!: (id: string) => Promise<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      const a = useArgsStatus(fn, ['a']);
+      return <div data-testid='row'>{a.loading ? 'loading' : 'done'}</div>;
+    }
+
+    render(
+      <StrictMode>
+        <TestComponent />
+      </StrictMode>
+    );
+
+    // The same call fired three times (event handler + StrictMode-style
+    // re-entry): the slot counts up to 3, not less, and drains to 0.
+    let p1!: Promise<string>;
+    let p2!: Promise<string>;
+    let p3!: Promise<string>;
+    await act(async () => {
+      p1 = injectable('a');
+      p2 = injectable('a');
+      p3 = injectable('a');
+    });
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    await act(async () => {
+      resolvers[0]!('1');
+      await p1;
+    });
+    // two calls still in flight → still loading (per-key count = 2)
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    await act(async () => {
+      resolvers[1]!('2');
+      await p2;
+    });
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    await act(async () => {
+      resolvers[2]!('3');
+      await p3;
+    });
+    expect(screen.getByTestId('row').textContent).toBe('done');
+
+    // The slot is fully drained — a subsequent render observes no
+    // leftover count (the deleted slot is the pairing proof).
+    const {getKeyedStore} = await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.get(stableHash(['a']))).toBeUndefined();
+  });
+
+  it('a rejected call releases its keyed slot and tallies failureCount', async () => {
+    const fetchData = vi.fn(async (): Promise<string> => {
+      throw new Error('x');
+    });
+    let injectable!: () => Promise<string>;
+    let latest!: {loading: boolean; error: unknown; failureCount: number};
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn as never;
+      latest = useArgsStatus(fn, []);
+      return null;
+    }
+    render(<TestComponent />);
+
+    await act(async () => {
+      await injectable().catch(() => {});
+    });
+    expect(latest.loading).toBe(false);
+    expect(latest.error).toBeInstanceOf(Error);
+    expect(latest.failureCount).toBe(1);
+
+    // The slot survives the settle (it holds the outcome) but holds no
+    // in-flight count; a success clears the outcome and tally.
+    const {getKeyedStore} = await import('../src/async/base');
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.get(stableHash([]))!.count).toBe(0);
+
+    fetchData.mockImplementation(async () => 'ok');
+    await act(async () => {
+      await injectable();
+    });
+    expect(latest.loading).toBe(false);
+    expect(latest.error).toBeUndefined();
+    expect(latest.failureCount).toBe(0);
+    // The success settled the drained slot's outcome and reclaimed the
+    // entry — no keyed residue after a clean settle (reclaim proof).
+    expect(keyed.keyed.get(stableHash([]))).toBeUndefined();
+  });
+
+  it('slow old call never clobbers the outcome of a newer same-args call', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    let flip = false;
+    const fetchData = vi.fn(async () => {
+      if (flip) {
+        return new Promise<string>((resolve) => {
+          resolvers.slow = resolve;
+        });
+      }
+      return 'fast-ok';
+    });
+    let injectable!: () => Promise<string>;
+    let latest!: {loading: boolean; error: unknown};
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latest = useArgsStatus(fn, []);
+      return null;
+    }
+    render(<TestComponent />);
+
+    // Call 1 succeeds quickly; call 2 hangs (slow path); call 3 succeeds.
+    await act(async () => {
+      await injectable();
+    });
+    expect(latest.error).toBeUndefined();
+
+    flip = true;
+    let slow!: Promise<string>;
+    await act(async () => {
+      slow = injectable();
+    });
+    expect(latest.loading).toBe(true);
+    flip = false;
+    await act(async () => {
+      await injectable();
+    });
+    expect(latest.loading).toBe(true);
+    // The fresh success cleared the error slot while the slow call is
+    // still in flight.
+    expect(latest.error).toBeUndefined();
+
+    // The slow call resolves LATER: the per-key seq guard keeps the newer
+    // success's cleared state authoritative — no resurrected error, and
+    // the loading flag drains exactly at the slow call's end.
+    await act(async () => {
+      resolvers.slow!('late');
+      await slow;
+    });
+    expect(latest.loading).toBe(false);
+    expect(latest.error).toBeUndefined();
   });
 });

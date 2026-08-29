@@ -30,6 +30,13 @@ export type ResultStore = {
   lastResult: any;
   hasResult: boolean;
   /**
+   * Monotonic counter bumped whenever `lastResult`/`lastArgs`/`hasResult`
+   * change — a cheap subscription point for keyed observers that must
+   * re-check provenance on every result movement. Uninteresting to plain
+   * `useResult` consumers (they subscribe on the value itself).
+   */
+  version: number;
+  /**
    * The args tuple the current `lastResult` was fetched with, when the
    * emitting wrapper knew it. Swapped together with `lastResult` by every
    * applied emission — `undefined` means "provenance unknown" (an
@@ -70,12 +77,34 @@ export type ErrorStore = {
   listeners: Set<(value: any) => void>;
 };
 
+/**
+ * Per-args-key bookkeeping shared by every wrapper of one injectable: an
+ * in-flight count and the last settle outcome per structural key. It is
+ * the observable surface behind {@link useArgsStatus}-style hooks, which
+ * read a single key's slots — so two concurrent calls with different args
+ * of the same injectable report independently instead of overwriting each
+ * other's injectable-level `loading`/`error`. Never rendered directly.
+ */
+export type KeyedStore = {
+  /** One entry per key any live call has started under. */
+  keyed: Map<string, {count: number; error: any; failureCount: number}>;
+  /**
+   * Monotonic version bumped on EVERY keyed mutation; the single
+   * subscription point for `useStoreValue` consumers (a per-key listener
+   * set would allocate per key without adding precision — a version bump
+   * plus a keyed snapshot read is strictly cheaper).
+   */
+  version: number;
+  listeners: Set<(version: number) => void>;
+};
+
 // Module-private store keys. The symbols are intentionally not exported:
 // stores must only be reached through the helpers below.
 const resultKey = Symbol('result store');
 const loadingKey = Symbol('loading store');
 const staleKey = Symbol('stale store');
 const errorKey = Symbol('error store');
+const keyedKey = Symbol('keyed store');
 
 // Per-store call sequencing: the result of an older call must never
 // overwrite the result of a newer one, no matter which wrapper emits it or
@@ -101,7 +130,12 @@ export function getResultStore(fn: Func): ResultStore {
   const context = getInjectContext(fn);
   let store = context[resultKey] as ResultStore | undefined;
   if (!store) {
-    store = {listeners: new Set(), lastResult: undefined, hasResult: false};
+    store = {
+      listeners: new Set(),
+      lastResult: undefined,
+      hasResult: false,
+      version: 0
+    };
     context[resultKey] = store;
   }
   return store;
@@ -207,6 +241,7 @@ export function emitResult(
   store.lastResult = result;
   store.hasResult = true;
   store.lastArgs = args;
+  store.version += 1;
   for (const listener of store.listeners) listener(result);
 }
 
@@ -220,6 +255,110 @@ export function emitLoading(store: LoadingStore, count: number) {
 export function emitStale(store: StaleStore, stale: boolean) {
   store.stale = stale;
   for (const listener of store.listeners) listener(stale);
+}
+
+/** Lazily creates and returns the shared keyed bookkeeping of an injectable. */
+export function getKeyedStore(fn: Func): KeyedStore {
+  const context = getInjectContext(fn);
+  let store = context[keyedKey] as KeyedStore | undefined;
+  if (!store) {
+    store = {keyed: new Map(), version: 0, listeners: new Set()};
+    context[keyedKey] = store;
+  }
+  return store;
+}
+
+/**
+ * Marks one call of `key` started (count 0→1 on first, further concurrent
+ * calls increment) and returns the exact undo: count−1. The slot itself is
+ * NOT deleted here: wrapper order is unspecified (the onion layers settle
+ * inner-first), so the sibling keyed-error emission of the same call may
+ * run before or after this release — deleting here would race it. The
+ * slot is reclaimed by {@link emitKeyedError} instead: a success on a
+ * drained slot deletes it, a failure keeps it observable, and a failure
+ * emission that finds no slot recreates one (a drained slot holding the
+ * outcome). The returned release runs at most once (idempotent by `done`),
+ * mirroring the `use()` pairing discipline of the memory provider.
+ */
+export function beginKeyedCall(store: KeyedStore, key: string): () => void {
+  let slot = store.keyed.get(key);
+  if (!slot) {
+    slot = {count: 0, error: undefined, failureCount: 0};
+    store.keyed.set(key, slot);
+  }
+  slot.count += 1;
+  store.version += 1;
+  for (const listener of store.listeners) listener(store.version);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    const current = store.keyed.get(key);
+    if (current) current.count -= 1;
+    store.version += 1;
+    for (const listener of store.listeners) listener(store.version);
+  };
+}
+
+/**
+ * Records the settle outcome of one call under its key. An emission whose
+ * ticket is older than the latest applied one for THAT key is dropped, so
+ * a slow old call can never clobber the outcome of a newer call of the
+ * same args — the per-key analogue of {@link emitError}'s guard.
+ * `undefined` error clears the slot's bookkeeping; a failure tallies it.
+ */
+export function emitKeyedError(
+  store: KeyedStore,
+  key: string,
+  error: any,
+  seq: number
+) {
+  const guard = keyedSeqOf(store, key);
+  if (seq < guard.applied) return;
+  guard.applied = seq;
+  let slot = store.keyed.get(key);
+  if (!slot) {
+    // The settle order between this emission and beginKeyedCall's release
+    // is unspecified (wrapper order is unspecified), so a settled-then-
+    // drained call can find no slot: recreate a drained one to hold the
+    // outcome. A stale zero-count slot without any settle ticket is never
+    // observable (loading reads count, error reads this emission).
+    slot = {count: 0, error: undefined, failureCount: 0};
+    store.keyed.set(key, slot);
+  }
+  slot.error = error;
+  slot.failureCount = error === undefined ? 0 : slot.failureCount + 1;
+  // A success on a fully drained slot leaves nothing observable — reclaim
+  // it (its failure tally was that drained slot's outcome).
+  if (error === undefined && slot.count <= 0) store.keyed.delete(key);
+  store.version += 1;
+  for (const listener of store.listeners) listener(store.version);
+}
+
+// Per-store, per-key error sequencing: the failure of an older call must
+// never overwrite the settled outcome of a newer call OF THE SAME KEY.
+const keyedSeqs = new WeakMap<
+  KeyedStore,
+  Map<string, {next: number; applied: number}>
+>();
+
+function keyedSeqOf(store: KeyedStore, key: string) {
+  let perStore = keyedSeqs.get(store);
+  if (!perStore) {
+    perStore = new Map();
+    keyedSeqs.set(store, perStore);
+  }
+  let seq = perStore.get(key);
+  if (!seq) {
+    seq = {next: 0, applied: 0};
+    perStore.set(key, seq);
+  }
+  return seq;
+}
+
+/** Reserves the per-key error ticket of a call (call order, per key). */
+export function nextKeyedErrorSeq(store: KeyedStore, key: string): number {
+  return ++keyedSeqOf(store, key).next;
 }
 
 /**

@@ -87,11 +87,15 @@ import {
   emitLoading,
   emitResult,
   emitStale,
+  beginKeyedCall,
+  emitKeyedError,
+  getKeyedStore,
   getErrorStore,
   getLoadingStore,
   getResultStore,
   getStaleStore,
   nextErrorSeq,
+  nextKeyedErrorSeq,
   nextResultSeq,
   useStoreValue
 } from './base';
@@ -726,14 +730,31 @@ export function useFinally<AF extends AsyncFunc>(
  */
 function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
   const store = getErrorStore(injectableFn);
+  // Per-key outcome mirror, keyed like useLoadingWrapper's: each call
+  // reserves its own ticket (call order per key) and publishes settle +
+  // error under it, so concurrent different-args calls of one injectable
+  // report independently. seq ordering mirrors emitError's guarantee.
+  const keyedStore = getKeyedStore(injectableFn);
   useInject(
     injectableFn,
     (f: AF) =>
       ((...args) => {
+        const key = stableHash(args);
         const seq = nextErrorSeq(store);
+        const keyedSeq = nextKeyedErrorSeq(keyedStore, key);
         return f(...args)
-          .then(thru(() => emitError(store, undefined, seq)))
-          .catch(thruError((e: any) => emitError(store, e, seq)));
+          .then(
+            thru(() => {
+              emitError(store, undefined, seq);
+              emitKeyedError(keyedStore, key, undefined, keyedSeq);
+            })
+          )
+          .catch(
+            thruError((e: any) => {
+              emitError(store, e, seq);
+              emitKeyedError(keyedStore, key, e, keyedSeq);
+            })
+          );
       }) as AF
   );
   return store;
@@ -1144,12 +1165,23 @@ function useLoadingWrapper<AF extends AsyncFunc>(
   injectableFn: AF
 ): LoadingStore {
   const store = getLoadingStore(injectableFn);
+  // Per-key in-flight mirror of the count above: keyed by the structural
+  // args hash, so observers can ask "is THIS call running" instead of "is
+  // anything running". The keyed store is created lazily here and only
+  // consumed by the useArgsStatus-style hooks — plain useLoading callers
+  // never pay for it beyond the wrapper's two calls below.
+  const keyedStore = getKeyedStore(injectableFn);
   useInject(
     injectableFn,
     (f: AF) =>
       ((...args: Parameters<AF>) => {
+        const key = stableHash(args);
+        const release = beginKeyedCall(keyedStore, key);
         emitLoading(store, store.count + 1);
-        return f(...args).finally(() => emitLoading(store, store.count - 1));
+        return f(...args).finally(() => {
+          release();
+          emitLoading(store, store.count - 1);
+        });
       }) as AF
   );
   return store;
@@ -1196,6 +1228,101 @@ export function useInitialLoading<AF extends AsyncFunc>(injectableFn: AF) {
     useCallback(() => resultStore.hasResult, [resultStore])
   );
   return count > 0 && !hasResult;
+}
+
+/** What {@link useArgsStatus} returns for one args key. */
+export type ArgsStatus = {
+  /** `true` while a call with THESE args is in flight — sibling calls of
+   * the same injectable with different args do not flip it. */
+  loading: boolean;
+  /** The last error of THESE args; a later same-args success clears it.
+   * Independent of the injectable-level `useError` broadcast. */
+  error: any | undefined;
+  /** Failures of THESE args since their last success. */
+  failureCount: number;
+  /**
+   * The shared last result while its provenance matches these args (the
+   * displayed data was actually fetched with them), `undefined` otherwise
+   * — `useResult`'s contract scoped to one key.
+   */
+  data: any | undefined;
+};
+
+/**
+ * Per-args observability of one injectable's calls — the keyed counterpart
+ * of {@link useLoading} / {@link useError}.
+ *
+ * The injectable-level stores answer "is *anything* running / what did the
+ * *latest* call fail with", which is right for a single-args screen but
+ * wrong when one injectable serves several argument sets at once: two
+ * concurrent calls overwrite each other's flag and error. This hook keys
+ * the bookkeeping by the structural args hash ({@link stableHash}, with a
+ * trailing `AbortSignal` collapsed exactly like `usePlaceholderData`), so
+ * each args tuple gets its own `loading` / `error` / `failureCount` slots
+ * that no sibling call can clobber.
+ *
+ * The keyed slots ride the SAME wrapper chain as the injectable-level
+ * stores — `useArgsStatus` registers nothing on the chain itself, so
+ * observability never changes call semantics, and consumers unmounting
+ * cannot break a call's bookkeeping (the wrapper owns start/end pairing;
+ * each key's slot is deleted when its last in-flight call drains).
+ *
+ * `data` mirrors `useResult`'s contract scoped to these args: the shared
+ * last result while its provenance matches (the displayed data was
+ * actually fetched with these args), `undefined` otherwise — including
+ * while a DIFFERENT args tuple's result is on display.
+ *
+ * @param injectableFn the injectable to observe
+ * @param args the args tuple identifying the call slot
+ * @returns `{loading, error, failureCount, data}` for exactly these args
+ * @example
+ * ```tsx
+ * function Row({id}: {id: number}) {
+ *   const {loading, error, data} = useArgsStatus(fetchUser, [id]);
+ *   // Row A (id=1) shows its own spinner even while Row B (id=2) runs —
+ *   // and an id=1 failure never shows on Row B.
+ *   return <li>{loading ? '…' : error ? `failed` : data?.name}</li>;
+ * }
+ * ```
+ */
+export function useArgsStatus<AF extends AsyncFunc>(
+  injectableFn: AF,
+  args: Parameters<AF>
+): ArgsStatus {
+  const loadingStore = useLoadingWrapper(injectableFn);
+  const errorStore = useErrorWrapper(injectableFn);
+  // The scoped `data` read needs results to flow with provenance: this hook
+  // is part of the read stack (like useResult), so it registers the result
+  // emitter itself. A consumer that ALSO calls useResult just adds a second
+  // emitter instance — same store, seq-guarded, no semantic change.
+  const resultStore = useEmittingResultStore(injectableFn);
+  const keyedStore = getKeyedStore(injectableFn);
+  const argsKey = stableHash(trimTrailingSignal(args));
+  // One subscription on the keyed version counter drives all three keyed
+  // reads: every keyed mutation bumps `version`, and useSyncExternalStore
+  // re-reads the snapshot afterwards, so each getter below observes the
+  // post-mutation state.
+  useStoreValue(
+    keyedStore,
+    useCallback(() => keyedStore.version, [keyedStore])
+  );
+  // The result store is a separate broadcast surface (provenance changes
+  // without a keyed event), so it gets its own subscription.
+  useStoreValue(
+    resultStore,
+    useCallback(() => resultStore.version, [resultStore])
+  );
+  const slot = keyedStore.keyed.get(argsKey);
+  const dataMatches =
+    resultStore.hasResult &&
+    resultStore.lastArgs !== undefined &&
+    stableHash(trimTrailingSignal(resultStore.lastArgs)) === argsKey;
+  return {
+    loading: slot ? slot.count > 0 : false,
+    error: slot ? slot.error : undefined,
+    failureCount: slot ? slot.failureCount : 0,
+    data: dataMatches ? resultStore.lastResult : undefined
+  };
 }
 
 /**
