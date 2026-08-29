@@ -13,7 +13,9 @@ import {subscribeInjectEvents} from '../async';
 import type {AsyncFunc, CacheEvent} from '../async';
 // The Refetch button swallows replay rejections: the failure is already
 // recorded by the log itself (the replay re-enters the observer chain).
-import {noop} from '../util';
+// `isAbortSignal` ducks-types the trailing-signal probe below across
+// realms, matching the core's own detection.
+import {isAbortSignal, noop} from '../util';
 
 /** Max characters shown per args/result summary cell. */
 const SUMMARY_LIMIT = 80;
@@ -236,6 +238,7 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: 4,
     backgroundColor: '#fff'
   },
+  warn: {color: '#c62828'},
   empty: {margin: 0, color: '#888'},
   table: {width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed'},
   th: {
@@ -295,6 +298,15 @@ export function InjectDevTools({
 }: InjectDevToolsProps) {
   const {events, clear} = useInjectEvents(injectables, limit);
   useCacheChanges(caches);
+  // Keys whose Remove click MISSED: `delete(args)` re-hashes the raw args
+  // tuple the row carries — the very array reference the setter passed —
+  // so an in-place mutation after `set` (a reused array gaining an
+  // element) silently drifts the hash off the stored key. Providers offer
+  // no by-hashed-key delete channel, so the click verifies against the
+  // snapshot and flags the row instead of failing quietly.
+  const [missedRemovals, setMissedRemovals] = useState<Set<string>>(
+    () => new Set()
+  );
 
   // The Refetch replay source: derived name → live injectable. Rebuilt
   // only when the prop changes; each event row looks its call up at click
@@ -367,7 +379,19 @@ export function InjectDevTools({
                             .map((arg) => summarize(arg))
                             .join(', ')})`}
                           onClick={() => {
-                            void call(...event.args).catch(noop);
+                            // A recorded trailing signal belongs to the
+                            // run that produced the row — by replay time
+                            // its owner may be gone ({signal: true}
+                            // aborts on dep change/unmount), and replaying
+                            // an ABORTED signal would fail the call before
+                            // it starts. Strip it and replay the logical
+                            // args; a still-live signal replays as-is.
+                            const last = event.args[event.args.length - 1];
+                            const replayArgs =
+                              isAbortSignal(last) && last.aborted
+                                ? event.args.slice(0, -1)
+                                : event.args;
+                            void call(...replayArgs).catch(noop);
                           }}
                         >
                           Refetch
@@ -404,15 +428,41 @@ export function InjectDevTools({
                         // Freeze the narrowed tuple for the closure below.
                         const args = entry.args;
                         if (!cache.delete || !args) return null;
+                        // Scoped by cache index: two caches may hold the
+                        // same hashed key.
+                        const missedKey = `${index}:${entry.key}`;
                         return (
-                          <button
-                            type='button'
-                            style={{...styles.button, marginRight: 4}}
-                            aria-label={`Remove ${entry.key}`}
-                            onClick={() => cache.delete!(args)}
-                          >
-                            Remove
-                          </button>
+                          <>
+                            <button
+                              type='button'
+                              style={{...styles.button, marginRight: 4}}
+                              aria-label={`Remove ${entry.key}`}
+                              onClick={() => {
+                                cache.delete!(args);
+                                // Verify by KEY, not by tuple: still
+                                // present means the tuple's hash no longer
+                                // addresses this entry — flag the row.
+                                const stillThere = cache.snapshot!().some(
+                                  (row) => row.key === entry.key
+                                );
+                                setMissedRemovals((prev) => {
+                                  if (stillThere === prev.has(missedKey))
+                                    return prev;
+                                  const next = new Set(prev);
+                                  if (stillThere) next.add(missedKey);
+                                  else next.delete(missedKey);
+                                  return next;
+                                });
+                              }}
+                            >
+                              Remove
+                            </button>
+                            {missedRemovals.has(missedKey) && (
+                              <span style={styles.warn}>
+                                remove missed (args mutated?)
+                              </span>
+                            )}
+                          </>
                         );
                       })()}
                       <button

@@ -235,6 +235,48 @@ describe('InjectDevTools', () => {
     expect(screen.getByText('v2', {selector: 'td'})).toBeTruthy();
   });
 
+  it('Remove flags the row when in-place-mutated args no longer address the entry', async () => {
+    const cache = createMemoryCacheProvider<string, any[]>();
+    function Host() {
+      const fn = useInjectable(async (x: any) => x);
+      return <InjectDevTools injectables={[fn]} caches={[cache]} />;
+    }
+    render(<Host />);
+
+    // set() stores the CALLER's array by reference; the caller then
+    // mutates it in place (a reused args buffer gaining an element) — the
+    // stored tuple's hash drifts off the entry's recorded key.
+    const args = [1];
+    await act(async () => {
+      cache.set(args, 'v1');
+    });
+    args.push(2);
+
+    const remove = screen.getByRole('button', {name: 'Remove [number:1]'});
+    await act(async () => {
+      remove.click();
+    });
+
+    // delete() re-hashed the MUTATED tuple ([1,2]) and missed — 0.14.0
+    // failed silently; now the row says so and the entry provably
+    // survives (the panel never lies about what it shows).
+    expect(cache.snapshot!()).toHaveLength(1);
+    expect(cache.peek!([1])!.value).toBe('v1');
+    expect(screen.getByText(/remove missed/i)).toBeTruthy();
+
+    // Positive control in the same panel: an untouched row removes
+    // cleanly, shows no flag, and the one flagged row stays flagged.
+    await act(async () => {
+      cache.set([9], 'v9');
+    });
+    const remove9 = screen.getByRole('button', {name: 'Remove [number:9]'});
+    await act(async () => {
+      remove9.click();
+    });
+    expect(cache.peek!([9])).toBeUndefined();
+    expect(screen.getAllByText(/remove missed/i)).toHaveLength(1);
+  });
+
   it('Invalidate clears the whole cache through the provider primitive', async () => {
     const cache = createMemoryCacheProvider<string, [number]>();
     const deleted: any[][] = [];
@@ -339,6 +381,64 @@ describe('InjectDevTools', () => {
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(screen.getAllByText('error', {selector: 'td'})).toHaveLength(2);
+  });
+
+  it('Refetch strips an ABORTED trailing signal and replays the logical args', async () => {
+    const fetcher = vi.fn(async (n: number, _signal?: AbortSignal) => `v${n}`);
+    let call: any;
+    function Host() {
+      const fn = useInjectable(fetcher);
+      call = fn;
+      const watched = [fn] as const;
+      return <InjectDevTools injectables={watched} refetchable={watched} />;
+    }
+    render(<Host />);
+
+    // A signal-driven call in the useRun({signal: true}) shape; the
+    // controller aborts before replay — the recorded run's owner is gone
+    // (unmount/dep change aborts its signal), exactly the finding's repro.
+    const controller = new AbortController();
+    await act(async () => {
+      await call(3, controller.signal);
+    });
+    controller.abort();
+
+    const refetch = screen.getAllByRole('button', {name: /refetch/i})[0]!;
+    await act(async () => {
+      refetch.click();
+    });
+
+    // 0.14.0 replayed the dead signal verbatim — an abort-aware fetcher
+    // would reject instantly after its owner unmounted. The replay now
+    // carries the logical args only.
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1]).toEqual([3]);
+  });
+
+  it('Refetch replays a still-live trailing signal as-is', async () => {
+    const fetcher = vi.fn(async (n: number, _signal?: AbortSignal) => `v${n}`);
+    let call: any;
+    function Host() {
+      const fn = useInjectable(fetcher);
+      call = fn;
+      const watched = [fn] as const;
+      return <InjectDevTools injectables={watched} refetchable={watched} />;
+    }
+    render(<Host />);
+
+    const signal = new AbortController().signal;
+    await act(async () => {
+      await call(3, signal);
+    });
+
+    const refetch = screen.getAllByRole('button', {name: /refetch/i})[0]!;
+    await act(async () => {
+      refetch.click();
+    });
+
+    // A non-aborted signal still belongs to a live owner — the replay
+    // keeps it, preserving abort linkage for runs that are still real.
+    expect(fetcher.mock.calls[1]).toEqual([3, signal]);
   });
 
   it('hides the Actions column when no refetchable source is passed', () => {

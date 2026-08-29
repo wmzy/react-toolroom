@@ -14,7 +14,7 @@
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `useDedup` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
 - **React 16.8 – 19** — one code path, broad peer range.
-- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 233 tests.
+- **TypeScript first** — authored in TypeScript, `.d.ts` generated from source; 322 tests.
 
 ## Install
 
@@ -697,7 +697,7 @@ Separate entry: importing it never adds a byte to the core or async bundles.
 
 | API | Description |
 | --- | --- |
-| `<InjectDevTools injectables, caches?, limit?, title?, refetchable?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table; providers also implementing `delete`/`clear` get per-row **Remove** and per-cache **Invalidate** buttons (pure cache writes — mounted `useCache` consumers revalidate through the normal deletion events), and passing `refetchable` (the same array as `injectables`) adds a **Refetch** button per log row that replays the recorded args through the live wrapper chain. Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
+| `<InjectDevTools injectables, caches?, limit?, title?, refetchable?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table; providers also implementing `delete`/`clear` get per-row **Remove** and per-cache **Invalidate** buttons (pure cache writes — mounted `useCache` consumers revalidate through the normal deletion events; a Remove whose stored args tuple was mutated in place after `set` no longer misses silently — the row flags itself `remove missed`), and passing `refetchable` (the same array as `injectables`) adds a **Refetch** button per log row that replays the recorded args through the live wrapper chain, stripping a trailing `AbortSignal` that has already aborted (the recorded run's owner is gone — replaying a dead signal would fail instantly). Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
 | `useInjectLog(fn, limit?)` | The headless engine behind the panel: returns `{events, clear}` carrying the same `InjectLogEvent[]` — build your own panel UI on it. |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}` — `duration` covers the whole onion chain below the observer; `name` is `fn.name`, and shows `'anonymous'` for the unnamed wrappers `useInjectable` returns. |
 
@@ -718,7 +718,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.
-- **Tested** — 233 tests (vitest + Testing Library).
+- **Tested** — 322 tests (vitest + Testing Library).
 
 ## Demos
 
