@@ -4543,7 +4543,10 @@ describe('useArgsStatus (per-key loading and error)', () => {
 
     await act(async () => {
       void injectable('good');
-      void injectable('bad');
+      // Captured: the keyed error must surface on the hook (React 18's
+      // act flushes the rejection asynchronously — a bare `void` leaves
+      // it unhandled), and `.catch` keeps the test's global state clean.
+      void injectable('bad').catch(() => {});
     });
     await act(async () => {
       resolvers['bad']!();
@@ -4552,7 +4555,6 @@ describe('useArgsStatus (per-key loading and error)', () => {
     // The failure of `bad` is visible ONLY on the bad row.
     expect(screen.getByTestId('bad').textContent).toBe('failed');
     expect(screen.getByTestId('good').textContent).toBe('ok');
-
     // A same-args success clears its own slot only.
     await act(async () => {
       resolvers['good']!();
