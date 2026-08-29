@@ -739,7 +739,9 @@ function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
     injectableFn,
     (f: AF) =>
       ((...args) => {
-        const key = stableHash(args);
+        // Same key derivation as the read side (useArgsStatus) — trailing
+        // AbortSignal trimmed, see useLoadingWrapper's mirror comment.
+        const key = stableHash(trimTrailingSignal(args));
         const seq = nextErrorSeq(store);
         const keyedSeq = nextKeyedErrorSeq(keyedStore, key);
         return f(...args)
@@ -1175,7 +1177,11 @@ function useLoadingWrapper<AF extends AsyncFunc>(
     injectableFn,
     (f: AF) =>
       ((...args: Parameters<AF>) => {
-        const key = stableHash(args);
+        // Same key derivation as the read side (useArgsStatus): the
+        // trailing AbortSignal appended by `useRun`'s `{signal: true}` is
+        // trimmed, so a signal-driven call and a plain call of the same
+        // logical args land on ONE slot.
+        const key = stableHash(trimTrailingSignal(args));
         const release = beginKeyedCall(keyedStore, key);
         emitLoading(store, store.count + 1);
         return f(...args).finally(() => {

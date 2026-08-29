@@ -4707,6 +4707,84 @@ describe('useArgsStatus (per-key loading and error)', () => {
     expect(keyed.keyed.get(stableHash([]))).toBeUndefined();
   });
 
+  it('signal-driven calls ({signal: true}) and plain calls land on ONE keyed slot', async () => {
+    const resolvers: ((v: string) => void)[] = [];
+    const fetchData = vi.fn(
+      (id: string, _signal?: AbortSignal) =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+
+    let injectable!: (id: string, signal?: AbortSignal) => Promise<string>;
+    // drive = ['a'] mounts the useRun driver (fires the signal call);
+    // drive = [] never matches a real fetch (fetchData requires an id).
+    let drive: string[] = [];
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      // The React-main path: useRun with {signal: true} appends the
+      // signal as a trailing arg. The keyed wrapper must record the slot
+      // under the TRIMMED key, so this hook reading ['a'] sees the
+      // signal-driven call's loading (key-asymmetry regression: without
+      // trimming, the slot was hashed '[a,#sig]' and never matched).
+      useRun(fn, drive as unknown as Parameters<typeof fn>, {
+        signal: true
+      });
+      const keyed = useArgsStatus(fn, ['a']);
+      return <div data-testid='row'>{keyed.loading ? 'loading' : 'done'}</div>;
+    }
+
+    const {rerender} = render(<TestComponent />);
+    expect(screen.getByTestId('row').textContent).toBe('done');
+    // The idle mount still fires useRun(fn, [], signal) — args [] with a
+    // lone trailing signal. That call hashes to a DIFFERENT (empty) key,
+    // so the ['a'] read is done. Park it in the background.
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    // Mount the driver: useRun re-runs with the SIGNAL call for ['a'].
+    await act(async () => {
+      drive = ['a'];
+      rerender(<TestComponent />);
+    });
+    // The wrapper hashed the trailing signal away — the hook reading
+    // ['a'] observes the call's loading (THE regression; without the
+    // trim this stayed 'done' forever).
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    expect(fetchData.mock.calls[1]![0]).toBe('a');
+    expect(fetchData.mock.calls[1]![1]).toBeInstanceOf(AbortSignal);
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    // A plain refetch-style call of the same logical args joins the SAME
+    // slot (count 2) instead of opening a second one.
+    let plain!: Promise<string>;
+    await act(async () => {
+      plain = injectable('a');
+    });
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    // Settle the signal call: the plain call still runs → still loading.
+    await act(async () => {
+      resolvers[1]!('s');
+    });
+    expect(screen.getByTestId('row').textContent).toBe('loading');
+
+    // Settle the plain call: ['a'] drained. The idle [] call is still
+    // parked on resolvers[0], but it occupies a DIFFERENT key — it must
+    // not keep the ['a'] row loading.
+    await act(async () => {
+      resolvers[2]!('p');
+    });
+    expect(screen.getByTestId('row').textContent).toBe('done');
+
+    // The parked idle call proves cross-key isolation: settle it now, the
+    // row stays done.
+    await act(async () => {
+      resolvers[0]!('idle');
+    });
+    expect(screen.getByTestId('row').textContent).toBe('done');
+  });
+
   it('slow old call never clobbers the outcome of a newer same-args call', async () => {
     const resolvers: Record<string, (v: string) => void> = {};
     let flip = false;
