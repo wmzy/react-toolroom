@@ -498,6 +498,25 @@ const refreshing = useLoading(fetchUsers);            // any call in flight
 - `useLoading` — `true` while **any** call is in flight, initial load or background refresh.
 - `useInitialLoading` — `true` only while a call is in flight **and no result exists yet** (fresh or cached). This is SWR's `isLoading` semantics: once any data is on screen, background refetches no longer count. Use it for the full-page skeleton; use `useLoading` for the "refreshing…" indicator.
 
+### Per-key status — `useArgsStatus`
+
+`useLoading` / `useError` are injectable-level: one in-flight count, one error slot per function. That is right for a single-args screen, but when one injectable serves several argument sets at once — a list of `Row({id})` components, a form watching two keyed queries — concurrent calls overwrite each other's flag and whichever call settled last decides what every observer sees.
+
+`useArgsStatus(fn, args)` keys the bookkeeping by the structural args hash instead:
+
+```tsx
+function Row({id}: {id: number}) {
+  const {loading, error, data} = useArgsStatus(fetchUser, [id]);
+  // Row 1 shows its own spinner while Row 2 loads — and a Row 1 failure
+  // never shows on Row 2.
+  if (loading) return <Spinner />;
+  if (error) return <ErrorRow error={error} />;
+  return <UserCard user={data} />;
+}
+```
+
+The keyed slots ride the same wrapper chain as everything else (the hook registers the read-stack wrappers itself, `useCache`-style), observability never changes call semantics, and each key's slot is reclaimed once its calls drain and its outcome is superseded.
+
 ### Suspend instead of a skeleton — `useSuspenseResult`
 
 ```tsx
@@ -651,6 +670,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
+| `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args. |
 | `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
 | `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
@@ -677,7 +697,7 @@ Separate entry: importing it never adds a byte to the core or async bundles.
 
 | API | Description |
 | --- | --- |
-| `<InjectDevTools injectables, caches?, limit?, title?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table. Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
+| `<InjectDevTools injectables, caches?, limit?, title?, refetchable?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table; providers also implementing `delete`/`clear` get per-row **Remove** and per-cache **Invalidate** buttons (pure cache writes — mounted `useCache` consumers revalidate through the normal deletion events), and passing `refetchable` (the same array as `injectables`) adds a **Refetch** button per log row that replays the recorded args through the live wrapper chain. Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
 | `useInjectLog(fn, limit?)` | The headless engine behind the panel: returns `{events, clear}` carrying the same `InjectLogEvent[]` — build your own panel UI on it. |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}` — `duration` covers the whole onion chain below the observer; `name` is `fn.name`, and shows `'anonymous'` for the unnamed wrappers `useInjectable` returns. |
 
