@@ -599,7 +599,8 @@ describe('async hooks', () => {
 
       const deleted: string[][] = [];
       provider.subscribe!((e) => {
-        if (e.type === 'delete') deleted.push(...e.deleted.map((k) => k as string[]));
+        if (e.type === 'delete')
+          deleted.push(...e.deleted.map((k) => k as string[]));
       });
 
       // loader 通道：不经 use()，直接 set + load
@@ -633,7 +634,10 @@ describe('async hooks', () => {
       });
 
       let resolveFn!: (v: string) => void;
-      const pending = provider.load!(['slow'], () => new Promise<string>((r) => (resolveFn = r)));
+      const pending = provider.load!(
+        ['slow'],
+        () => new Promise<string>((r) => (resolveFn = r))
+      );
       vi.advanceTimersByTime(5000);
 
       // 请求仍在途：即便已远超 cacheTime，条目也不回收。
@@ -685,7 +689,10 @@ describe('async hooks', () => {
     it('should carry the raw args of swept entries on the delete event', async () => {
       vi.useFakeTimers();
 
-      const provider = createMemoryCacheProvider<{id: string}, [string, number]>({
+      const provider = createMemoryCacheProvider<
+        {id: string},
+        [string, number]
+      >({
         cacheTime: 500,
         hash: (key) => JSON.stringify(key)
       });
@@ -2180,7 +2187,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Consumer({id, tag}: {id: number; tag: string}) {
         const injectable = useInjectable(fetchData);
@@ -2216,7 +2225,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Consumer({id}: {id: number}) {
         const injectable = useInjectable(fetchData);
@@ -2253,7 +2264,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const loaderFetch = vi.fn(async () => 'loader data');
-      const cache = createMemoryCacheProvider<string, [string]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 1000
+      });
 
       function Idle() {
         const injectable = useInjectable(async () => 'never fetched');
@@ -2287,7 +2300,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Consumer({id}: {id: number}) {
         const injectable = useInjectable(fetchData);
@@ -2321,7 +2336,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Consumer({id}: {id: number}) {
         const injectable = useInjectable(fetchData);
@@ -2369,7 +2386,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       let invalidateOne!: (id: number) => Promise<unknown>;
       function Consumer({id}: {id: number}) {
@@ -2410,7 +2429,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Consumer({id}: {id: number}) {
         const injectable = useInjectable(fetchData);
@@ -2441,7 +2462,9 @@ describe('async hooks', () => {
       vi.useFakeTimers();
 
       const fetchData = vi.fn(async (id: number) => `data ${id}`);
-      const cache = createMemoryCacheProvider<string, [number]>({cacheTime: 1000});
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 1000
+      });
 
       function Child({id}: {id: number}) {
         const injectable = useInjectable(fetchData);

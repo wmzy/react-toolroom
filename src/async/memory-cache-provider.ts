@@ -146,8 +146,11 @@ export default function create<T, K extends any[]>({
   // independent and idempotent. With `reset = false` an already pending
   // scan is left alone (its earlier deadline sweeps later writes too);
   // `use()`'s re-arm passes it so it never extends its own deadline.
+  // A function DECLARATION (not a const arrow): `touch` above calls it
+  // before this line, which is safe — declarations hoist and `touch` only
+  // runs post-initialization — while keeping the lint rule satisfied.
   let sweepTimer: ReturnType<typeof setTimeout> | undefined;
-  const scheduleSweep = (reset = true) => {
+  function scheduleSweep(reset = true) {
     if (cacheTime === Infinity) return;
     if (sweepTimer !== undefined) {
       if (!reset) return;
@@ -157,7 +160,7 @@ export default function create<T, K extends any[]>({
       sweepTimer = undefined;
       sweep();
     }, cacheTime);
-  };
+  }
   // Observer bookkeeping — the `use` observer API marks the tuples its
   // mounted consumer has fetched (and unmarks on unmount). Observed KEYS
   // (not just entries) are tracked so a key re-created later by `set`/
