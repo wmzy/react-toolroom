@@ -62,7 +62,9 @@ type Entry<T, K extends any[]> = {
  * @returns {CacheProvider<T, K>} Returns an object with methods for getting, setting,
  * deleting, clearing, and managing the cache expiration, plus `load`/`peek` for
  * in-flight-sharing reads, `dehydrate`/`hydrate` for serializing the cache across
- * an SSR boundary, `deletePrefix`/`deleteWhere` for batch invalidation, and
+ * an SSR boundary, `deletePrefix`/`deleteWhere` for batch invalidation,
+ * `deleteKey` for structural single-entry removal by the hashed key a
+ * snapshot row carries, and
  * `subscribe`/`snapshot` as a read-only observation surface for devtools panels
  * and `useCache` revalidation.
  * @example
@@ -301,6 +303,22 @@ export default function create<T, K extends any[]>({
     },
     delete(k: K) {
       const h = hash(k);
+      const entry = map.get(h);
+      map.delete(h);
+      if (entry) {
+        gens.set(h, (gens.get(h) ?? 0) + 1);
+        notifyDelete([entry]);
+      }
+    },
+    // Structural-addressing twin of delete: the caller already holds the
+    // hashed key — a snapshot row's `key`, recorded at write time — so the
+    // removal cannot miss the way a re-hashed raw tuple can (an in-place
+    // args mutation after `set`, or a hydrated entry that never had one).
+    // Same bookkeeping as delete: generation bump (an in-flight request
+    // captured under the old generation must not resurrect the entry),
+    // deletion event carrying the raw tuple when recoverable. A miss is a
+    // silent no-op — listeners only hear real removals.
+    deleteKey(h: string) {
       const entry = map.get(h);
       map.delete(h);
       if (entry) {

@@ -123,6 +123,17 @@ export type CacheProvider<T, K extends any[]> = {
    */
   deleteWhere?: (predicate: (k: K) => boolean) => void;
   /**
+   * Deletes exactly the entry stored under the hashed key `key` — the same
+   * string a {@link CacheProvider.snapshot} row carries, so a caller that
+   * already holds the structural address removes precisely even when the
+   * entry's recorded raw args tuple has drifted (an in-place mutation after
+   * `set` re-hashes to a different key; a hydrated entry never had a tuple).
+   * Fires the same `{type: 'delete', deleted: [...]}` event as `delete`,
+   * carrying the entry's raw tuple when recoverable. Optional — the same
+   * feature-detect contract as `deletePrefix`/`deleteWhere`.
+   */
+  deleteKey?: (key: string) => void;
+  /**
    * Batch write-side primitive, the symmetric twin of `deleteWhere`: every
    * settled entry whose raw args tuple satisfies `predicate` is passed to
    * `updater`, and the returned value is written back through the same

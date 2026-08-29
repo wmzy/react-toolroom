@@ -764,6 +764,77 @@ describe('async hooks', () => {
       ]);
     });
 
+    it('should delete exactly the entry its snapshot row key addresses, even after in-place args mutation', async () => {
+      const provider = createMemoryCacheProvider<string, any[]>();
+      const args = [1];
+      provider.set(args, 'v1');
+      provider.set([2], 'v2');
+      // set() stores the caller's array by reference; the caller mutates
+      // it in place (a reused args buffer gaining an element) — re-hashing
+      // delete(args) now lands on a different key and misses. The snapshot
+      // row's key was recorded at write time and still addresses the entry.
+      args.push(2);
+
+      provider.deleteKey!(provider.snapshot!()![0]!.key);
+
+      expect(await provider.get([1])).toBeUndefined();
+      expect(provider.snapshot!()).toHaveLength(1);
+      expect(provider.peek!([2])!.value).toBe('v2');
+    });
+
+    it('should fire one delete event per deleteKey hit and none on a miss', () => {
+      const provider = createMemoryCacheProvider<string, [number]>();
+      const events: unknown[] = [];
+      provider.subscribe!((e) => events.push(e));
+      provider.set([1], 'v1');
+      provider.set([2], 'v2');
+
+      provider.deleteKey!(stableHash([1]));
+      // A key nothing ever wrote fires nothing — listeners only hear
+      // real removals.
+      provider.deleteKey!(stableHash([999]));
+
+      expect(events).toEqual([
+        {type: 'set'},
+        {type: 'set'},
+        {type: 'delete', deleted: [[1]]}
+      ]);
+      expect(provider.snapshot!().map((row) => row.value)).toEqual(['v2']);
+    });
+
+    it('should delete hydrated entries by key, reporting no raw tuple', () => {
+      const provider = createMemoryCacheProvider<string, [number]>();
+      const key = stableHash([1]);
+      provider.hydrate!({[key]: ['v1', 0]});
+
+      const events: {type: string; deleted?: unknown[]}[] = [];
+      provider.subscribe!((e) => events.push(e as any));
+      provider.deleteKey!(key);
+
+      // Hydrated entries carry no raw args, so the deletion event lists
+      // nothing — same shape delete() would report for them.
+      expect(events).toEqual([{type: 'delete', deleted: []}]);
+      expect(provider.snapshot!()).toEqual([]);
+    });
+
+    it('should not resurrect an entry deleteKey removed while its load was in flight', async () => {
+      const provider = createMemoryCacheProvider<string, [string]>({
+        cacheTime: 60000,
+        hash: (key) => JSON.stringify(key)
+      });
+      let resolveFn!: (v: string) => void;
+      const promise = provider.load!(
+        ['k'],
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      provider.deleteKey!(JSON.stringify(['k']));
+
+      resolveFn('fetched');
+      await promise;
+      expect(await provider.get(['k'])).toBeUndefined();
+    });
+
     it('should merge hydrate data without clearing existing entries', async () => {
       const provider = createMemoryCacheProvider<string, [string]>({
         cacheTime: 60000,

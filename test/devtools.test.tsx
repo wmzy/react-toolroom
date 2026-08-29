@@ -8,7 +8,11 @@
  */
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {act, render, screen} from '@testing-library/react';
-import {useInjectable, createMemoryCacheProvider} from '../src/async';
+import {
+  useInjectable,
+  createMemoryCacheProvider,
+  stableHash
+} from '../src/async';
 import {InjectDevTools, useInjectLog} from '../src/devtools';
 import type {InjectLogEvent} from '../src/devtools';
 
@@ -205,7 +209,7 @@ describe('InjectDevTools', () => {
     ).toBeTruthy();
   });
 
-  it('Remove deletes exactly its entry via the raw args tuple', async () => {
+  it('Remove deletes exactly its entry through its structural key', async () => {
     const cache = createMemoryCacheProvider<string, [number]>();
     function Host() {
       const fn = useInjectable(async () => 'ok');
@@ -226,7 +230,7 @@ describe('InjectDevTools', () => {
     });
 
     // Only entry [1] is gone — Remove addresses exactly one entry through
-    // the raw args tuple its snapshot row carried.
+    // the hashed key its snapshot row carries (deleteKey).
     expect(cache.snapshot!()).toHaveLength(1);
     expect(cache.peek!([1])).toBeUndefined();
     expect(cache.peek!([2])!.value).toBe('v2');
@@ -235,7 +239,7 @@ describe('InjectDevTools', () => {
     expect(screen.getByText('v2', {selector: 'td'})).toBeTruthy();
   });
 
-  it('Remove flags the row when in-place-mutated args no longer address the entry', async () => {
+  it('Remove deletes exactly its entry even after in-place args mutation (T4 root fix)', async () => {
     const cache = createMemoryCacheProvider<string, any[]>();
     function Host() {
       const fn = useInjectable(async (x: any) => x);
@@ -245,10 +249,13 @@ describe('InjectDevTools', () => {
 
     // set() stores the CALLER's array by reference; the caller then
     // mutates it in place (a reused args buffer gaining an element) — the
-    // stored tuple's hash drifts off the entry's recorded key.
+    // stored tuple's re-hash drifts off the entry's recorded key. This is
+    // the T4 scenario: 0.14.0 removed nothing silently, the interim fix
+    // flagged the row 'remove missed', and deleteKey now removes exactly.
     const args = [1];
     await act(async () => {
       cache.set(args, 'v1');
+      cache.set([9], 'v9');
     });
     args.push(2);
 
@@ -257,24 +264,66 @@ describe('InjectDevTools', () => {
       remove.click();
     });
 
-    // delete() re-hashed the MUTATED tuple ([1,2]) and missed — 0.14.0
-    // failed silently; now the row says so and the entry provably
-    // survives (the panel never lies about what it shows).
+    // deleteKey addressed the row by the hashed key recorded at write
+    // time: the entry is gone despite the tuple mutation, neighbors are
+    // untouched, and no flag ever shows.
+    expect(cache.peek!([1])).toBeUndefined();
     expect(cache.snapshot!()).toHaveLength(1);
-    expect(cache.peek!([1])!.value).toBe('v1');
-    expect(screen.getByText(/remove missed/i)).toBeTruthy();
+    expect(cache.peek!([9])!.value).toBe('v9');
+    expect(screen.queryByText(/remove missed/i)).toBeNull();
+    expect(screen.queryByText('v1', {selector: 'td'})).toBeNull();
+  });
 
-    // Positive control in the same panel: an untouched row removes
-    // cleanly, shows no flag, and the one flagged row stays flagged.
+  it('Remove falls back to args re-hashing — and flags a miss — without deleteKey', async () => {
+    // The pre-deleteKey addressing path, kept for providers that never
+    // implement it: the row's raw tuple is re-hashed, so a tuple mutated
+    // in place after set misses and the row flags itself instead of
+    // failing quietly.
+    const rows = [{key: 'k1', value: 'v1', cachedAt: 0, args: [1]}];
+    const legacy = {
+      snapshot: () => rows,
+      subscribe: () => () => {},
+      // Re-hashes the (drifted) tuple — misses by construction here.
+      delete: () => {},
+      clear: () => {}
+    };
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[legacy]} />;
+    }
+    render(<Host />);
+
+    const remove = screen.getByRole('button', {name: 'Remove k1'});
     await act(async () => {
-      cache.set([9], 'v9');
+      remove.click();
     });
-    const remove9 = screen.getByRole('button', {name: 'Remove [number:9]'});
+
+    // The fallback verified against the snapshot: the row provably
+    // survived and says so — the panel never lies about what it shows.
+    expect(rows).toHaveLength(1);
+    expect(screen.getByText(/remove missed/i)).toBeTruthy();
+  });
+
+  it('Remove also addresses hydrated rows that carry no raw args tuple', async () => {
+    const cache = createMemoryCacheProvider<string, [number]>();
+    // hydrate() mutates silently (no set event), so prime the cache before
+    // the panel mounts — the first render pulls snapshot() directly.
+    const key = stableHash([1]);
+    cache.hydrate!({[key]: ['v1', 0]});
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[cache]} />;
+    }
+    render(<Host />);
+
+    // The hydrated row carries no args — before deleteKey it rendered no
+    // Remove button at all.
+    const remove = screen.getByRole('button', {name: `Remove ${key}`});
     await act(async () => {
-      remove9.click();
+      remove.click();
     });
-    expect(cache.peek!([9])).toBeUndefined();
-    expect(screen.getAllByText(/remove missed/i)).toHaveLength(1);
+    expect(cache.snapshot!()).toEqual([]);
+    expect(screen.queryByText('v1', {selector: 'td'})).toBeNull();
   });
 
   it('Invalidate clears the whole cache through the provider primitive', async () => {

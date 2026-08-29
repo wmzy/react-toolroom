@@ -142,7 +142,8 @@ export type InjectDevToolsProps = {
   /** Caches (e.g. from `createMemoryCacheProvider`) to observe. Same
    * identity caveat as `injectables`; providers without the optional
    * `snapshot` member are silently skipped. Providers implementing
-   * `delete`/`clear` get per-row Remove and per-cache Invalidate buttons. */
+   * `deleteKey` (structural), `delete` (args fallback) and/or `clear` get
+   * per-row Remove and per-cache Invalidate buttons. */
   caches?: readonly ObservableCache[];
   /**
    * Optional replay source for the log's Refetch buttons — the same
@@ -162,8 +163,8 @@ export type InjectDevToolsProps = {
  */
 export type ObservableCache = {
   /** Shallow copy of every entry as `{key, value, cachedAt}`; rows whose
-   * raw args tuple is recoverable carry an additive `args` — the Remove
-   * button uses it to address exactly that entry. */
+   * raw args tuple is recoverable carry an additive `args` — the fallback
+   * Remove path re-hashes it when no structural channel exists. */
   snapshot?: () => {
     key: string;
     value: any;
@@ -187,6 +188,14 @@ export type ObservableCache = {
    */
   delete?: (k: any) => void;
   clear?: () => void;
+  /**
+   * The structural Remove channel: deletes exactly the entry stored under
+   * the hashed `key` a snapshot row carries, immune to the raw tuple drift
+   * the `delete(args)` fallback suffers. Preferred when present — the
+   * Remove button feature-detects it and skips the miss-verification
+   * fallback entirely.
+   */
+  deleteKey?: (key: string) => void;
 };
 
 /**
@@ -298,12 +307,14 @@ export function InjectDevTools({
 }: InjectDevToolsProps) {
   const {events, clear} = useInjectEvents(injectables, limit);
   useCacheChanges(caches);
-  // Keys whose Remove click MISSED: `delete(args)` re-hashes the raw args
-  // tuple the row carries — the very array reference the setter passed —
-  // so an in-place mutation after `set` (a reused array gaining an
-  // element) silently drifts the hash off the stored key. Providers offer
-  // no by-hashed-key delete channel, so the click verifies against the
-  // snapshot and flags the row instead of failing quietly.
+  // Keys whose Remove click MISSED — the FALLBACK path only: providers
+  // without `deleteKey` are addressed by re-hashing the raw args tuple the
+  // row carries, the very array reference the setter passed, so an
+  // in-place mutation after `set` (a reused array gaining an element)
+  // silently drifts the hash off the stored key. Providers with
+  // `deleteKey` (the memory provider) are addressed structurally and
+  // cannot miss; the fallback verifies against the snapshot and flags the
+  // row instead of failing quietly.
   const [missedRemovals, setMissedRemovals] = useState<Set<string>>(
     () => new Set()
   );
@@ -427,9 +438,17 @@ export function InjectDevTools({
                       {(() => {
                         // Freeze the narrowed tuple for the closure below.
                         const args = entry.args;
-                        if (!cache.delete || !args) return null;
-                        // Scoped by cache index: two caches may hold the
-                        // same hashed key.
+                        // Structural address first: a provider with
+                        // `deleteKey` removes by the row's hashed key,
+                        // recorded at write time — it cannot drift the way
+                        // the stored raw tuple can, and rows without a
+                        // tuple (SSR hydration) become removable too.
+                        // Providers without it fall back to re-hashing the
+                        // row's raw tuple.
+                        if (!cache.deleteKey && (!cache.delete || !args))
+                          return null;
+                        // Scoped by cache index: two caches may hold
+                        // the same hashed key.
                         const missedKey = `${index}:${entry.key}`;
                         return (
                           <>
@@ -438,10 +457,15 @@ export function InjectDevTools({
                               style={{...styles.button, marginRight: 4}}
                               aria-label={`Remove ${entry.key}`}
                               onClick={() => {
+                                if (cache.deleteKey) {
+                                  cache.deleteKey(entry.key);
+                                  return;
+                                }
                                 cache.delete!(args);
-                                // Verify by KEY, not by tuple: still
-                                // present means the tuple's hash no longer
-                                // addresses this entry — flag the row.
+                                // Fallback verification, by KEY not by
+                                // tuple: still present means the tuple's
+                                // hash no longer addresses this entry —
+                                // flag the row.
                                 const stillThere = cache.snapshot!().some(
                                   (row) => row.key === entry.key
                                 );

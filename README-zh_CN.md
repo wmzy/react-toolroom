@@ -386,6 +386,18 @@ cache.deletePrefix('user:');
 
 `delete(key)` 与 `useInvalidate` 只会精确命中单条。`deletePrefix(prefix)` 是批量版：遍历哈希键，删除所有以 `prefix` 开头的条目。配合 `hash` 约定（`'user:' + stableHash(args)`），一个可能影响大量缓存用户的 mutation——比如给整个团队改权限——就能整体作废 `user:` 命名空间，而不动 `post:` 等其它前缀。删除会触发与 `invalidate` 相同的删除事件，挂载中的 `useCache` 消费者随之重新请求——无需任何额外接线。
 
+### 结构化删除 — `deleteKey`
+
+```tsx
+// 每条 snapshot 行都携带它存储所用的哈希键。
+const row = cache.snapshot().find((r) => r.value === target);
+
+// 直接按该键删除——不涉及参数重哈希。
+cache.deleteKey(row.key);
+```
+
+`delete(key)` 通过重哈希原始参数元组寻址条目，而该元组正是调用方传给 `set` 的数组引用——`set` 之后的原地修改（复用的参数缓冲区追加元素）会让哈希偏离存储键导致删除落空；SSR 水合条目则根本没有元组。`deleteKey(hashedKey)` 同时补上两个缺口：按哈希键精确删除——与 `snapshot()` 行携带的键同源（写入时记录），不受之后元组漂移影响。它触发与 `delete` 相同的 `{type: 'delete'}` 事件（可恢复时携带原始元组），递增同一把每键代数计数（在飞请求无法复活被删条目），未知键静默无操作。DevTools 面板的 **Remove** 按钮在 provider 实现它时优先走结构化删除，未实现时回退参数重哈希——并在落空时标记该行。
+
 ### 声明式失效：`invalidates` / `invalidate`
 
 `useInvalidate` 是命令式的：你要在成功回调里自己调用。`invalidates` 则把同一流程声明在 mutation 身上——成功时（且仅在成功时）由库执行：
@@ -634,7 +646,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）、`deletePrefix`（按哈希键前缀批量失效）与 `deleteWhere`（按参数谓词批量失效——前缀型 `invalidates` 目标使用的原语）；还实现了可观察接口 `subscribe`/`snapshot`——写入后发 `set` 事件，删除后发携带被删条目原始参数元组的 `delete` 事件，同时驱动 DevTools 面板与 `useCache` 的被动重验证，`snapshot()` 返回 `{key, value, cachedAt}[]` 条目列表；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）、`deletePrefix`（按哈希键前缀批量失效）与 `deleteWhere`（按参数谓词批量失效——前缀型 `invalidates` 目标使用的原语）、`deleteKey(hashedKey)`（按 `snapshot()` 行携带的哈希键结构化删除单条——不受原始元组漂移影响，可寻址水合条目）；还实现了可观察接口 `subscribe`/`snapshot`——写入后发 `set` 事件，删除后发携带被删条目原始参数元组的 `delete` 事件，同时驱动 DevTools 面板与 `useCache` 的被动重验证，`snapshot()` 返回 `{key, value, cachedAt}[]` 条目列表；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
 | `useDedup(fn, {hash = stableHash}?)` | 同键并发调用共享同一个 in-flight promise；落定即删条目，失败可重试。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache`/`useDedup` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。 |
