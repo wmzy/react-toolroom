@@ -455,8 +455,14 @@ export default function create<T, K extends any[]>({
           value: T;
           cachedAt: number;
           pending?: boolean;
+          args?: K;
         } = {key, value: settled.value, cachedAt: settled.cachedAt};
         if (entry.inflight) row.pending = true;
+        // Additive raw tuple, when recoverable: hydrated entries (SSR)
+        // carry no args and stay `undefined` — devtools Remove buttons
+        // feature-detect on it instead of synthesizing a tuple from the
+        // hashed key.
+        if (entry.args !== undefined) row.args = entry.args;
         return [row];
       });
     }

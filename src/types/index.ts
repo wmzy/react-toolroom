@@ -145,11 +145,12 @@ export type CacheProvider<T, K extends any[]> = {
   mutation?: CreateMutationBinder<T, K>['mutation'];
   /** Notifies `listener` after any entry mutation; returns an unsubscribe. */
   subscribe?: (listener: (e: CacheEvent<K>) => void) => () => void;
-  /** Shallow-copies every settled entry as {key, value, cachedAt} for read-only observation; entries with a request in flight carry an additive `pending: true`. */
+  /** Shallow-copies every settled entry as {key, value, cachedAt} for read-only observation; entries with a request in flight carry an additive `pending: true`, and entries whose raw args tuple is recoverable carry an additive `args` (hydrated ones do not — devtools Remove buttons feature-detect on it). */
   snapshot?: () => {
     key: string;
     value: T;
     cachedAt: number;
     pending?: boolean;
+    args?: K;
   }[];
 };

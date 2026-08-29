@@ -204,6 +204,154 @@ describe('InjectDevTools', () => {
       screen.getByText(/no calls settled yet/i, {selector: 'p'})
     ).toBeTruthy();
   });
+
+  it('Remove deletes exactly its entry via the raw args tuple', async () => {
+    const cache = createMemoryCacheProvider<string, [number]>();
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[cache]} />;
+    }
+    render(<Host />);
+
+    await act(async () => {
+      cache.set([1], 'v1');
+      cache.set([2], 'v2');
+    });
+    expect(cache.snapshot!()).toHaveLength(2);
+
+    // Each row renders its own Remove button, addressed by its key.
+    const remove1 = screen.getByRole('button', {name: 'Remove [number:1]'});
+    await act(async () => {
+      remove1.click();
+    });
+
+    // Only entry [1] is gone — Remove addresses exactly one entry through
+    // the raw args tuple its snapshot row carried.
+    expect(cache.snapshot!()).toHaveLength(1);
+    expect(cache.peek!([1])).toBeUndefined();
+    expect(cache.peek!([2])!.value).toBe('v2');
+    // The subscribe-driven re-render dropped the row.
+    expect(screen.queryByText('v1', {selector: 'td'})).toBeNull();
+    expect(screen.getByText('v2', {selector: 'td'})).toBeTruthy();
+  });
+
+  it('Invalidate clears the whole cache through the provider primitive', async () => {
+    const cache = createMemoryCacheProvider<string, [number]>();
+    const deleted: any[][] = [];
+    cache.subscribe?.((e) => {
+      if (e.type === 'delete') deleted.push(...e.deleted);
+    });
+    function Host() {
+      const fn = useInjectable(async () => 'ok');
+      return <InjectDevTools injectables={[fn]} caches={[cache]} />;
+    }
+    render(<Host />);
+
+    await act(async () => {
+      cache.set([1], 'v1');
+      cache.set([2], 'v2');
+    });
+
+    const invalidate = screen.getAllByRole('button', {name: /invalidate/i});
+    // One Invalidate button per cache row group — both address the same
+    // provider; click the first.
+    expect(invalidate.length).toBeGreaterThanOrEqual(1);
+    await act(async () => {
+      invalidate[0]!.click();
+    });
+
+    // clear() wipes everything and reports the removed entries as a
+    // deletion event — the same shape invalidate([cache]) produces, so
+    // mounted useCache consumers refetch identically.
+    expect(cache.snapshot!()).toEqual([]);
+    expect(deleted).toEqual([[1], [2]]);
+    expect(screen.queryByText('v1', {selector: 'td'})).toBeNull();
+  });
+
+  it('renders cache actions only when the provider implements them', () => {
+    // snapshot-only provider: no delete/clear members, no action cells.
+    render(
+      <InjectDevTools
+        injectables={[]}
+        caches={[{snapshot: () => [{key: 'k', value: 'v', cachedAt: 0}]}]}
+      />
+    );
+    expect(screen.getByText('v', {selector: 'td'})).toBeTruthy();
+    expect(screen.queryByText('Actions', {selector: 'th'})).toBeNull();
+    expect(screen.queryByRole('button', {name: /invalidate/i})).toBeNull();
+    expect(screen.queryByRole('button', {name: /remove/i})).toBeNull();
+  });
+
+  it('Refetch replays the recorded args through the live injectable', async () => {
+    const fetcher = vi.fn(async (n: number) => n * 10);
+    let call: any;
+    function Host() {
+      const fn = useInjectable(fetcher);
+      call = fn;
+      // Same array passed as watch source and replay source: the common
+      // `import.meta.env.DEV` usage — both props point at one useMemo'd
+      // list — is what the Refetch button exists for.
+      const watched = [fn] as const;
+      return <InjectDevTools injectables={watched} refetchable={watched} />;
+    }
+    render(<Host />);
+
+    await act(async () => {
+      await call(3);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const refetch = screen.getByRole('button', {name: /refetch/i});
+    await act(async () => {
+      refetch.click();
+    });
+
+    // The recorded args [3] were re-run through the live injectable —
+    // the full current wrapper chain, not a re-record of the old call.
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenLastCalledWith(3);
+  });
+
+  it('Refetch swallows the replay rejection and still records it as an error row', async () => {
+    const fetcher = vi.fn(async (n: number) => {
+      if (n === 8) throw new Error('boom');
+      return n;
+    });
+    let call: any;
+    function Host() {
+      const fn = useInjectable(fetcher);
+      call = fn;
+      const watched = [fn] as const;
+      return <InjectDevTools injectables={watched} refetchable={watched} />;
+    }
+    render(<Host />);
+
+    await act(async () => {
+      await call(8).catch(() => {});
+    });
+    expect(screen.getByText('error', {selector: 'td'})).toBeTruthy();
+
+    // The replay rejects (unhandled-rejection-safe) and lands as a NEW
+    // error row — header + two error rows.
+    const refetch = screen.getByRole('button', {name: /refetch/i});
+    await act(async () => {
+      refetch.click();
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByText('error', {selector: 'td'})).toHaveLength(2);
+  });
+
+  it('hides the Actions column when no refetchable source is passed', () => {
+    const fetcher = vi.fn(async (n: number) => n);
+    let call: any;
+    function Host() {
+      const fn = useInjectable(fetcher);
+      call = fn;
+      return <InjectDevTools injectables={[fn]} />;
+    }
+    render(<Host />);
+    expect(screen.queryByText('Actions', {selector: 'th'})).toBeNull();
+  });
 });
 
 describe('useInjectLog', () => {

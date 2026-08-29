@@ -11,6 +11,9 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import type {CSSProperties} from 'react';
 import {subscribeInjectEvents} from '../async';
 import type {AsyncFunc, CacheEvent} from '../async';
+// The Refetch button swallows replay rejections: the failure is already
+// recorded by the log itself (the replay re-enters the observer chain).
+import {noop} from '../util';
 
 /** Max characters shown per args/result summary cell. */
 const SUMMARY_LIMIT = 80;
@@ -136,8 +139,19 @@ export type InjectDevToolsProps = {
   title?: string;
   /** Caches (e.g. from `createMemoryCacheProvider`) to observe. Same
    * identity caveat as `injectables`; providers without the optional
-   * `snapshot` member are silently skipped. */
+   * `snapshot` member are silently skipped. Providers implementing
+   * `delete`/`clear` get per-row Remove and per-cache Invalidate buttons. */
   caches?: readonly ObservableCache[];
+  /**
+   * Optional replay source for the log's Refetch buttons — the same
+   * injectables array as `injectables` is the common value. Each entry's
+   * name is derived exactly like the log's (`fn.name || 'anonymous'`), so
+   * a row matches its source even for anonymous arrows. A Refetch click
+   * re-runs the recorded args through the full current wrapper chain — a
+   * plain call, so `useCache` consumers still hit the cache and broadcast
+   * through the normal result store.
+   */
+  refetchable?: readonly AsyncFunc[];
 };
 
 /**
@@ -145,13 +159,32 @@ export type InjectDevToolsProps = {
  * by the panel, implemented by `createMemoryCacheProvider`.
  */
 export type ObservableCache = {
-  /** Shallow copy of every entry as `{key, value, cachedAt}`. */
-  snapshot?: () => {key: string; value: any; cachedAt: number}[];
+  /** Shallow copy of every entry as `{key, value, cachedAt}`; rows whose
+   * raw args tuple is recoverable carry an additive `args` — the Remove
+   * button uses it to address exactly that entry. */
+  snapshot?: () => {
+    key: string;
+    value: any;
+    cachedAt: number;
+    pending?: boolean;
+    args?: any[];
+  }[];
   /**
    * Fires after any entry mutation with what changed (`set` after writes,
    * `delete` with the removed entries' raw args); returns an unsubscribe.
    */
   subscribe?: (listener: (e: CacheEvent<any[]>) => void) => () => void;
+  /**
+   * Optional action surface, feature-detected per button: `delete` removes
+   * one entry (the row's Remove button — a pure cache write, the mounted
+   * `useCache` consumers' passive revalidation decides whether to refetch),
+   * `clear` purges everything (the row group's Invalidate button — the
+   * same primitive `invalidate([cache])` calls). The parameter is the
+   * wide tuple type concrete providers narrow into, so a
+   * `CacheProvider<T, [number]>` stays assignable (parameter bivariance).
+   */
+  delete?: (k: any) => void;
+  clear?: () => void;
 };
 
 /**
@@ -257,10 +290,27 @@ export function InjectDevTools({
   injectables,
   limit = 50,
   title = 'InjectDevTools',
-  caches
+  caches,
+  refetchable
 }: InjectDevToolsProps) {
   const {events, clear} = useInjectEvents(injectables, limit);
   useCacheChanges(caches);
+
+  // The Refetch replay source: derived name → live injectable. Rebuilt
+  // only when the prop changes; each event row looks its call up at click
+  // time, so an entry recorded from an earlier registration still replays
+  // through the injectable currently mounted under that name. The name is
+  // derived exactly like the log rows', so lookups match by construction.
+  const callables = useMemo(() => {
+    const byName = new Map<string, AsyncFunc>();
+    if (refetchable) {
+      for (const call of refetchable) {
+        const name = call.name || 'anonymous';
+        if (!byName.has(name)) byName.set(name, call);
+      }
+    }
+    return byName;
+  }, [refetchable]);
 
   return (
     <section aria-label={title} style={styles.panel}>
@@ -281,6 +331,7 @@ export function InjectDevTools({
               <th style={styles.th}>Status</th>
               <th style={styles.th}>Duration</th>
               <th style={styles.th}>Args → Result</th>
+              {callables.size > 0 && <th style={styles.th}>Actions</th>}
             </tr>
           </thead>
           <tbody>
@@ -303,6 +354,28 @@ export function InjectDevTools({
                     ? summarize(event.error)
                     : summarize(event.result)}
                 </td>
+                {callables.size > 0 && (
+                  <td style={styles.td}>
+                    {(() => {
+                      const call = callables.get(event.name);
+                      if (!call) return null;
+                      return (
+                        <button
+                          type='button'
+                          style={styles.button}
+                          aria-label={`Refetch ${event.name}(${event.args
+                            .map((arg) => summarize(arg))
+                            .join(', ')})`}
+                          onClick={() => {
+                            void call(...event.args).catch(noop);
+                          }}
+                        >
+                          Refetch
+                        </button>
+                      );
+                    })()}
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -316,6 +389,7 @@ export function InjectDevTools({
                 <th style={styles.th}>Key</th>
                 <th style={styles.th}>Age</th>
                 <th style={styles.th}>Value</th>
+                {cache.clear && <th style={styles.th}>Actions</th>}
               </tr>
             </thead>
             <tbody>
@@ -324,6 +398,33 @@ export function InjectDevTools({
                   <td style={styles.td}>{entry.key}</td>
                   <td style={styles.td}>{formatAge(entry.cachedAt)}</td>
                   <td style={styles.td}>{summarize(entry.value)}</td>
+                  {cache.clear && (
+                    <td style={styles.td}>
+                      {(() => {
+                        // Freeze the narrowed tuple for the closure below.
+                        const args = entry.args;
+                        if (!cache.delete || !args) return null;
+                        return (
+                          <button
+                            type='button'
+                            style={{...styles.button, marginRight: 4}}
+                            aria-label={`Remove ${entry.key}`}
+                            onClick={() => cache.delete!(args)}
+                          >
+                            Remove
+                          </button>
+                        );
+                      })()}
+                      <button
+                        type='button'
+                        style={styles.button}
+                        aria-label='Invalidate all entries of this cache'
+                        onClick={() => cache.clear!()}
+                      >
+                        Invalidate
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
