@@ -8,11 +8,18 @@
  */
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {act, render, screen} from '@testing-library/react';
+import {StrictMode} from 'react';
 import {
   useInjectable,
+  useRun,
+  useResult,
   createMemoryCacheProvider,
   stableHash
 } from '../src/async';
+import {
+  getNamedInjectables,
+  subscribeNamedInjectables
+} from '../src/async/inject';
 import {InjectDevTools, useInjectLog} from '../src/devtools';
 import type {InjectLogEvent} from '../src/devtools';
 
@@ -574,5 +581,313 @@ describe('useInjectLog', () => {
     expect(latest.events).toHaveLength(1);
     expect(latest.events[0].error).toBeInstanceOf(Error);
     expect(latest.events[0].result).toBeUndefined();
+  });
+});
+
+describe('named injectable registry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('registers on mount, unregisters on unmount, and notifies subscribers', () => {
+    const changes: number[] = [];
+    const stop = subscribeNamedInjectables(() => changes.push(changes.length));
+
+    const fetcher = async (id: number) => id;
+    let injectable: any;
+    function Host() {
+      injectable = useInjectable(fetcher, {name: 'fetchTags'});
+      return null;
+    }
+    const {unmount} = render(<Host />);
+
+    // Exactly the named instance is registered, and the registered name
+    // doubles as the injectable's display name.
+    expect(getNamedInjectables()).toEqual([injectable]);
+    expect(injectable.name).toBe('fetchTags');
+    expect(changes).toHaveLength(1);
+
+    unmount();
+    expect(getNamedInjectables()).toEqual([]);
+    expect(changes).toHaveLength(2);
+    stop();
+  });
+
+  it('leaves unnamed useInjectable completely untouched', () => {
+    const changes: number[] = [];
+    const stop = subscribeNamedInjectables(() => changes.push(changes.length));
+
+    function Host() {
+      useInjectable(async () => 'ok');
+      return null;
+    }
+    const {unmount} = render(<Host />);
+
+    // No registration, no notification — the unnamed path is exactly what
+    // it was before the registry existed.
+    expect(getNamedInjectables()).toEqual([]);
+    expect(changes).toEqual([]);
+    unmount();
+    stop();
+  });
+
+  it('coexists under one name — unmount removes exactly its own instance', () => {
+    const fetcher = async (x: number) => x;
+    const seen: any[] = [];
+    function Feature() {
+      const fn = useInjectable(fetcher, {name: 'fetchTags'});
+      if (!seen.includes(fn)) seen.push(fn);
+      return null;
+    }
+
+    const first = render(<Feature />);
+    const second = render(<Feature />);
+
+    // Two hook instances, one name: both live — duplicate names coexist
+    // rather than overwriting each other.
+    expect(getNamedInjectables()).toEqual(seen);
+    expect(seen).toHaveLength(2);
+
+    first.unmount();
+    expect(getNamedInjectables()).toEqual([seen[1]]);
+    second.unmount();
+    expect(getNamedInjectables()).toEqual([]);
+  });
+
+  it('observes a preset-internal injectable from a separate panel below it', async () => {
+    // A useQuery-like preset: the injectable never leaves the hook, so a
+    // panel cannot be handed a reference — the registry is the only way
+    // in. useRun fires the first call from the feature's own mount
+    // effects, in the same commit as the panel.
+    function useQuery(fn: () => Promise<string[]>, options?: {name?: string}) {
+      const fetcher = useInjectable(fn, options);
+      useRun(fetcher, []);
+      return useResult(fetcher);
+    }
+    function Tags() {
+      const tags = useQuery(async () => ['t1', 't2'], {name: 'fetchTags'});
+      return <span>{tags?.join(',')}</span>;
+    }
+    function App() {
+      return (
+        <>
+          <Tags />
+          <InjectDevTools />
+        </>
+      );
+    }
+    render(<App />);
+
+    // The panel — a sibling AFTER the feature in tree order — recorded
+    // the mount-time call under the registered name, not 'anonymous'.
+    expect(await screen.findByText('fetchTags', {selector: 'td'})).toBeTruthy();
+    expect(
+      screen.getByText(/\[\] → \["t1","t2"\]/, {selector: 'td'})
+    ).toBeTruthy();
+  });
+
+  it('observes a preset-internal injectable also when the panel sits above it', async () => {
+    function useQuery(fn: () => Promise<string[]>, options?: {name?: string}) {
+      const fetcher = useInjectable(fn, options);
+      useRun(fetcher, []);
+      return useResult(fetcher);
+    }
+    function Tags() {
+      useQuery(async () => ['a'], {name: 'fetchTags'});
+      return null;
+    }
+    function App() {
+      return (
+        <>
+          <InjectDevTools />
+          <Tags />
+        </>
+      );
+    }
+    render(<App />);
+
+    // Insertion effects run tree-first: the panel subscribes to registry
+    // changes before the feature registers, then attaches synchronously
+    // inside the notification — the first call is observed in this order
+    // too.
+    expect(await screen.findByText('fetchTags', {selector: 'td'})).toBeTruthy();
+  });
+
+  it('keeps watching exactly the passed injectables — no registry by default', async () => {
+    const namedFetcher = vi.fn(async () => 'named');
+    const directFetcher = vi.fn(async () => 'direct');
+    let named: any;
+    let direct: any;
+    function Feature() {
+      named = useInjectable(namedFetcher, {name: 'fetchTags'});
+      return null;
+    }
+    function Host() {
+      direct = useInjectable(directFetcher);
+      return (
+        <>
+          <Feature />
+          <InjectDevTools injectables={[direct]} />
+        </>
+      );
+    }
+    render(<Host />);
+
+    await act(async () => {
+      await named();
+      await direct();
+    });
+
+    // The explicit-prop mode is unchanged: only what was handed in is
+    // watched, registry members are invisible. (The unnamed injectable
+    // shows as 'anonymous'; its row is distinguished by the result.)
+    expect(screen.getByText(/\[\] → direct/, {selector: 'td'})).toBeTruthy();
+    expect(screen.queryByText('fetchTags', {selector: 'td'})).toBeNull();
+    expect(screen.queryByText(/\[\] → named/, {selector: 'td'})).toBeNull();
+  });
+
+  it('merges explicit injectables and the registry with registry: true — overlap watched once', async () => {
+    const fetcher = vi.fn(async (x: number) => x);
+    let overlap: any;
+    let namedOnly: any;
+    let directFn: any;
+    function Feature() {
+      overlap = useInjectable(fetcher, {name: 'fetchTags'});
+      namedOnly = useInjectable(fetcher, {name: 'fetchUsers'});
+      return null;
+    }
+    // The overlap fn is captured from Feature's render, so it can only be
+    // handed to the panel AFTER the first commit — hence the rerender.
+    function Host({withOverlap}: {withOverlap: boolean}) {
+      const fn = useInjectable(fetcher);
+      directFn = fn;
+      return (
+        <>
+          <Feature />
+          {/* The overlap fn arrives through BOTH channels. */}
+          <InjectDevTools
+            injectables={withOverlap ? [fn, overlap] : [fn]}
+            registry
+          />
+        </>
+      );
+    }
+    const view = render(<Host withOverlap={false} />);
+    view.rerender(<Host withOverlap={true} />);
+
+    await act(async () => {
+      await directFn(1);
+      await overlap(2);
+      await namedOnly(3);
+    });
+
+    // All three sources recorded — one row each, the overlap fn exactly
+    // once despite arriving through both channels.
+    expect(screen.getAllByRole('row')).toHaveLength(4);
+    expect(screen.getByText(/\[1\]/, {selector: 'td'})).toBeTruthy();
+    expect(screen.getByText(/\[2\]/, {selector: 'td'})).toBeTruthy();
+    expect(screen.getByText(/\[3\]/, {selector: 'td'})).toBeTruthy();
+  });
+
+  it('keeps watching a prop injectable after its registry entry unregisters', async () => {
+    const fetcher = vi.fn(async (x: number) => x);
+    let overlap: any;
+    let directFn: any;
+    function Feature() {
+      overlap = useInjectable(fetcher, {name: 'fetchTags'});
+      return null;
+    }
+    // The overlap fn is only referenceable after Feature's first render,
+    // so the panel grows the prop in phase 1 — then the feature unmounts
+    // in phase 2 while the prop keeps holding the (now unregistered) fn.
+    function Host({show, withOverlap}: {show: boolean; withOverlap: boolean}) {
+      const fn = useInjectable(fetcher);
+      directFn = fn;
+      return (
+        <>
+          {show && <Feature />}
+          <InjectDevTools
+            injectables={withOverlap ? [fn, overlap] : [fn]}
+            registry
+          />
+        </>
+      );
+    }
+    const view = render(<Host show={true} withOverlap={false} />);
+    view.rerender(<Host show={true} withOverlap={true} />);
+
+    await act(async () => {
+      await overlap(1);
+    });
+    expect(screen.getByText(/\[1\]/, {selector: 'td'})).toBeTruthy();
+
+    // The registry entry is gone; the detach guard must spare the prop
+    // member — its calls are still observed.
+    view.rerender(<Host show={false} withOverlap={true} />);
+    expect(getNamedInjectables()).toEqual([]);
+    await act(async () => {
+      await overlap(2);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/\[2\]/, {selector: 'td'})).toBeTruthy();
+  });
+
+  it('survives StrictMode double effects with exactly one registry entry and no duplicate rows', async () => {
+    const fetcher = vi.fn(async (x: number) => x);
+    let injectable: any;
+    function Host() {
+      injectable = useInjectable(fetcher, {name: 'fetchTags'});
+      return <InjectDevTools />;
+    }
+    render(
+      <StrictMode>
+        <Host />
+      </StrictMode>
+    );
+
+    // Insertion effects ran add → remove → add (simulated unmount/remount):
+    // the registry holds exactly the one live instance.
+    expect(getNamedInjectables()).toEqual([injectable]);
+
+    await act(async () => {
+      await injectable(7);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+  });
+
+  it('stops recording when the named feature unmounts — the chain keeps working', async () => {
+    const fetcher = vi.fn(async (x: number) => x);
+    let injectable: any;
+    function Feature() {
+      injectable = useInjectable(fetcher, {name: 'fetchTags'});
+      return null;
+    }
+    function Host({show}: {show: boolean}) {
+      return (
+        <>
+          {show && <Feature />}
+          <InjectDevTools />
+        </>
+      );
+    }
+    const view = render(<Host show={true} />);
+
+    await act(async () => {
+      await injectable(1);
+    });
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+
+    // Unmounting the feature unregisters it; the panel detaches its
+    // observer. The stale function reference still calls through the
+    // (now observer-free) chain — the call resolves, nothing is recorded.
+    view.rerender(<Host show={false} />);
+    expect(getNamedInjectables()).toEqual([]);
+    await act(async () => {
+      await injectable(2);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/\[1\]/, {selector: 'td'})).toBeTruthy();
+    expect(screen.queryByText(/\[2\]/, {selector: 'td'})).toBeNull();
   });
 });

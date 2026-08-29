@@ -137,6 +137,11 @@ import {InjectDevTools} from 'react-toolroom/devtools';
 
 // 仅开发环境，挂在树里任意位置——独立入口、内联样式、零依赖。
 <InjectDevTools injectables={[fetchUsers]} />
+
+// 预设 hook 内部的 injectable 拿不到引用——给它起名
+// （useInjectable(fn, {name: 'fetchTags'}))后省略 prop：
+// 面板自动发现所有存活的具名 injectable。
+<InjectDevTools />
 ```
 
 ## `memo` 与 React Compiler 的关系
@@ -218,6 +223,8 @@ function UsersPage() {
 wrapper 接收 `(nextFn, callContext)`：`nextFn` 是要调用的下一层内层函数；`callContext` 是每次调用新生成的对象——当 `useRun` 以 `{signal: true}` 运行时，末尾追加的 `AbortSignal` 会以 `callContext.signal` 暴露出来，让更深层的 wrapper 能感知取消。需要跨调用共享状态时，`getInjectContext(fetchUsers)` 返回该 injectable 的稳定 context 对象（result 和 loading store 就存在这里）。`useInjectBefore` 是高级变体：它把 wrapper 插到链头而非链尾，因此先于已注册的 wrapper 被应用，最终位于最内层、紧贴原始函数。
 
 注册 wrapper 也不一定需要 hook。注入模块还导出 `addWrapper(fn, wrapper)`——签名同为 `InjectWrapper<F>`（`(f, callContext) => f`）的非 hook 原语——它向同一条链压入 wrapper 并返回退订函数；`subscribeInjectEvents` 本身就是架在它上面的一层薄观察器，非 React 工具（日志面板、devtools）正是这样接入调用链的。反方向上，`useRun` 甚至不要求传入 injectable：它会先用 `isInjectable(fn)` 探测参数，普通函数完全跳过 wrapper 机制，同时保持相同的"变化即重跑"行为。
+
+每实例链做不到的一件事是发现：挂在某个实例上的观察器看不到另一实例的调用（两个组件用同一个预设，各自持有独立的 `useInjectable`），而预设的 injectable 从不离开 hook。面向工具侧有一个可选的发现通道——`useInjectable(fn, {name})` 会把实例发布到模块级注册表，存续期与其组件一致，`<InjectDevTools />` 无需引用即可观察全部存活成员（见下方菜谱）。
 
 ## 实战示例
 
@@ -606,6 +613,50 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 `subscribeInjectEvents` 是普通函数而非 hook——可以在 effect、模块顶层甚至浏览器控制台里注册。观察器注册为最外层 wrapper，因此 `onSettle` 每次调用恰好触发一次，携带 `{args, result | error, duration}`，其中 `duration` 度量它观察到的整条洋葱链（原始函数加订阅之前注册的所有 wrapper）。最小日志面板只需在它上面叠一层状态：把每次 settle 事件推进数组再渲染即可。想要同一洋葱模型的可运行演示——跨组件注入、层次顺序、卸载自动移除——见 [`demos/views/Async/Inject.tsx`](./demos/views/Async/Inject.tsx)。
 
+### 观察预设内部的 injectable — `useInjectable(fn, {name})`
+
+wrapper 链挂在 hook 实例上：两个组件使用同一个预设（`useQuery` 类组合）时各持有一个独立的 `useInjectable`，挂在其中一个实例上的观察器永远看不到另一个实例的调用。对行为而言这是正确的——每个组件组合自己的链——但面板因此失明：预设的 injectable 从不离开 hook，根本没有引用可以交给 `<InjectDevTools injectables={…}>`。
+
+`{name}` 就是针对这一场景的可选发现通道——模块级具名注册表：
+
+```tsx
+import {useInjectable, useRun, useResult} from 'react-toolroom/async';
+import {InjectDevTools} from 'react-toolroom/devtools';
+
+// 一个预设：injectable 保持内部私有——用 name 发布进注册表。
+function useTags() {
+  const fetchTags = useInjectable(fetchTagList, {name: 'fetchTags'});
+  useRun(fetchTags, []);
+  return useResult(fetchTags);
+}
+
+function Tags() {
+  const tags = useTags();
+  return <ul>{tags?.map((t) => <li key={t}>{t}</li>)}</ul>;
+}
+
+function App() {
+  return (
+    <>
+      <Tags />
+      {/* 不传引用：自动观察所有存活的具名 injectable。 */}
+      {import.meta.env.DEV && <InjectDevTools />}
+    </>
+  );
+}
+```
+
+语义：
+
+- **注册跟随组件生命周期。** 实例在挂载时发布、卸载时注销（注册发生在 effect 里而非渲染期，不会留下被丢弃渲染的孤儿；StrictMode 的模拟卸载/重挂载会干净地重新注册）。
+- **重名共存。** 两个组件使用同一个具名预设时同时注册——各自卸载只注销自己的实例，面板能观察到共享同一名字的所有存活实例的调用。
+- **名字即显示名。** 返回函数的 `name` 属性会被设置为它，日志行、Refetch 匹配与调用栈看到的都是 `fetchTags` 而非 `'anonymous'`。
+- **该选项在每个调用点上是静态的。** 首次渲染的值即被固定——之后切换名字会改变组件的 hook 顺序。
+- **不传名字则一切不变。** 不注册、无 effect、无状态：无名路径与注册表出现之前完全一致。
+- **请给异步函数命名。** 面板经 `subscribeInjectEvents` 观察调用并 await 其结果——具名的同步函数在面板观察期间会让自身调用崩溃。
+
+注册表只列举实例，不触碰行为。所有每实例 store（wrapper 链、call context）都留在原处——`<InjectDevTools>` 只是把"需要引用"换成了"枚举存活成员"。显式传 `injectables` 的面板继续只观察传入的那些；想两者都看，传 `registry: true`。
+
 ## API 参考
 
 ### 核心 — `react-toolroom`
@@ -622,7 +673,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 | API | 说明 |
 | --- | --- |
-| `useInjectable(fn)` | 把任意函数变为带私有 wrapper 链的 injectable；返回的函数跨渲染引用稳定。 |
+| `useInjectable(fn, options?)` | 把任意函数变为带私有 wrapper 链的 injectable；返回的函数跨渲染引用稳定。`options.name` 可选加入具名注册表——面向预设 hook 内部 injectable 的 devtools 发现通道：挂载时发布、卸载时注销、重名共存，且名字会成为 injectable 的显示名（`fn.name`）。每个调用点静态（首次渲染即固定）；不传名字时路径与之前完全一致、零注册。 |
 | `isInjectable(fn)` | `fn` 是否为 `useInjectable` 的产物——`useRun` 用它兼容普通（非 injectable）函数，你自己的 wrapper 也可以用它做探测。 |
 | `useInject(fn, wrapper)` | 在 injectable 上注册 `wrapper: (nextFn, callContext) => nextFn`；每个 hook 实例只注册一次，卸载时移除。 |
 | `useInjectBefore(fn, wrapper)` | 高级 API：把 wrapper 插入链头——先于已注册的 wrapper 被应用，最终位于最内层、紧贴原始函数。 |
@@ -659,7 +710,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 | API | 说明 |
 | --- | --- |
-| `<InjectDevTools injectables, caches?, limit?, title?>` | 零依赖调用轨迹面板。经 `subscribeInjectEvents` 订阅每个 injectable，把最近 `limit`（默认 50）条 settle 事件渲染成内联样式表格——时间、函数名、状态、耗时、参数/结果摘要——卸载时退订。可选 `caches` 传入实现了 `snapshot` 的 cache provider（如 `createMemoryCacheProvider()` 实例），面板会在第二张订阅驱动的表格里渲染缓存条目——key、age、value。`injectables` / `caches` 请传引用稳定的数组（模块常量或 `useMemo`）。 |
+| `<InjectDevTools injectables?, registry?, caches?, limit?, title?, refetchable?>` | 零依赖调用轨迹面板。经 `subscribeInjectEvents` 订阅每个被观察的 injectable，把最近 `limit`（默认 50）条 settle 事件渲染成内联样式表格——时间、函数名、状态、耗时、参数/结果摘要——卸载时退订。观察对象是 `injectables` prop，外加（`registry` 开启时）所有存活的 `useInjectable(fn, {name})` 实例：省略 `injectables` 时 `registry` 默认为 `true`（观察所有具名 injectable——观察预设内部 injectable 的方式，其引用从不离开 hook；成员随组件挂载/卸载同步接入/摘除，预设的第一次调用也能被观察到——React 18+；16.8/17 无 insertion 阶段，同 commit 挂载可能错过首次调用，后续调用照常观察），传入时默认为 `false`（已有面板继续只观察显式交给它的）。可选 `caches` 传入实现了 `snapshot` 的 cache provider（如 `createMemoryCacheProvider()` 实例），面板会在第二张订阅驱动的表格里渲染缓存条目——key、age、value。`injectables` / `caches` 请传引用稳定的数组（模块常量或 `useMemo`）。 |
 | `useInjectLog(fn, limit?)` | 面板背后的无头引擎：返回 `{events, clear}`，携带同样格式的 `InjectLogEvent[]`——用它搭建自己的面板 UI。 |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}`——`duration` 覆盖观察者之下的整条洋葱链；`name` 取 `fn.name`，`useInjectable` 返回的匿名 wrapper 显示为 `'anonymous'`。 |
 

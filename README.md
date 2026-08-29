@@ -137,6 +137,11 @@ import {InjectDevTools} from 'react-toolroom/devtools';
 
 // Dev-only, anywhere in the tree — separate entry, inline styles, zero deps.
 <InjectDevTools injectables={[fetchUsers]} />
+
+// Preset hooks keep their injectable internal — name it
+// (useInjectable(fn, {name: 'fetchTags'})) and drop the prop:
+// the panel discovers every live named injectable on its own.
+<InjectDevTools />
 ```
 
 ## `memo` and the React Compiler
@@ -218,6 +223,8 @@ function UsersPage() {
 A wrapper receives `(nextFn, callContext)`: `nextFn` is the next inner layer to call, and `callContext` is a fresh object per call — when `useRun` runs with `{signal: true}`, the trailing `AbortSignal` is exposed as `callContext.signal` so deeper wrappers can observe cancellation. For state shared across calls, `getInjectContext(fetchUsers)` returns the injectable's stable context object (this is where the result and loading stores live). `useInjectBefore` is the advanced variant: it inserts the wrapper at the head of the chain instead of the tail, so it is applied before previously registered wrappers and ends up as the innermost layer, closest to the original function.
 
 Registration does not require a hook. The injection module also exposes `addWrapper(fn, wrapper)` — the non-hook primitive with the `InjectWrapper<F>` signature `(f, callContext) => f` — which pushes onto the same chain and returns an unsubscribe function; `subscribeInjectEvents` is nothing more than a thin observer built on top of it, which is how non-React tooling (log panels, devtools) taps into a chain. In the other direction, `useRun` does not even require an injectable: it probes its argument with `isInjectable(fn)` up front, and plain functions skip the wrapper machinery entirely while keeping the same run-on-change behavior.
+
+One thing a per-instance chain cannot do is discovery: an observer attached to one instance never sees calls through another (two components using the same preset each own a separate `useInjectable`), and a preset's injectable never leaves the hook. For tooling there is an opt-in discovery channel — `useInjectable(fn, {name})` publishes the instance into a module-level registry for its component's lifetime, and `<InjectDevTools />` watches every live member without needing a reference (see the recipe below).
 
 ## Recipes
 
@@ -655,6 +662,50 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 `subscribeInjectEvents` is a plain function, not a hook — register from an effect, a module, or the browser console. The observer is registered as the outermost wrapper, so `onSettle` fires exactly once per call with `{args, result | error, duration}` where `duration` measures the entire onion chain it observes (original function plus every wrapper registered before the subscription). A minimal log panel is just state on top: push each settle event into an array and render it. For a runnable tour of the same onion model — cross-component injection, layer order, automatic removal on unmount — see the demo at [`demos/views/Async/Inject.tsx`](./demos/views/Async/Inject.tsx).
 
+### Observe injectables inside presets — `useInjectable(fn, {name})`
+
+The wrapper chain lives on the hook instance: two components using the same preset (`useQuery`-like compositions) each own a separate `useInjectable`, and an observer attached to one instance never sees the other's calls. Correct for behavior — each component composes its own chain — but it leaves a panel blind, because the preset's injectable never leaves the hook and there is no reference to hand to `<InjectDevTools injectables={…}>`.
+
+`{name}` opts into the module-level named registry, the discovery channel for exactly that case:
+
+```tsx
+import {useInjectable, useRun, useResult} from 'react-toolroom/async';
+import {InjectDevTools} from 'react-toolroom/devtools';
+
+// A preset: the injectable stays internal — name it for the registry.
+function useTags() {
+  const fetchTags = useInjectable(fetchTagList, {name: 'fetchTags'});
+  useRun(fetchTags, []);
+  return useResult(fetchTags);
+}
+
+function Tags() {
+  const tags = useTags();
+  return <ul>{tags?.map((t) => <li key={t}>{t}</li>)}</ul>;
+}
+
+function App() {
+  return (
+    <>
+      <Tags />
+      {/* No references handed in: watches every live named injectable. */}
+      {import.meta.env.DEV && <InjectDevTools />}
+    </>
+  );
+}
+```
+
+Semantics:
+
+- **Registration follows the component's lifetime.** The instance is published on mount and unregistered on unmount (registration happens in an effect, never during render, so no discarded-render orphans; StrictMode's simulated unmount/remount re-registers cleanly).
+- **Duplicate names coexist.** Two components using the same named preset are both registered — each unmount removes exactly its own instance, and a panel observes calls through every live instance sharing the name.
+- **The name becomes the display name.** The returned function's `name` property is set to it, so log rows, Refetch matching and stack traces read `fetchTags` instead of `'anonymous'`.
+- **The option is static per call site.** The first render's value is fixed — toggling the name later would reorder the component's hooks.
+- **Without a name, nothing changes.** No registration, no effect, no state: the unnamed path is exactly what it was before the registry existed.
+- **Name async injectables.** The panel observes through `subscribeInjectEvents`, which awaits each call's result — a named synchronous function would crash its own calls while a panel is watching.
+
+The registry lists instances; it does not touch behavior. Every per-instance store (wrapper list, call context) stays where it was — `<InjectDevTools>` simply enumerates the live members instead of needing a reference. Panels that pass `injectables` explicitly keep watching exactly what they were handed; pass `registry: true` to watch both.
+
 ## API reference
 
 ### Core — `react-toolroom`
@@ -671,7 +722,7 @@ const stop = subscribeInjectEvents(fetchUsers, {
 
 | API | Description |
 | --- | --- |
-| `useInjectable(fn)` | Turn any function into an injectable with a per-instance wrapper chain; the returned identity is stable across renders. |
+| `useInjectable(fn, options?)` | Turn any function into an injectable with a per-instance wrapper chain; the returned identity is stable across renders. `options.name` opts into the named registry — the devtools discovery channel for injectables created inside preset hooks: published on mount, unregistered on unmount, duplicate names coexist, and the name becomes the injectable's display name (`fn.name`). Static per call site (first render fixes it); without a name the path is unchanged and registration-free. |
 | `isInjectable(fn)` | `true` when `fn` was created by `useInjectable` — the probe `useRun` uses to accept plain (non-injectable) functions, also handy for your own wrappers. |
 | `useInject(fn, wrapper)` | Register `wrapper: (nextFn, callContext) => nextFn` on an injectable; registered once per hook instance, removed on unmount. |
 | `useInjectBefore(fn, wrapper)` | Advanced API: insert the wrapper at the head of the chain — applied before previously registered wrappers, ending up as the innermost layer, closest to the original function. |
@@ -709,7 +760,7 @@ Separate entry: importing it never adds a byte to the core or async bundles.
 
 | API | Description |
 | --- | --- |
-| `<InjectDevTools injectables, caches?, limit?, title?, refetchable?>` | Zero-dependency call-trace panel. Subscribes every injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table; providers also implementing `delete`/`clear`/`deleteKey` get action buttons (pure cache writes — mounted `useCache` consumers revalidate through the normal deletion events): per-row **Remove** deletes through the row's hashed key when the provider implements `deleteKey` — precise even when the stored args tuple was mutated in place after `set`, and able to address hydrated rows that carry no tuple — and falls back to re-hashing the stored tuple otherwise, flagging the row `remove missed` on a provable miss; per-cache **Invalidate** purges everything through `clear`. Passing `refetchable` (the same array as `injectables`) adds a **Refetch** button per log row that replays the recorded args through the live wrapper chain, stripping a trailing `AbortSignal` that has already aborted (the recorded run's owner is gone — replaying a dead signal would fail instantly). Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
+| `<InjectDevTools injectables?, registry?, caches?, limit?, title?, refetchable?>` | Zero-dependency call-trace panel. Subscribes every watched injectable via `subscribeInjectEvents` and renders the last `limit` (default 50) settle events — time, function name, status, duration, args/result summary — in an inline-styled table; unsubscribes on unmount. Watched are the `injectables` prop plus, with `registry` on, every live `useInjectable(fn, {name})` instance: `registry` defaults to `true` when `injectables` is omitted (watch every named injectable — the way to observe presets, whose references never leave the hook; members attach/detach synchronously with their components, so a preset's first call is observed — React 18+; on 16.8/17 there is no insertion phase, so a same-commit mount may miss the very first call while later calls are observed normally) and `false` when it is passed (existing panels keep watching exactly what they were handed). The optional `caches` prop takes cache providers implementing `snapshot` (e.g. `createMemoryCacheProvider()` instances) and renders their entries — key, age, value — in a second, subscription-driven table; providers also implementing `delete`/`clear`/`deleteKey` get action buttons (pure cache writes — mounted `useCache` consumers revalidate through the normal deletion events): per-row **Remove** deletes through the row's hashed key when the provider implements `deleteKey` — precise even when the stored args tuple was mutated in place after `set`, and able to address hydrated rows that carry no tuple — and falls back to re-hashing the stored tuple otherwise, flagging the row `remove missed` on a provable miss; per-cache **Invalidate** purges everything through `clear`. Passing `refetchable` (the same array as `injectables`) adds a **Refetch** button per log row that replays the recorded args through the live wrapper chain, stripping a trailing `AbortSignal` that has already aborted (the recorded run's owner is gone — replaying a dead signal would fail instantly). Pass referentially stable `injectables`/`caches` arrays (module constant or `useMemo`). |
 | `useInjectLog(fn, limit?)` | The headless engine behind the panel: returns `{events, clear}` carrying the same `InjectLogEvent[]` — build your own panel UI on it. |
 | `InjectLogEvent` | `{seq, name, args, result?, error?, duration, at}` — `duration` covers the whole onion chain below the observer; `name` is `fn.name`, and shows `'anonymous'` for the unnamed wrappers `useInjectable` returns. |
 
