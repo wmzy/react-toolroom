@@ -65,6 +65,43 @@ export function subscribeNamedInjectables(listener: () => void): () => void {
 // are told apart from not-yet-confirmed siblings of the same commit.
 const CLAIMED = Symbol('claimed');
 const SEQ = Symbol('seq');
+// Swallow marker: rides on a stable wrapper slot. The call boundary derives
+// the errors-as-state opt-in from the LIVE slots — same lifecycle as the
+// chain itself (registered during render, claimed in an effect, removed on
+// unmount, orphaned passes reclaimed by the filter above), so a render-time
+// early caller is covered exactly like it would be by a tail wrapper.
+const SWALLOW = Symbol('swallow');
+
+// Identity wrapper: the swallow semantics live in the slot marker only —
+// this layer never changes behavior while the chain folds.
+const SWALLOW_IDENTITY: InjectWrapper<Func> = (f) => f;
+
+/**
+ * Registers the swallow marker slot: errors-as-state for an injectable.
+ * Called from `useErrorWrapper` — mounting any error-reading hook
+ * (`useError` / `useArgsStatus` / `useFailureCount`) claims the errors of
+ * the instance: failures then resolve `undefined` at the call boundary
+ * instead of rejecting, because a reader has declared ownership of them.
+ * Slot-based (not an instance flag) on purpose — the flag variant only
+ * takes effect in an insertion effect, leaving render-time early callers
+ * (a contract the trampoline machinery preserves) with a dangling
+ * rejection. The marker rides the chain's own lifecycle instead, and the
+ * call boundary derives the opt-in from live slots after the whole chain
+ * has observed the rejection. The wrapper itself is identity: swallowing
+ * never participates in the onion fold, so composition order carries no
+ * semantics (an outer useCache can never cache the swallowed undefined).
+ */
+export function useSwallowCell<F extends Func>(fn: F): void {
+  useInjectCell(
+    fn,
+    'useSwallowErrors',
+    SWALLOW_IDENTITY as unknown as InjectWrapper<F>,
+    (list, stable) => {
+      (stable as {[SWALLOW]?: boolean})[SWALLOW] = true;
+      list.push(stable);
+    }
+  );
+}
 
 type Registry = {
   /** Monotonic insertion counter for render-time trampolines. */
@@ -162,16 +199,19 @@ export function useInjectable<F extends Func>(
     }
     const callContext = {};
     const result = injects.reduce((i, w) => w(i, callContext), func)(...args);
-    // Errors-as-state opt-in (useSwallowErrors): the instance-level flag is
-    // known before the call starts — unlike a per-call flag, it survives
-    // wrappers that defer their inner calls (useCache defers through its
-    // get-chain). The catch is attached HERE, after the whole chain has
-    // run, so wrapper order never matters: error recorders (useError's
-    // wrapper) still see the rejection and rethrow first, and no layer
-    // registered later can mistake the swallowed failure for a settled
-    // `undefined` (a useCache outside it would cache that).
+    // Errors-as-state opt-in (useSwallowErrors): derived from live swallow
+    // slots — registration-effective from render time (a render-time early
+    // caller is covered, matching a tail wrapper), removed on unmount, and
+    // orphaned passes are reclaimed by the filter above. The catch is
+    // attached HERE, after the whole chain has run, so wrapper order never
+    // matters: error recorders (useError's wrapper) still see the rejection
+    // and rethrow first, and no layer registered later can mistake the
+    // swallowed failure for a settled `undefined` (a useCache outside it
+    // would cache that).
     // `Promise.resolve` is identity for promises and tolerates sync fns.
-    return ctx.swallow ? Promise.resolve(result).catch(noop) : result;
+    return injects.some((w) => (w as {[SWALLOW]?: boolean})[SWALLOW])
+      ? Promise.resolve(result).catch(noop)
+      : result;
   }, []) as F;
 
   map.set(f, ref);

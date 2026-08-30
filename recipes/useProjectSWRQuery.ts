@@ -33,7 +33,7 @@ import {
   useRefresh,
   useResult,
   useRun,
-  useSwallowErrors,
+
   type R
 } from 'react-toolroom/async';
 import {fetchList} from '@/services/user';
@@ -107,10 +107,10 @@ export function useProjectSWRQuery(options?: {
   useDedup(loadProjects);
   const isStale = useCache(loadProjects, projectCache, staleTime);
   useFocusRevalidate(loadProjects);
-  // Errors as state: every trigger above is fire-and-forget, so failures
-  // resolve `undefined` at the call boundary instead of dangling — the
-  // `error` field below stays the one place to read them.
-  useSwallowErrors(loadProjects);
+  // Errors as state: the `error` read below claims the instance's
+  // failures — every fire-and-forget trigger above resolves `undefined`
+  // at the call boundary instead of dangling, and `error` stays the one
+  // place to read them.
   // Plain `[]` — see the header note on cache-key alignment with
   // `useFocusRevalidate` before adding options or `{signal: true}`.
   useRun(loadProjects, []);

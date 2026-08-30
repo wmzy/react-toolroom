@@ -1,6 +1,6 @@
 import {describe, it, expect, vi} from 'vitest';
 import {act, fireEvent, render, screen} from '@testing-library/react';
-import {createElement} from 'react';
+import {createElement, useEffect, useRef} from 'react';
 import {
   useRun,
   useInjectable,
@@ -33,6 +33,113 @@ import {
 } from '../src/async';
 import {useLoadingFn} from '../src/async/base';
 import {addWrapper, useInjectBefore} from '../src/async/inject';
+
+describe('错误认领语义：挂 useError 即吞（与链尾 catch wrapper 等价）', () => {
+  // 读即认领：挂载 useError（或 useArgsStatus/useFailureCount）声明「错误
+  // 走状态通道」，实例的调用失败在调用边界 resolve undefined 而不再
+  // reject。曾经的机制分叉点是渲染期早调用——链尾 wrapper 渲染期注册
+  // 即生效（inject.ts 的 trampoline 显式保留 render-time early-caller
+  // 契约），flag 型实现要到 insertion effect 才置位，渲染期 rejection
+  // 逃逸成 unhandled。槽化后标记与链同生命周期，全时序等价；effect 期
+  // 发起的调用（useRun/useRefresh/focus/手写）两版一直等价。这组用例
+  // 是认领语义与时序的回归防线。
+  function collectUnhandled(sink: unknown[]) {
+    const onUnhandled = (reason: unknown) => sink.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    return () => process.off('unhandledRejection', onUnhandled);
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it('渲染期早调用：链尾 wrapper 吞掉（无 unhandled）', async () => {
+    const unhandled: unknown[] = [];
+    const off = collectUnhandled(unhandled);
+    try {
+      const fail = () => Promise.reject(new Error('boom-old'));
+      function OldStyle() {
+        const injectable = useInjectable(fail);
+        useInject(injectable, (g) =>
+          ((...a: Parameters<typeof fail>) =>
+            g(...a).catch(() => undefined)) as typeof fail
+        );
+        // 渲染期早调用只发一次：不防重的话，settle 触发的重渲染会再次
+        // 调用——渲染期调用 + 订阅的组合自身就是循环，与吞错无关。
+        const called = useRef(false);
+        if (!called.current) {
+          called.current = true;
+          void injectable();
+        }
+        return null;
+      }
+      render(createElement(OldStyle));
+      await settle();
+      await settle();
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      off();
+    }
+  });
+
+  it('渲染期早调用：挂 useError 同样吞掉（槽注册即生效，等价）', async () => {
+    const unhandled: unknown[] = [];
+    const off = collectUnhandled(unhandled);
+    try {
+      const fail = () => Promise.reject(new Error('boom-new'));
+      function NewStyle() {
+        const injectable = useInjectable(fail);
+        useError(injectable);
+        // 同上：渲染期调用只发一次，否则 useError 的订阅把 settle 变成
+        // 渲染循环（那是组合反模式，不是被测语义）。
+        const called = useRef(false);
+        if (!called.current) {
+          called.current = true;
+          void injectable();
+        }
+        return null;
+      }
+      render(createElement(NewStyle));
+      await settle();
+      await settle();
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      off();
+    }
+  });
+
+  it('effect 期调用：两版等价——无 unhandled 且调用方拿到 undefined', async () => {
+    const unhandled: unknown[] = [];
+    const off = collectUnhandled(unhandled);
+    try {
+      const results: unknown[] = [];
+      const fail = () => Promise.reject(new Error('boom-effect'));
+      function makeComp(claim: boolean) {
+        return function Comp() {
+          const injectable = useInjectable(fail);
+          if (claim) useError(injectable);
+          else
+            useInject(injectable, (g) =>
+              ((...a: Parameters<typeof fail>) =>
+                g(...a).catch(() => undefined)) as typeof fail
+            );
+          useRun(injectable, []);
+          useError(injectable);
+          if (injectable)
+            useEffect(() => {
+              void injectable().then((r) => results.push(r));
+            }, [injectable]);
+          return null;
+        };
+      }
+      render(createElement(makeComp(true)));
+      render(createElement(makeComp(false)));
+      await settle();
+      await settle();
+      expect(unhandled).toHaveLength(0);
+      expect(results).toEqual([undefined, undefined]);
+    } finally {
+      off();
+    }
+  });
+});
 
 describe('async hooks exports', () => {
   it('should export useRun', () => {

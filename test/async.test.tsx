@@ -26,7 +26,6 @@ import {
   useCache,
   useInvalidate,
   useRefresh,
-  useSwallowErrors,
   useMutation,
   invalidate,
   getInjectContext,
@@ -1956,7 +1955,7 @@ describe('async hooks', () => {
       expect(screen.getByText('failures: 0')).toBeDefined();
     });
 
-    it('useSwallowErrors should resolve undefined on failure while the error stays readable from state', async () => {
+    it('useError mount should resolve undefined on failure while the error stays readable from state', async () => {
       const fetchData = vi.fn(async (): Promise<string> => {
         throw new Error('swallowed');
       });
@@ -1966,7 +1965,6 @@ describe('async hooks', () => {
 
       function TestComponent() {
         const injectable = useInjectable(fetchData);
-        useSwallowErrors(injectable);
         const error = useError<Error>(injectable);
         injectableRef = injectable;
         return <span>{error ? error.message : 'no error'}</span>;
@@ -1996,7 +1994,7 @@ describe('async hooks', () => {
       });
     });
 
-    it('useSwallowErrors should swallow after the whole chain regardless of registration order — a later useCache never caches undefined', async () => {
+    it('useError mount should swallow after the whole chain regardless of registration order — a later useCache never caches undefined', async () => {
       const fetchData = vi.fn(async (): Promise<string> => {
         throw new Error('chain order');
       });
@@ -2005,7 +2003,6 @@ describe('async hooks', () => {
       function TestComponent() {
         const injectable = useInjectable(fetchData);
         // worst order: the swallow opt-in registered BEFORE useCache
-        useSwallowErrors(injectable);
         useCache(injectable, cache);
         const error = useError<Error>(injectable);
         return (
@@ -2036,7 +2033,7 @@ describe('async hooks', () => {
       expect(fetchData).toHaveBeenCalledTimes(2);
     });
 
-    it('useSwallowErrors should keep useRun-triggered failures rejection-free', async () => {
+    it('useError mount should keep useRun-triggered failures rejection-free', async () => {
       const fetchData = vi.fn(async (): Promise<string> => {
         throw new Error('run failure');
       });
@@ -2046,7 +2043,6 @@ describe('async hooks', () => {
 
       function TestComponent() {
         const injectable = useInjectable(fetchData);
-        useSwallowErrors(injectable);
         const error = useError<Error>(injectable);
         useRun(injectable, []);
         return <span>{error ? error.message : 'no error'}</span>;

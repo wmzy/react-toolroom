@@ -77,7 +77,7 @@ import {
   useInjectable,
   getInjectContext,
   isInjectable,
-  useClaim
+  useSwallowCell
 } from './inject';
 import {
   ErrorStore,
@@ -770,6 +770,11 @@ function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
 export function useError<E extends Error, AF extends AsyncFunc = AsyncFunc>(
   injectableFn: AF
 ): E | undefined {
+  // Mounting this hook claims the instance's errors: failures resolve
+  // `undefined` at the call boundary instead of rejecting — the reader has
+  // declared ownership, so nobody else needs the rejection. Unmount the
+  // last reader and rejections flow to callers again (see useSwallowCell).
+  useSwallowCell(injectableFn);
   const store = useErrorWrapper(injectableFn);
   // Plain store field swapped in place by emitError — a stable snapshot.
   return useStoreValue(
@@ -789,61 +794,12 @@ export function useError<E extends Error, AF extends AsyncFunc = AsyncFunc>(
  * @return {number} the count of failures
  */
 export function useFailureCount<AF extends AsyncFunc>(injectableFn: AF) {
+  useSwallowCell(injectableFn);
   const store = useErrorWrapper(injectableFn);
   return useStoreValue(
     store,
     useCallback(() => store.failureCount, [store])
   );
-}
-
-/**
- * Opt an injectable into errors-as-state: while this hook is mounted, every
- * call through the injectable resolves `undefined` on failure instead of
- * rejecting, so fire-and-forget triggers — `useRun`, polling, focus/reconnect
- * revalidation, `useRefresh`, plain `void fn()` calls — never leave a
- * dangling (unhandled) rejection. Failures still reach every state hook
- * exactly as before: `useError`/`useArgsStatus`/`useFailureCount` record
- * them first, and the rejection is only swallowed after the whole wrapper
- * chain — `useCache` included — has observed it.
- *
- * The opt-in lives on the injectable instance (not on a wrapper at this
- * hook's chain position), so composition order carries no semantics: call
- * it before or after `useCache`, a cached layer still sees the real
- * rejection and never mistakes a swallowed failure for a settled
- * `undefined`. The flag is set in an insertion effect — before any passive
- * effect can call the injectable, whichever hook order you compose — and
- * refcounted, so several components opting into the same shared instance
- * keep the guarantee until the last one unmounts. Components that need the
- * rejection itself — a `useSuspenseResult` error boundary — simply do not
- * mount this hook on that injectable.
- *
- * @param {AsyncFunc} injectableFn - the injectable whose failures resolve
- *   `undefined` instead of rejecting.
- * @return {void} Nothing; the hook only flips the instance-level opt-in.
- * @example
- * ```tsx
- * const fetchUsers = useInjectable(getUsers);
- * useCache(fetchUsers, userCache);
- * useSwallowErrors(fetchUsers); // errors surface via useError only
- * const error = useError(fetchUsers);
- * useRun(fetchUsers, []); // a failure here no longer rejects unhandled
- * ```
- */
-export function useSwallowErrors<AF extends AsyncFunc>(
-  injectableFn: AF
-): void {
-  const ctx = getInjectContext(injectableFn) as {
-    swallow?: boolean;
-    swallowRefs?: number;
-  };
-  useClaim(() => {
-    ctx.swallowRefs = (ctx.swallowRefs ?? 0) + 1;
-    ctx.swallow = true;
-    return () => {
-      ctx.swallowRefs = (ctx.swallowRefs ?? 0) - 1;
-      if (ctx.swallowRefs === 0) ctx.swallow = false;
-    };
-  }, [ctx]);
 }
 
 /** Lifecycle callbacks of one mutation — naming aligned with TanStack/SWR. */
@@ -1086,9 +1042,21 @@ export function useMutation<
   // 3. Status from the shared stores — every flag is injectable-level
   //    state: sibling components tracking the same mutation update
   //    together, and late mounters start from the current values.
+  //    These read the error store through the internal recorder, NOT the
+  //    public `useError`/`useFailureCount`: the public hooks now claim
+  //    errors (errors-as-state, rejection swallowed at the call boundary),
+  //    and `mutate`'s contract keeps rejections flowing to the caller.
+  //    Library-internal reads are not a user's declaration of ownership.
   const isMutating = useLoading(mutate);
-  const error = useError(mutate);
-  const failureCount = useFailureCount(mutate);
+  const errorStore = useErrorWrapper(mutate);
+  const error = useStoreValue(
+    errorStore,
+    useCallback(() => errorStore.error, [errorStore])
+  );
+  const failureCount = useStoreValue(
+    errorStore,
+    useCallback(() => errorStore.failureCount, [errorStore])
+  );
 
   // 4. Clear the settled error bookkeeping. Writing with the CURRENT seq
   //    does not raise the watermark, so an in-flight call's ticket stays
@@ -1361,6 +1329,10 @@ export function useArgsStatus<AF extends AsyncFunc>(
   injectableFn: AF,
   args: Parameters<AF>
 ): ArgsStatus {
+  // Mounting this hook claims the instance's errors, exactly like
+  // `useError`/`useFailureCount`: the keyed failure reads declare
+  // ownership, so the instance's calls stop rejecting at the boundary.
+  useSwallowCell(injectableFn);
   const loadingStore = useLoadingWrapper(injectableFn);
   const errorStore = useErrorWrapper(injectableFn);
   // The scoped `data` read needs results to flow with provenance: this hook

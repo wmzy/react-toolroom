@@ -60,7 +60,7 @@ The [`recipes/`](./recipes/) directory holds copy-and-customize templates to sta
 | --- | --- |
 | [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | The base: `useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`. |
 | [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | The write side, on top of the first-class `useMutation`: pins the project's default failure reporting while an explicit `onError` still replaces it — the pattern for adding a house convention to a library hook. |
-| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`, with `useSwallowErrors` making every trigger's failure land in the returned `error` field (never a dangling rejection) and `useRefresh` as the returned stable `refetch` — drop the entry, force one fresh request. |
+| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`, with the `useError` read claiming the instance's failures (every trigger lands in the returned `error` field, never a dangling rejection) and `useRefresh` as the returned stable `refetch` — drop the entry, force one fresh request. |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | Adds `usePolling` on a fixed interval. |
 | [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data made observable by `usePlaceholderData`, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
 | [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | A `CacheProvider` that persists entries to `localStorage` — for caches that should survive a page reload instead of rebuilding from scratch. |
@@ -382,15 +382,14 @@ The entry a `useRun({signal: true})` rerun wrote is keyed by the args tuple **wi
 
 Where `useInvalidate(fn, cache)` takes its args per call and hands you the rejection-owning promise for mutation handlers, `useRefresh(fn, args, cache)` closes over the query's args and is safe to fire and forget — the refetch button vs. the post-mutation refresh.
 
-### Errors as state — `useSwallowErrors`
+### Errors as state — reading claims them
 
 ```tsx
 function UserList() {
   const fetchUsers = useInjectable(getUsers);
   useCache(fetchUsers, userCache);
-  useSwallowErrors(fetchUsers);
   const users = useResult(fetchUsers);
-  const error = useError(fetchUsers);
+  const error = useError(fetchUsers); // ← this mount claims the errors
   useRun(fetchUsers, []);
 
   if (error) return <ErrorPanel error={error} retry={() => fetchUsers()} />;
@@ -398,9 +397,9 @@ function UserList() {
 }
 ```
 
-By default every failure keeps flowing as a rejection, which is right when a caller owns the promise — but fire-and-forget triggers (`useRun`, polling, focus/reconnect revalidation, `useRefresh`, a plain `void fn()` call) have nobody to reject to, and a failing fetch leaves a dangling unhandled rejection. `useSwallowErrors` opts the injectable into errors-as-state (React Query's default philosophy): while mounted, every call through it resolves `undefined` on failure, and failures are read exclusively from `useError`/`useArgsStatus`/`useFailureCount` — which still record them first, because the rejection is only swallowed after the whole wrapper chain has observed it.
+Mounting any error-reading hook — `useError`, `useArgsStatus`, `useFailureCount` — declares ownership of the injectable's failures: while a reader is mounted, every call resolves `undefined` on failure instead of rejecting, so fire-and-forget triggers (`useRun`, polling, focus/reconnect revalidation, `useRefresh`, a plain `void fn()` call) never leave a dangling unhandled rejection. Nobody reading keeps the default: rejections flow to whoever holds the promise.
 
-The opt-in lives on the injectable instance, not at a wrapper position: call it before or after `useCache` — order carries no semantics — and a cached layer still sees the real rejection, so a swallowed failure is never mistaken for a settled `undefined` and written to the cache. Components that *want* the rejection (a `useSuspenseResult` error boundary) simply don't mount it on that injectable.
+The claim is a marker slot on the injectable's wrapper chain, not a wrapper at a chain position: order carries no semantics — a cached layer still sees the real rejection, so a swallowed failure is never mistaken for a settled `undefined` and written to the cache. The slot is registered during render (a render-time early caller is covered, exactly like a tail wrapper), confirmed in an insertion effect, and removed on unmount; discarded render passes are reclaimed at the call boundary. `useMutation` keeps rejections flowing to the caller regardless — its internal status reads are not a user's declaration of ownership; per-call `.catch` on the returned promise stays the way to branch imperatively. Components that need the rejection itself (a `useSuspenseResult` error boundary) simply don't mount a reader on that injectable.
 
 ### Optimistic update — `useOptimistic`
 
@@ -790,11 +789,10 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
-| `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args; `dataUpdatedAt` (settle timestamp, `Date.now()`) and `dataUpdateCount` (successes since these args took the display) ride the same provenance contract and are never touched by failures. |
+| `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args; `dataUpdatedAt` (settle timestamp, `Date.now()`) and `dataUpdateCount` (successes since these args took the display) ride the same provenance contract and are never touched by failures. Like `useError`, mounting it claims the instance's errors (errors-as-state, see "Errors as state"). |
 | `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
-| `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
-| `useSwallowErrors(fn)` | Opt the injectable into errors-as-state: while mounted, every call through it resolves `undefined` on failure instead of rejecting, so fire-and-forget triggers (`useRun`, polling, focus/reconnect revalidation, `useRefresh`) never leave a dangling unhandled rejection. Failures are still recorded by `useError`/`useArgsStatus`/`useFailureCount` first — the rejection is swallowed only after the whole wrapper chain has observed it. Instance-level and refcounted: composition order carries no semantics (a cached layer never mistakes a swallowed failure for settled `undefined`), and several components opting into one shared instance keep the guarantee until the last unmounts. |
-| `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
+| `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. Mounting it (or `useArgsStatus`/`useFailureCount`) claims the instance's errors: calls resolve `undefined` on failure instead of rejecting while a reader is mounted — errors-as-state by declaration (see "Errors as state"). |
+| `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. Also claims the instance's errors like `useError` does. |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
 | `useRetry(fn, shouldRetry)` | Retry on failure while `shouldRetry(failureCount, e)` returns `true`; returning a `Promise` waits for it, then retries (backoff). Preset shorthand: `useRetry(fn, {retries = 3, backoff = 'exponential'})` — `'exponential'` waits 1s/2s/4s…, `'linear'` 1s/2s/3s…, or pass `(attempt) => ms` for custom delays; both signatures share one mechanism. |
