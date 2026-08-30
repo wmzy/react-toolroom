@@ -1,5 +1,6 @@
 import {AsyncFunc, Func} from '@@/types';
 import {useCallback, useEffect, useSyncExternalStore, useState} from 'react';
+import {isAbortSignal, stableHash} from '@@/util';
 import {getInjectContext} from './inject';
 
 export function useLoadingFn() {
@@ -19,6 +20,19 @@ export function useLoadingFn() {
 // `emitResult`/`emitLoading` broadcast semantics are unchanged — every
 // listener is still invoked with the new value; the uSES callbacks ignore
 // the argument and let React re-read the snapshot.
+
+// Drops the trailing AbortSignal slot of an args tuple. `useRun` with
+// `{signal: true}` appends the signal AFTER the caller's logical
+// arguments, and stableHash already collapses every signal instance to one
+// fixed placeholder — so trimming the extra slot makes tuples with and
+// without an appended signal hash identically. Shared by every keyed or
+// provenance-scoped surface (the loading/error wrappers, the result
+// store's provenance stamp, and the useArgsStatus read side) so all of
+// them derive ONE key for the same logical args.
+export const trimTrailingSignal = (args: readonly any[]) =>
+  args.length > 0 && isAbortSignal(args[args.length - 1])
+    ? args.slice(0, -1)
+    : args;
 
 /**
  * Broadcast store holding the latest successful result of an injectable. It
@@ -44,6 +58,34 @@ export type ResultStore = {
    * `emitResult` call predating this field).
    */
   lastArgs?: any[];
+  /**
+   * `Date.now()` of the last APPLIED result emission — when `lastResult`
+   * settled into the store. Stamped only by applied emissions (a dropped
+   * older ticket never touches it) and never by failures; a
+   * provenance-unknown emission (optimistic snapshot, accumulated
+   * `useInfinite` pages) stamps it too, because it also swaps
+   * `lastResult`. Consumers scope it through provenance like `lastResult`
+   * itself (see useArgsStatus's `dataUpdatedAt`).
+   */
+  updatedAt: number;
+  /**
+   * Successful settles of the CURRENT provenance series: incremented when
+   * an applied emission carries the same structural args key as the one
+   * before it, restarted at 1 when the key changes or becomes unknown.
+   * Interleaved siblings therefore restart a key's series rather than
+   * tally it forever — the counter answers "the displayed data has
+   * updated N times since these args took the display", not "these args
+   * succeeded N times in the store's lifetime".
+   */
+  updateCount: number;
+  /**
+   * The structural key of `lastArgs` — `stableHash(trimTrailingSignal(
+   * lastArgs))` — maintained by every applied emission. The write-side
+   * half of the provenance comparison, so readers match their args key
+   * against a stored key instead of re-hashing `lastArgs` per read.
+   * `undefined` exactly when `lastArgs` is.
+   */
+  lastKey?: string;
 };
 
 /**
@@ -137,7 +179,9 @@ export function getResultStore(fn: Func): ResultStore {
       listeners: new Set(),
       lastResult: undefined,
       hasResult: false,
-      version: 0
+      version: 0,
+      updatedAt: 0,
+      updateCount: 0
     };
     context[resultKey] = store;
   }
@@ -227,6 +271,12 @@ export function currentErrorSeq(store: ErrorStore): number {
  * not fetched with. Recording args never touches the ticket sequence: a
  * dropped emission discards result and args together.
  *
+ * Every APPLIED emission also stamps the settle metadata keyed status
+ * hooks expose: `updatedAt` (`Date.now()` of this settle) and `updateCount`
+ * (incremented when the structural args key is unchanged, restarted at 1
+ * otherwise — see the field docs). Dropped and failed calls leave both
+ * untouched.
+ *
  * @param store the shared result store of the injectable
  * @param result the successful result to publish
  * @param seq the ticket obtained from {@link nextResultSeq} when the call started
@@ -241,6 +291,12 @@ export function emitResult(
   const guard = seqOf(store, resultSeqs);
   if (seq < guard.applied) return;
   guard.applied = seq;
+  const key =
+    args === undefined ? undefined : stableHash(trimTrailingSignal(args));
+  store.updateCount =
+    key !== undefined && key === store.lastKey ? store.updateCount + 1 : 1;
+  store.lastKey = key;
+  store.updatedAt = Date.now();
   store.lastResult = result;
   store.hasResult = true;
   store.lastArgs = args;

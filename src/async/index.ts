@@ -97,6 +97,7 @@ import {
   nextErrorSeq,
   nextKeyedErrorSeq,
   nextResultSeq,
+  trimTrailingSignal,
   useStoreValue
 } from './base';
 import {
@@ -271,16 +272,6 @@ export function useResultSelect<AF extends AsyncFunc, T>(
     }, [store, initial, select])
   );
 }
-
-// Drops the trailing AbortSignal slot of an args tuple. `useRun` with
-// `{signal: true}` appends the signal AFTER the caller's logical
-// arguments, and stableHash already collapses every signal instance to one
-// fixed placeholder — so trimming the extra slot makes tuples with and
-// without an appended signal hash identically.
-const trimTrailingSignal = (args: readonly any[]) =>
-  args.length > 0 && isAbortSignal(args[args.length - 1])
-    ? args.slice(0, -1)
-    : args;
 
 /**
  * Returns `true` while the result currently on display was not fetched
@@ -1252,6 +1243,25 @@ export type ArgsStatus = {
    * — `useResult`'s contract scoped to one key.
    */
   data: any | undefined;
+  /**
+   * `Date.now()` of the most recent successful settle of these args,
+   * exposed under the same provenance contract as `data`: a number while
+   * the displayed result was fetched with exactly these args,
+   * `undefined` otherwise (including while a different args tuple's
+   * result is on display). Failures never touch it, so it survives a
+   * failed refetch of the same args. TanStack Query's `dataUpdatedAt`
+   * analogue.
+   */
+  dataUpdatedAt?: number;
+  /**
+   * Successful settles of these args since they last took the display:
+   * incremented on each same-args success, restarted at 1 when these args
+   * (re)take the display after another tuple or a provenance-unknown
+   * emission (optimistic snapshot, `useInfinite` pages) held it.
+   * `undefined` exactly when `data` is. The cheap "displayed data has
+   * updated" signal — TanStack Query's `dataUpdateCount` analogue.
+   */
+  dataUpdateCount?: number;
 };
 
 /**
@@ -1276,11 +1286,15 @@ export type ArgsStatus = {
  * `data` mirrors `useResult`'s contract scoped to these args: the shared
  * last result while its provenance matches (the displayed data was
  * actually fetched with these args), `undefined` otherwise — including
- * while a DIFFERENT args tuple's result is on display.
+ * while a DIFFERENT args tuple's result is on display. `dataUpdatedAt`
+ * and `dataUpdateCount` ride the same contract: the settle timestamp
+ * (`Date.now()`) and the successive-update count of the displayed args'
+ * data — both `undefined` whenever `data` is, and untouched by failures
+ * (a failed refetch of the same args leaves the last success stamped).
  *
  * @param injectableFn the injectable to observe
  * @param args the args tuple identifying the call slot
- * @returns `{loading, error, failureCount, data}` for exactly these args
+ * @returns `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly these args
  * @example
  * ```tsx
  * function Row({id}: {id: number}) {
@@ -1319,15 +1333,19 @@ export function useArgsStatus<AF extends AsyncFunc>(
     useCallback(() => resultStore.version, [resultStore])
   );
   const slot = keyedStore.keyed.get(argsKey);
+  // Provenance match against the store's own stamped key — the write side
+  // (emitResult) maintains `lastKey` in lockstep with `lastResult`, so the
+  // data-scoped reads below all gate on one comparison instead of
+  // re-hashing `lastArgs` per field.
   const dataMatches =
-    resultStore.hasResult &&
-    resultStore.lastArgs !== undefined &&
-    stableHash(trimTrailingSignal(resultStore.lastArgs)) === argsKey;
+    resultStore.hasResult && resultStore.lastKey === argsKey;
   return {
     loading: slot ? slot.count > 0 : false,
     error: slot ? slot.error : undefined,
     failureCount: slot ? slot.failureCount : 0,
-    data: dataMatches ? resultStore.lastResult : undefined
+    data: dataMatches ? resultStore.lastResult : undefined,
+    dataUpdatedAt: dataMatches ? resultStore.updatedAt : undefined,
+    dataUpdateCount: dataMatches ? resultStore.updateCount : undefined
   };
 }
 

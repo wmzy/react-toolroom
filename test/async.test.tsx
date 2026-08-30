@@ -35,6 +35,7 @@ import {
   useArgsStatus,
   stableHash
 } from '../src/async';
+import type {ArgsStatus} from '../src/async';
 import {useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
 
@@ -5080,5 +5081,177 @@ describe('useArgsStatus (per-key loading and error)', () => {
     expect(latest.failureCount).toBe(0);
     expect(keyed.keyed.get(stableHash([]))).toBeUndefined();
     expect(keyed.keyed.size).toBe(0);
+  });
+
+  it('dataUpdatedAt and dataUpdateCount stamp on every successful settle of the same args', async () => {
+    const resolvers: Array<(v: string) => void> = [];
+    const fetchData = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+    let injectable!: () => Promise<string>;
+    let latest!: ArgsStatus;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latest = useArgsStatus(fn, []);
+      return null;
+    }
+    render(<TestComponent />);
+    // No result yet: the fields are as absent as `data` itself.
+    expect(latest.data).toBeUndefined();
+    expect(latest.dataUpdatedAt).toBeUndefined();
+    expect(latest.dataUpdateCount).toBeUndefined();
+
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      let p1!: Promise<string>;
+      await act(async () => {
+        p1 = injectable();
+      });
+      // In flight, nothing settled yet — still unstamped.
+      expect(latest.dataUpdatedAt).toBeUndefined();
+      await act(async () => {
+        resolvers[0]!('one');
+        await p1;
+      });
+      expect(latest.data).toBe('one');
+      expect(latest.dataUpdatedAt).toBe(1_000);
+      expect(latest.dataUpdateCount).toBe(1);
+
+      // A same-args re-success advances BOTH the timestamp and the count.
+      now.mockReturnValue(2_000);
+      let p2!: Promise<string>;
+      await act(async () => {
+        p2 = injectable();
+      });
+      await act(async () => {
+        resolvers[1]!('two');
+        await p2;
+      });
+      expect(latest.data).toBe('two');
+      expect(latest.dataUpdatedAt).toBe(2_000);
+      expect(latest.dataUpdateCount).toBe(2);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('a failed refetch leaves dataUpdatedAt and dataUpdateCount at the last success', async () => {
+    let fail = false;
+    const fetchData = vi.fn(async (): Promise<string> => {
+      if (fail) throw new Error('boom');
+      return 'ok';
+    });
+    let injectable!: () => Promise<string>;
+    let latest!: ArgsStatus;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latest = useArgsStatus(fn, []);
+      return null;
+    }
+    render(<TestComponent />);
+
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      await act(async () => {
+        await injectable();
+      });
+      expect(latest.data).toBe('ok');
+      expect(latest.dataUpdatedAt).toBe(1_000);
+      expect(latest.dataUpdateCount).toBe(1);
+
+      // The refetch fails LATER in clock time: the keyed error surfaces,
+      // but the settle metadata of the displayed data must not move.
+      now.mockReturnValue(2_000);
+      fail = true;
+      await act(async () => {
+        await injectable().catch(() => {});
+      });
+      expect(latest.error).toBeDefined();
+      expect(latest.failureCount).toBe(1);
+      expect(latest.data).toBe('ok');
+      expect(latest.dataUpdatedAt).toBe(1_000);
+      expect(latest.dataUpdateCount).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('dataUpdatedAt and dataUpdateCount are scoped per key like data', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    const fetchData = vi.fn(
+      (id: string) =>
+        new Promise<string>((resolve) => {
+          resolvers[id] = resolve;
+        })
+    );
+    let injectable!: (id: string) => Promise<string>;
+    let latestA!: ArgsStatus;
+    let latestB!: ArgsStatus;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latestA = useArgsStatus(fn, ['a']);
+      latestB = useArgsStatus(fn, ['b']);
+      return null;
+    }
+    render(<TestComponent />);
+
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000);
+      let pa!: Promise<string>;
+      await act(async () => {
+        pa = injectable('a');
+      });
+      await act(async () => {
+        resolvers['a']!('A');
+        await pa;
+      });
+      expect(latestA.dataUpdatedAt).toBe(1_000);
+      expect(latestA.dataUpdateCount).toBe(1);
+      // `b` never settled: its fields stay absent (not zero, not t1).
+      expect(latestB.dataUpdatedAt).toBeUndefined();
+      expect(latestB.dataUpdateCount).toBeUndefined();
+
+      // Provenance moves to `b`: a's fields drop together with its data,
+      // b carries its own timestamp and starts its own series.
+      now.mockReturnValue(2_000);
+      let pb!: Promise<string>;
+      await act(async () => {
+        pb = injectable('b');
+      });
+      await act(async () => {
+        resolvers['b']!('B');
+        await pb;
+      });
+      expect(latestA.data).toBeUndefined();
+      expect(latestA.dataUpdatedAt).toBeUndefined();
+      expect(latestA.dataUpdateCount).toBeUndefined();
+      expect(latestB.dataUpdatedAt).toBe(2_000);
+      expect(latestB.dataUpdateCount).toBe(1);
+
+      // `a` retakes the display: its series RESTARTS at 1 — the counter
+      // follows the displayed series (see ArgsStatus.dataUpdateCount
+      // docs), it is not a lifetime per-key tally.
+      now.mockReturnValue(3_000);
+      let pa2!: Promise<string>;
+      await act(async () => {
+        pa2 = injectable('a');
+      });
+      await act(async () => {
+        resolvers['a']!('A2');
+        await pa2;
+      });
+      expect(latestA.data).toBe('A2');
+      expect(latestA.dataUpdatedAt).toBe(3_000);
+      expect(latestA.dataUpdateCount).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
   });
 });

@@ -536,6 +536,16 @@ function Row({id}: {id: number}) {
 
 The keyed slots ride the same wrapper chain as everything else (the hook registers the read-stack wrappers itself, `useCache`-style), observability never changes call semantics, and each key's slot is reclaimed once its calls drain and its outcome is superseded. Retention is bounded: a key holding a failure outcome stays observable until a same-key success clears it, and the store keeps at most 100 such keys per injectable, evicting the longest-idle drained ones first — a screen enumerating many distinct args (infinite scroll, filter churn) cannot grow the map without bound.
 
+Besides the live slots, the status also carries the settle metadata of the scoped data — the TanStack Query `dataUpdatedAt` / `dataUpdateCount` analogues:
+
+```tsx
+const {data, dataUpdatedAt, dataUpdateCount} = useArgsStatus(fetchUser, [id]);
+// <footer>updated {Math.floor((Date.now() - dataUpdatedAt) / 1000)}s ago</footer>
+```
+
+- `dataUpdatedAt` — `Date.now()` of the most recent **successful** settle of exactly these args. It rides `data`'s provenance contract: a number while the displayed result was fetched with these args, `undefined` otherwise (including while a different args tuple's result is on display). Failures never touch it — a failed refetch of the same args leaves the last success stamped, so "data as of T" stays truthful across error states.
+- `dataUpdateCount` — successful settles of these args since they last took the display: `1` on the first, `+1` per same-args re-success. When these args retake the display after another tuple — or a provenance-unknown emission (an optimistic snapshot, `useInfinite`'s accumulated pages) — held it, the series restarts at `1`: it answers "the displayed data has updated N times since these args took the display", not a lifetime per-key tally. Use it as the effect dependency for "data changed" transitions (flash a row, replay an animation).
+
 ### Suspend instead of a skeleton — `useSuspenseResult`
 
 ```tsx
@@ -733,7 +743,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `useSuspenseResult(fn)` | Like `useResult`, but suspends — throws the in-flight promise — until the first result exists. Requires a `<Suspense>` boundary, and the fetch driver (`useRun` or a manual call) must live in a parent outside it. After the first result, updates flow in exactly like `useResult`. |
 | `useLoading(fn)` | `true` while any call is in flight. |
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
-| `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args. |
+| `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args; `dataUpdatedAt` (settle timestamp, `Date.now()`) and `dataUpdateCount` (successes since these args took the display) ride the same provenance contract and are never touched by failures. |
 | `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
 | `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
