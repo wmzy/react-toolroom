@@ -34,7 +34,8 @@ import {
   usePolling,
   useFocusRevalidate,
   useArgsStatus,
-  stableHash
+  stableHash,
+  isAbortSignal
 } from '../src/async';
 import type {ArgsStatus} from '../src/async';
 import {useLoadingFn} from '../src/async/base';
@@ -3522,6 +3523,74 @@ describe('async hooks', () => {
       ).toBeUndefined();
       // …and the fresh write landed, so subscribers were re-broadcast
       expect(fetchData).toHaveBeenLastCalledWith(1);
+    });
+
+    // 场景复现（修复回归）：signal 剥离型自定义 hash 下，refresh 的第一
+    // 个 delete（plain 元组）就命中 useRun({signal: true}) 写入的条目，
+    // 删除事件在「两个 pending claim 只落了一半」的窗口内同步派发——
+    // 事件携带条目的原始元组（尾带 signal，stableHash 归一为 #sig 孪生
+    // key），该 key 尚未被 claim，消费者重跑与 refresh 自己的重取经
+    // provider 的 in-flight 去重合并为一次 fetch、两趟 wrapper 链 settle：
+    // 一次失败的 refetch 被 failureCount 双计（默认 hash 下第一个 delete
+    // 打不中条目，事件只在两个 claim 都就位后才发，掩盖了该交错）。
+    // 修复：所有 claim 先于任何 delete 落位（两阶段）。
+    it('useRefresh with a signal-stripping hash: a failed refetch after a success tallies ONE failure', async () => {
+      const stripSignalHash = (args: unknown[]): string =>
+        stableHash(args.filter((a) => !isAbortSignal(a)));
+      const fetchData = vi
+        .fn<(id: number, signal: AbortSignal) => Promise<string[]>>()
+        .mockResolvedValueOnce(['v1'])
+        .mockRejectedValueOnce(new Error('boom'));
+      const cache = createMemoryCacheProvider<string[], [number, AbortSignal]>({
+        cacheTime: 60000,
+        hash: stripSignalHash as any
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        // 尾参 signal 会按读取侧契约剥除（trimTrailingSignal），key 与
+        // [1] 等价——这里直接按 useRun({signal: true}) 追加后的真实形状传
+        const status = useArgsStatus(injectable, [
+          1,
+          new AbortController().signal
+        ]);
+        const refresh = useRefresh(injectable, [1], cache);
+        useRun(injectable, [1], {signal: true});
+        return (
+          <div>
+            <span data-testid='result'>{status.data?.[0] ?? 'no result'}</span>
+            <span data-testid='fc'>{status.failureCount}</span>
+            <span data-testid='stamp'>{status.dataUpdatedAt ?? ''}</span>
+            <button
+              data-testid='refresh'
+              type='button'
+              onClick={() => void refresh()}
+            >
+              refresh
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('v1');
+      });
+      const stampBefore = screen.getByTestId('stamp').textContent;
+      expect(stampBefore).not.toBe('');
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('refresh'));
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('fc').textContent).toBe('1');
+      });
+      // one underlying fetch, ONE tallied failure — not two
+      expect(fetchData).toHaveBeenCalledTimes(2);
+      // the last success stays stamped across the failed refetch
+      expect(screen.getByTestId('result').textContent).toBe('v1');
+      expect(screen.getByTestId('stamp').textContent).toBe(stampBefore);
     });
 
     it('useRefresh should stay referentially stable and follow the newest args', async () => {

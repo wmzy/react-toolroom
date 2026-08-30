@@ -668,12 +668,28 @@ export function useInvalidate<AF extends AsyncFunc>(
       // below is the one that refetches; the claim is released when it
       // settles. (The old model never notified consumers at all — the new
       // one refreshes them through the event for every other entry.)
+      //
+      // The signal twin is claimed too: under a signal-stripping custom
+      // `hash`, deleting the plain tuple hits an entry a `useRun({signal:
+      // true})` call wrote (raw tuple ends in a signal), and the event
+      // carries THAT raw tuple — its `stableHash` is the `#sig`-shaped
+      // twin key, not the plain one. Claiming only the plain key left the
+      // twin-addressed event unclaimed, so consumers re-ran and joined our
+      // own call through the provider's in-flight dedupe: one fetch, two
+      // wrapper-chain settles — a doubled failureCount for one failed
+      // call. `stableHash` collapses every signal instance to the same
+      // placeholder, so one twin claim covers all signal varieties.
       const pending = getPendingSet(injectableFn, cacheProvider);
       const key = stableHash(args);
+      const twinKey = stableHash([...args, new AbortController().signal]);
       pending.add(key);
+      pending.add(twinKey);
       cacheProvider.delete(args);
       const call = injectableFn(...args) as Promise<R<AF>>;
-      call.finally(() => pending.delete(key));
+      call.finally(() => {
+        pending.delete(key);
+        pending.delete(twinKey);
+      });
       return call;
     },
     [injectableFn, cacheProvider]
@@ -1570,19 +1586,28 @@ export function useRefresh<AF extends AsyncFunc>(
     // useCache consumers re-run the same args and fetch a second time.
     // Both addressings are claimed because the deletion event carries the
     // entry's raw tuple — written with or without a trailing signal.
+    //
+    // ALL claims land before ANY delete — a custom signal-stripping
+    // provider `hash` makes the FIRST delete (the plain tuple) hit the
+    // entry a `useRun({signal: true})` call wrote, so the event fires
+    // mid-loop with the `#sig`-shaped raw tuple while only the plain key
+    // had been claimed. The consumer re-run then joined our own re-fetch
+    // through the provider's in-flight dedupe: one fetch, two
+    // wrapper-chain settles — one failed refetch tallied a doubled
+    // failureCount. Two phases close the window for every claim/delete
+    // pairing; the default hash is unaffected either way (its first
+    // delete misses the signalled entry, so its event only fired after
+    // both claims were in place).
     const pending = getPendingSet(injectableFn, cacheProvider);
     const signalled = [...currentArgs, new AbortController().signal];
-    for (const tuple of [currentArgs, signalled] as Parameters<AF>[]) {
-      pending.add(stableHash(tuple));
-      cacheProvider.delete(tuple);
-    }
+    const tuples = [currentArgs, signalled] as Parameters<AF>[];
+    for (const tuple of tuples) pending.add(stableHash(tuple));
+    for (const tuple of tuples) cacheProvider.delete(tuple);
     purgeInflight(injectableFn, currentArgs);
-    return Promise.resolve(
-      injectableFn(...(currentArgs as Parameters<AF>))
-    )
+    return Promise.resolve(injectableFn(...(currentArgs as Parameters<AF>)))
       .catch(noop)
       .finally(() => {
-        for (const tuple of [currentArgs, signalled]) {
+        for (const tuple of tuples) {
           pending.delete(stableHash(tuple));
         }
       });
