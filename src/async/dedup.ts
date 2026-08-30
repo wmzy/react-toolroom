@@ -90,3 +90,23 @@ export function useDedup<AF extends AsyncFunc>(
       }) as AF
   );
 }
+
+/**
+ * Drops the in-flight dedup entry of `args` (both addressings: the plain
+ * tuple and its trailing-signal twin, which share one key under the default
+ * hash), so the next call starts a fresh request instead of joining the
+ * pending one. The bypass primitive of `useRefresh` — a forced refetch must
+ * not be folded back into the very request it is replacing.
+ *
+ * @param {AF} injectableFn - the injectable whose dedup registry to purge.
+ * @param {any[]} args - the logical arguments whose entry should go.
+ */
+export function purgeInflight<AF extends AsyncFunc>(
+  injectableFn: AF,
+  args: any[]
+): void {
+  const inflight = inflightCache.get(injectableFn);
+  if (!inflight) return;
+  inflight.delete(stableHash(args));
+  inflight.delete(stableHash([...args, new AbortController().signal]));
+}

@@ -1,4 +1,5 @@
 import {Func} from '@@/types';
+import {noop} from '@@/util';
 import {
   RefObject,
   useCallback,
@@ -99,7 +100,9 @@ type Cell<F extends Func> = {
 // injectable, so prefer useInsertionEffect (which fires before layout and
 // passive effects); React 16.8/17 lack it and fall back to useEffect —
 // they have no StrictMode replay, so the fallback is safe there.
-const useClaim: typeof useEffect =
+// Also reused by hooks that must set instance state before any passive
+// effect can call the injectable (useSwallowErrors).
+export const useClaim: typeof useEffect =
   typeof useInsertionEffect === 'function' ? useInsertionEffect : useEffect;
 
 /**
@@ -139,7 +142,7 @@ export function useInjectable<F extends Func>(
   ref.current[0] = fn;
 
   const f = useCallback((...args: Parameters<F>) => {
-    const [func, injects, , registry] = ref.current!;
+    const [func, injects, ctx, registry] = ref.current!;
     // Drop orphans left by discarded render passes. A trampoline that no
     // effect ever claimed and that predates the latest confirmed insertion
     // belongs to a hook state React threw away — its cleanup will never
@@ -158,7 +161,17 @@ export function useInjectable<F extends Func>(
       }
     }
     const callContext = {};
-    return injects.reduce((i, w) => w(i, callContext), func)(...args);
+    const result = injects.reduce((i, w) => w(i, callContext), func)(...args);
+    // Errors-as-state opt-in (useSwallowErrors): the instance-level flag is
+    // known before the call starts — unlike a per-call flag, it survives
+    // wrappers that defer their inner calls (useCache defers through its
+    // get-chain). The catch is attached HERE, after the whole chain has
+    // run, so wrapper order never matters: error recorders (useError's
+    // wrapper) still see the rejection and rethrow first, and no layer
+    // registered later can mistake the swallowed failure for a settled
+    // `undefined` (a useCache outside it would cache that).
+    // `Promise.resolve` is identity for promises and tolerates sync fns.
+    return ctx.swallow ? Promise.resolve(result).catch(noop) : result;
   }, []) as F;
 
   map.set(f, ref);

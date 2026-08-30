@@ -25,6 +25,8 @@ import {
   useRetry,
   useCache,
   useInvalidate,
+  useRefresh,
+  useSwallowErrors,
   useMutation,
   invalidate,
   getInjectContext,
@@ -1953,6 +1955,117 @@ describe('async hooks', () => {
       expect(screen.getByText('no error')).toBeDefined();
       expect(screen.getByText('failures: 0')).toBeDefined();
     });
+
+    it('useSwallowErrors should resolve undefined on failure while the error stays readable from state', async () => {
+      const fetchData = vi.fn(async (): Promise<string> => {
+        throw new Error('swallowed');
+      });
+      let injectableRef:
+        | (() => Promise<string | undefined>)
+        | undefined;
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useSwallowErrors(injectable);
+        const error = useError<Error>(injectable);
+        injectableRef = injectable;
+        return <span>{error ? error.message : 'no error'}</span>;
+      }
+
+      render(<TestComponent />);
+
+      // the call resolves undefined instead of rejecting — the painless
+      // "errors as state" fallback: fire-and-forget callers never dangle
+      let settled: unknown = 'pending';
+      await act(async () => {
+        void injectableRef!().then(
+          (v) => {
+            settled = v;
+          },
+          () => {
+            settled = 'rejected';
+          }
+        );
+      });
+      await waitFor(() => {
+        expect(settled).toBeUndefined();
+      });
+      // the failure still surfaces through the state hooks
+      await waitFor(() => {
+        expect(screen.getByText('swallowed')).toBeDefined();
+      });
+    });
+
+    it('useSwallowErrors should swallow after the whole chain regardless of registration order — a later useCache never caches undefined', async () => {
+      const fetchData = vi.fn(async (): Promise<string> => {
+        throw new Error('chain order');
+      });
+      const cache = createMemoryCacheProvider<string, []>();
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        // worst order: the swallow opt-in registered BEFORE useCache
+        useSwallowErrors(injectable);
+        useCache(injectable, cache);
+        const error = useError<Error>(injectable);
+        return (
+          <div>
+            <span>{error ? error.message : 'no error'}</span>
+            <button type='button' onClick={() => void injectable()}>
+              run
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+      await waitFor(() => {
+        expect(screen.getByText('chain order')).toBeDefined();
+      });
+
+      // the cached layer saw the real rejection (the swallow is applied at
+      // the call boundary, not at this hook's position), so nothing was
+      // written: a retry runs the fetch again instead of hitting undefined
+      expect(await cache.get([])).toBeUndefined();
+      await act(async () => {
+        fireEvent.click(screen.getByText('run'));
+      });
+      expect(fetchData).toHaveBeenCalledTimes(2);
+    });
+
+    it('useSwallowErrors should keep useRun-triggered failures rejection-free', async () => {
+      const fetchData = vi.fn(async (): Promise<string> => {
+        throw new Error('run failure');
+      });
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown) => unhandled.push(e);
+      process.on('unhandledRejection', onUnhandled);
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useSwallowErrors(injectable);
+        const error = useError<Error>(injectable);
+        useRun(injectable, []);
+        return <span>{error ? error.message : 'no error'}</span>;
+      }
+
+      try {
+        render(<TestComponent />);
+        await waitFor(() => {
+          expect(screen.getByText('run failure')).toBeDefined();
+        });
+        // give any would-be unhandled rejection a macrotask to surface
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 10));
+        });
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+    });
   });
 
   describe('useFailureCount', () => {
@@ -3313,6 +3426,220 @@ describe('async hooks', () => {
       expect(fetchData).toHaveBeenCalledTimes(1);
       expect(fetchData).toHaveBeenCalledWith(1);
       expect(fetchData).not.toHaveBeenCalledWith(2);
+    });
+
+    it('useRefresh should delete the current args entry and force one fresh fetch', async () => {
+      const fetchData = vi.fn(async (id: number) => `data ${id} v${fetchData.mock.calls.length}`);
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const result = useResult(injectable);
+        const refresh = useRefresh(injectable, [1], cache);
+        useRun(injectable, [1]);
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <button
+              data-testid='refresh'
+              type='button'
+              onClick={() => void refresh()}
+            >
+              refresh
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 v1');
+      });
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('refresh'));
+      });
+      // hard miss: the entry was deleted before the call, so the fetch runs
+      // again — and exactly once (the revalidation-slot claim suppresses
+      // the double fetch our own deletion event would trigger)
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 v2');
+      });
+      expect(fetchData).toHaveBeenCalledTimes(2);
+      expect(cache.get([1])).toEqual(['data 1 v2', expect.any(Number)]);
+    });
+
+    it('useRefresh should hit the entry a useRun({signal: true}) rerun stored', async () => {
+      const fetchData = vi.fn(
+        async (id: number, signal: AbortSignal) =>
+          `data ${id} ${signal.aborted ? 'aborted' : 'live'}`
+      );
+      // default hash: the run's [...args, signal] tuple and the plain args
+      // tuple address DIFFERENT keys (stableHash collapses signals to a
+      // placeholder but keeps the slot) — the dual-addressing case
+      const cache = createMemoryCacheProvider<string, [number, AbortSignal]>({
+        cacheTime: 60000
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const result = useResult(injectable);
+        const refresh = useRefresh(injectable, [1], cache);
+        useRun(injectable, [1], {signal: true});
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <button
+              data-testid='refresh'
+              type='button'
+              onClick={() => void refresh()}
+            >
+              refresh
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1 live');
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('refresh'));
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe(
+          'data 1 live'
+        );
+        expect(fetchData).toHaveBeenCalledTimes(2);
+      });
+      // the run's signal-keyed entry is gone (hashed with any signal
+      // instance it collapses to the same placeholder)…
+      expect(
+        await cache.get([1, new AbortController().signal])
+      ).toBeUndefined();
+      // …and the fresh write landed, so subscribers were re-broadcast
+      expect(fetchData).toHaveBeenLastCalledWith(1);
+    });
+
+    it('useRefresh should stay referentially stable and follow the newest args', async () => {
+      const fetchData = vi.fn(async (id: number) => `data ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000
+      });
+      const refreshRefs: Array<() => Promise<string | undefined>> = [];
+
+      function TestComponent({id}: {id: number}) {
+        const [, setTick] = useState(0);
+        const injectable = useInjectable(fetchData);
+        useCache(injectable, cache, 60000);
+        const result = useResult(injectable);
+        const refresh = useRefresh(injectable, [id], cache);
+        useRun(injectable, [id]);
+        refreshRefs.push(refresh);
+        return (
+          <div>
+            <span data-testid='result'>{result ?? 'no result'}</span>
+            <button data-testid='rerender' type='button' onClick={() => setTick((t) => t + 1)}>
+              rerender
+            </button>
+            <button data-testid='refresh' type='button' onClick={() => void refresh()}>
+              refresh
+            </button>
+          </div>
+        );
+      }
+
+      const {rerender} = render(<TestComponent id={1} />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 1');
+      });
+
+      // stable across re-renders…
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('rerender'));
+      });
+      expect(new Set(refreshRefs).size).toBe(1);
+
+      // …and across args changes: the SAME callback reference now
+      // refreshes the newest args
+      rerender(<TestComponent id={2} />);
+      await waitFor(() => {
+        expect(screen.getByTestId('result').textContent).toBe('data 2');
+      });
+      const captured = refreshRefs[refreshRefs.length - 1];
+      expect(captured).toBe(refreshRefs[0]);
+      await act(async () => {
+        void captured();
+      });
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenLastCalledWith(2);
+      });
+      expect(fetchData).toHaveBeenCalledTimes(3);
+    });
+
+    it('useRefresh should bypass an in-flight useDedup request and never reject', async () => {
+      const rejectQueue: Array<(e: Error) => void> = [];
+      const fetchData = vi.fn(
+        (id: number) =>
+          new Promise<string>((resolve, reject) => {
+            rejectQueue.push(reject);
+          })
+      );
+      const cache = createMemoryCacheProvider<string, [number]>({
+        cacheTime: 60000
+      });
+      let refreshFn: (() => Promise<string | undefined>) | undefined;
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useDedup(injectable);
+        const refresh = useRefresh(injectable, [1], cache);
+        refreshFn = refresh;
+        useEffect(() => {
+          void injectable(1).catch(() => {});
+        }, [injectable]);
+        return null;
+      }
+
+      render(<TestComponent />);
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(1);
+      });
+      // the first request is still in flight here
+
+      // the returned promise never rejects — track it across a failure
+      let settled: unknown = 'pending';
+      await act(async () => {
+        const p = refreshFn!();
+        void p.then(
+          (v) => {
+            settled = v;
+          },
+          () => {
+            settled = 'rejected';
+          }
+        );
+      });
+      // the dedup entry was purged together with the cache entry, so the
+      // refresh started a SECOND request instead of joining the pending
+      // first one (which it would share without the purge)
+      await waitFor(() => {
+        expect(fetchData).toHaveBeenCalledTimes(2);
+      });
+
+      // the refreshed request fails: the promise resolves undefined
+      await act(async () => {
+        rejectQueue[1]!(new Error('refresh failed'));
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(settled).toBeUndefined();
     });
   });
 

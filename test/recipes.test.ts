@@ -160,6 +160,53 @@ describe('recipes/useProjectSWRQuery', () => {
     });
     expect(fetchListMock.mock.calls.length).toBe(callsAfterFirstMount);
   });
+
+  it('should refetch through refetch() and surface failures as error state, not rejections', async () => {
+    fetchListMock.mockImplementation(async () => projects);
+    let refetchFn: (() => Promise<typeof projects | undefined>) | undefined;
+
+    function RefreshView() {
+      const {data, error, refetch} = useProjectSWRQuery();
+      refetchFn = refetch;
+      if (error) return createElement('p', null, `error: ${error.message}`);
+      return createElement(
+        'ul',
+        null,
+        ...(data ?? []).map((p) => createElement('li', {key: p.id}, p.username))
+      );
+    }
+
+    render(createElement(RefreshView));
+    expect(await screen.findByText('alpha')).toBeTruthy();
+    // the module-scope projectCache may carry entries from earlier tests —
+    // count relatively
+    const callsAfterMount = fetchListMock.mock.calls.length;
+
+    // refetch drops the fresh entry and forces one new request
+    await act(async () => {
+      await refetchFn!();
+    });
+    expect(fetchListMock.mock.calls.length).toBe(callsAfterMount + 1);
+
+    // a failing refetch resolves undefined (no rejection to handle) and
+    // the failure lands in the error field instead
+    fetchListMock.mockImplementation(async () => {
+      throw new Error('refresh failed');
+    });
+    let settled: unknown = 'pending';
+    await act(async () => {
+      void refetchFn!().then(
+        (v) => {
+          settled = v;
+        },
+        () => {
+          settled = 'rejected';
+        }
+      );
+    });
+    expect(settled).toBeUndefined();
+    expect(await screen.findByText('error: refresh failed')).toBeTruthy();
+  });
 });
 
 describe('recipes/useProjectPollingQuery', () => {

@@ -60,7 +60,7 @@ The [`recipes/`](./recipes/) directory holds copy-and-customize templates to sta
 | --- | --- |
 | [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | The base: `useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`. |
 | [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | The write side, on top of the first-class `useMutation`: pins the project's default failure reporting while an explicit `onError` still replaces it — the pattern for adding a house convention to a library hook. |
-| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`. |
+| [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | Adds `useCache(staleTime)` over a module-level cache instance + `useFocusRevalidate`, with `useSwallowErrors` making every trigger's failure land in the returned `error` field (never a dangling rejection) and `useRefresh` as the returned stable `refetch` — drop the entry, force one fresh request. |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | Adds `usePolling` on a fixed interval. |
 | [`useProjectPaginatedQuery.ts`](./recipes/useProjectPaginatedQuery.ts) | Keyed `useRun(fn, [{page}], {hash: stableHash})` with default keep-previous-data made observable by `usePlaceholderData`, `useLoading` as the small refresh indicator and `useInitialLoading` as the first-screen skeleton. |
 | [`createLocalCacheProvider.ts`](./recipes/createLocalCacheProvider.ts) | A `CacheProvider` that persists entries to `localStorage` — for caches that should survive a page reload instead of rebuilding from scratch. |
@@ -354,6 +354,53 @@ function UserList() {
 ```
 
 Unlike a stale-while-revalidate background refetch — which keeps serving the old value while refreshing — `useInvalidate` is a hard invalidation: it deletes the cache entry under the given args, then immediately re-runs the injectable with them, so subscribers see a fresh loading → result cycle instead of the pre-mutation data. The key linkage mirrors `useCache`: the same `cacheProvider` plus the same args tuple address the same entry (`useInvalidate(fetchUser, userCache)(userId)` drops what `useRun(fetchUser, [userId])` populated). The returned function is referentially stable and resolves to the fresh result, so `await` it in the mutation handler before closing your toast.
+
+### Refresh the current query — `useRefresh`
+
+```tsx
+const userCache = createMemoryCacheProvider<User, [string]>({cacheTime: 60000});
+
+function UserProfile({userId}: {userId: string}) {
+  const fetchUser = useInjectable(getUser);
+  useCache(fetchUser, userCache, 5000);
+  const refresh = useRefresh(fetchUser, [userId], userCache);
+  const user = useResult(fetchUser);
+  useRun(fetchUser, [userId], {signal: true});
+
+  return (
+    <>
+      {/* …render `user`… */}
+      <button type='button' onClick={() => refresh()}>Refresh</button>
+    </>
+  );
+}
+```
+
+`useRefresh` is the "refresh this query" button: calling the returned callback deletes the cache entry under the hook's current args, then re-runs the injectable with them — a forced fresh fetch. It bypasses everything that would fold the call back into existing work: the settled cache entry, the provider's in-flight `load` slot and any `useDedup` registration are purged with the entry, so the refresh can never join the very request it is replacing.
+
+The entry a `useRun({signal: true})` rerun wrote is keyed by the args tuple **with** the trailing `AbortSignal`; `useRefresh` addresses both shapes (the plain tuple and its trailing-signal twin — `stableHash` collapses every signal instance to one placeholder, and signal-stripping custom hashes normalize the two deletes to one), so the delete always hits without any manual argument stripping at the call site. The callback is referentially stable for the hook's lifetime and always refreshes the newest render's args; a revalidation-slot claim suppresses the double fetch its own deletion event would otherwise trigger in mounted `useCache` consumers; and the returned promise never rejects — failures resolve `undefined` and surface through `useError`/`useArgsStatus`, so `onClick={() => refresh()}` is safe as-is.
+
+Where `useInvalidate(fn, cache)` takes its args per call and hands you the rejection-owning promise for mutation handlers, `useRefresh(fn, args, cache)` closes over the query's args and is safe to fire and forget — the refetch button vs. the post-mutation refresh.
+
+### Errors as state — `useSwallowErrors`
+
+```tsx
+function UserList() {
+  const fetchUsers = useInjectable(getUsers);
+  useCache(fetchUsers, userCache);
+  useSwallowErrors(fetchUsers);
+  const users = useResult(fetchUsers);
+  const error = useError(fetchUsers);
+  useRun(fetchUsers, []);
+
+  if (error) return <ErrorPanel error={error} retry={() => fetchUsers()} />;
+  // …render `users`…
+}
+```
+
+By default every failure keeps flowing as a rejection, which is right when a caller owns the promise — but fire-and-forget triggers (`useRun`, polling, focus/reconnect revalidation, `useRefresh`, a plain `void fn()` call) have nobody to reject to, and a failing fetch leaves a dangling unhandled rejection. `useSwallowErrors` opts the injectable into errors-as-state (React Query's default philosophy): while mounted, every call through it resolves `undefined` on failure, and failures are read exclusively from `useError`/`useArgsStatus`/`useFailureCount` — which still record them first, because the rejection is only swallowed after the whole wrapper chain has observed it.
+
+The opt-in lives on the injectable instance, not at a wrapper position: call it before or after `useCache` — order carries no semantics — and a cached layer still sees the real rejection, so a swallowed failure is never mistaken for a settled `undefined` and written to the cache. Components that *want* the rejection (a `useSuspenseResult` error boundary) simply don't mount it on that injectable.
 
 ### Optimistic update — `useOptimistic`
 
@@ -746,6 +793,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args; `dataUpdatedAt` (settle timestamp, `Date.now()`) and `dataUpdateCount` (successes since these args took the display) ride the same provenance contract and are never touched by failures. |
 | `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
 | `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. |
+| `useSwallowErrors(fn)` | Opt the injectable into errors-as-state: while mounted, every call through it resolves `undefined` on failure instead of rejecting, so fire-and-forget triggers (`useRun`, polling, focus/reconnect revalidation, `useRefresh`) never leave a dangling unhandled rejection. Failures are still recorded by `useError`/`useArgsStatus`/`useFailureCount` first — the rejection is swallowed only after the whole wrapper chain has observed it. Instance-level and refcounted: composition order carries no semantics (a cached layer never mistakes a swallowed failure for settled `undefined`), and several components opting into one shared instance keep the guarantee until the last unmounts. |
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |
 | `useFinally(fn, handler)` | Run `handler` when a call settles, success or failure. |
@@ -754,6 +802,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `useMutation(mutation, options?)` | The write-side counterpart of `useRun`: returns `[mutate, status, reset]` — a stable `mutate` (the injectable itself, rejections keep flowing), injectable-level shared status (`isMutating` / `error` / `failureCount`, same stores as `useLoading`/`useError`), and a `reset` that clears settled failure bookkeeping without invalidating in-flight tickets. Hook-level `onMutate`/`onSuccess`/`onError`/`onSettled` callbacks fire with the latest closures (ref funnel — inline options objects are fine); per-call callbacks are simply `.then`/`.catch` on the returned promise. `invalidates: [cache, [cache, ...argsPrefix], …]` purges the target providers on success (see `invalidate`) — mounted consumers refresh through the deletion event. `scope: key | ((…args) => key)` serializes same-key calls into a FIFO chain (TanStack `mutationKey` + `scope`): a queued call runs after every earlier same-scope call settles — failures don't break the chain, the module-level chain survives unmount, and `isMutating` counts a queued call from the moment it is made; different keys run parallel, no `scope` changes nothing. Compose `useOptimistic` / `useInvalidate` on the same injectable for optimistic snapshots and manual refresh. |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR caching: cache hits broadcast immediately; stale entries revalidate in the background. Returns whether the current data is stale — a broadcast flag shared by every `useCache` consumer of the injectable, updating together (last verdict wins). Also subscribes to the provider's deletion events, so anything that purges the cache (`invalidate` / `invalidates`, `deletePrefix`, a DevTools panel button, expiry) makes mounted consumers refetch and re-broadcast. |
 | `useInvalidate(fn, cacheProvider)` | Returns a stable `(...args) => Promise<R>` that deletes the cache entry under `args` and immediately re-runs the injectable with them — hard invalidation for mutation success paths. Keys link to `useCache` via the same provider and args tuple. |
+| `useRefresh(fn, args, cacheProvider)` | Returns a stable `() => Promise<R \| undefined>` that deletes the cache entry under the hook's current `args` and re-runs the injectable with them — a forced fresh fetch for refresh buttons: the settled entry, the provider's in-flight `load` slot and any `useDedup` registration are purged, so the refresh never joins the request it replaces. Dual-addresses the entry a `useRun({signal: true})` rerun stored (plain tuple + trailing-signal twin), so the delete always hits without manual argument stripping. Referentially stable for the hook's lifetime, always refreshes the newest render's args, suppresses the double fetch its own deletion event would trigger, and never rejects — failures resolve `undefined` and surface through `useError`/`useArgsStatus`. |
 | `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is a cache provider (all of its entries are purged) or a `[provider, ...argsPrefix]` tuple (only entries whose raw args tuple structurally extends the prefix, removed via the provider's `deleteWhere` — any `hash` convention works). A pure cache operation: no injectable needed, no request issued; mounted `useCache` consumers of the provider refresh themselves through its deletion event (refetch via the wrapper chain, rewrite, broadcast). |
 | `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}` — a subset of TanStack's `useInfiniteQuery`, including bidirectional paging and a `maxPages` sliding window. Only `fetchNextPage()`/`fetchPreviousPage()` calls grow the list; any direct call (e.g. a `useRun` rerun) resets `pages`. |
@@ -787,7 +836,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 6.75 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 6.59 kB.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 7 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 1.4 kB / 6.73 kB.
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useDedup` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.

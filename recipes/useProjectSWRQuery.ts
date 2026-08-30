@@ -30,8 +30,10 @@ import {
   useFocusRevalidate,
   useInitialLoading,
   useInjectable,
+  useRefresh,
   useResult,
   useRun,
+  useSwallowErrors,
   type R
 } from 'react-toolroom/async';
 import {fetchList} from '@/services/user';
@@ -53,6 +55,12 @@ export type ProjectSWRQueryResult = {
   error: Error | undefined;
   /** `true` while the on-screen data is older than `staleTime`. */
   isStale: boolean;
+  /**
+   * Drop the cached entry and fetch anew — the refresh button. Stable
+   * identity, safe to fire and forget (never rejects; failures land in
+   * `error` above).
+   */
+  refetch: () => Promise<Project | undefined>;
 };
 
 /**
@@ -99,13 +107,22 @@ export function useProjectSWRQuery(options?: {
   useDedup(loadProjects);
   const isStale = useCache(loadProjects, projectCache, staleTime);
   useFocusRevalidate(loadProjects);
+  // Errors as state: every trigger above is fire-and-forget, so failures
+  // resolve `undefined` at the call boundary instead of dangling — the
+  // `error` field below stays the one place to read them.
+  useSwallowErrors(loadProjects);
   // Plain `[]` — see the header note on cache-key alignment with
   // `useFocusRevalidate` before adding options or `{signal: true}`.
   useRun(loadProjects, []);
+  // The refresh button: deletes the current `[]` entry (and its dedup
+  // in-flight registration) and re-runs — never joins the pending request
+  // it replaces. Dual-addresses a `{signal: true}` run's key too, so the
+  // header's key-alignment note does not restrict it.
+  const refetch = useRefresh(loadProjects, [], projectCache);
 
   const data = useResult(loadProjects);
   const initialLoading = useInitialLoading(loadProjects);
   const error = useError(loadProjects);
 
-  return {data, initialLoading, error, isStale};
+  return {data, initialLoading, error, isStale, refetch};
 }

@@ -76,7 +76,8 @@ import {
   useInjectBefore,
   useInjectable,
   getInjectContext,
-  isInjectable
+  isInjectable,
+  useClaim
 } from './inject';
 import {
   ErrorStore,
@@ -122,6 +123,7 @@ export type {
 } from '@@/types';
 
 export {useDedup} from './dedup';
+import {purgeInflight} from './dedup';
 export {useOptimistic} from './optimistic';
 export {useInfinite} from './infinite';
 
@@ -792,6 +794,56 @@ export function useFailureCount<AF extends AsyncFunc>(injectableFn: AF) {
     store,
     useCallback(() => store.failureCount, [store])
   );
+}
+
+/**
+ * Opt an injectable into errors-as-state: while this hook is mounted, every
+ * call through the injectable resolves `undefined` on failure instead of
+ * rejecting, so fire-and-forget triggers — `useRun`, polling, focus/reconnect
+ * revalidation, `useRefresh`, plain `void fn()` calls — never leave a
+ * dangling (unhandled) rejection. Failures still reach every state hook
+ * exactly as before: `useError`/`useArgsStatus`/`useFailureCount` record
+ * them first, and the rejection is only swallowed after the whole wrapper
+ * chain — `useCache` included — has observed it.
+ *
+ * The opt-in lives on the injectable instance (not on a wrapper at this
+ * hook's chain position), so composition order carries no semantics: call
+ * it before or after `useCache`, a cached layer still sees the real
+ * rejection and never mistakes a swallowed failure for a settled
+ * `undefined`. The flag is set in an insertion effect — before any passive
+ * effect can call the injectable, whichever hook order you compose — and
+ * refcounted, so several components opting into the same shared instance
+ * keep the guarantee until the last one unmounts. Components that need the
+ * rejection itself — a `useSuspenseResult` error boundary — simply do not
+ * mount this hook on that injectable.
+ *
+ * @param {AsyncFunc} injectableFn - the injectable whose failures resolve
+ *   `undefined` instead of rejecting.
+ * @return {void} Nothing; the hook only flips the instance-level opt-in.
+ * @example
+ * ```tsx
+ * const fetchUsers = useInjectable(getUsers);
+ * useCache(fetchUsers, userCache);
+ * useSwallowErrors(fetchUsers); // errors surface via useError only
+ * const error = useError(fetchUsers);
+ * useRun(fetchUsers, []); // a failure here no longer rejects unhandled
+ * ```
+ */
+export function useSwallowErrors<AF extends AsyncFunc>(
+  injectableFn: AF
+): void {
+  const ctx = getInjectContext(injectableFn) as {
+    swallow?: boolean;
+    swallowRefs?: number;
+  };
+  useClaim(() => {
+    ctx.swallowRefs = (ctx.swallowRefs ?? 0) + 1;
+    ctx.swallow = true;
+    return () => {
+      ctx.swallowRefs = (ctx.swallowRefs ?? 0) - 1;
+      if (ctx.swallowRefs === 0) ctx.swallow = false;
+    };
+  }, [ctx]);
 }
 
 /** Lifecycle callbacks of one mutation — naming aligned with TanStack/SWR. */
@@ -1482,6 +1534,87 @@ export function useRun<F extends Func>(
     },
     hash ? [hashKey, signal] : [...args, signal]
   );
+}
+
+/**
+ * A custom hook that returns a stable refresh callback for the current
+ * `args` of a cached injectable: calling it deletes the cache entry under
+ * those args and immediately re-runs the injectable with them — a forced
+ * fresh fetch that bypasses both the settled cache and any in-flight
+ * request (the provider's `load` slot and the `useDedup` registry are
+ * purged with the entry, so the refresh can never be folded back into the
+ * very request it replaces).
+ *
+ * Key linkage with `useRun({signal: true})`: a run stores its entry under
+ * the args tuple WITH the trailing `AbortSignal` appended. The delete
+ * addresses both shapes — the plain tuple and its trailing-signal twin
+ * (`stableHash` collapses every signal instance to one placeholder, so
+ * appending a fresh signal addresses the run's key; providers hashing with
+ * a signal-stripping custom hash normalize both deletes to one) — so the
+ * entry a run wrote is always hit, with no manual argument stripping at
+ * the call site.
+ *
+ * The returned callback is referentially stable for the hook's lifetime
+ * (across renders AND `args` changes — it always refreshes the newest
+ * render's args), the revalidation-slot claim suppresses the double fetch
+ * our own deletion event would otherwise trigger in mounted `useCache`
+ * consumers, and the returned promise never rejects: failures resolve
+ * `undefined` and surface through `useError`/`useArgsStatus` instead —
+ * fire-and-forget call sites (`onClick={() => refresh()}`) are safe as-is.
+ *
+ * @param {AsyncFunc} injectableFn - the injectable to refresh.
+ * @param {any[]} args - the logical arguments to refresh (the same tuple
+ *   passed to `useRun` — with or without its trailing signal slot).
+ * @param {CacheProvider} cacheProvider - the same cache provider passed to
+ *   `useCache`.
+ * @return {function} a stable `() => Promise<R | undefined>` that deletes
+ *   the entry under the current args, then re-runs the injectable.
+ * @example
+ * ```tsx
+ * const fetchUser = useInjectable(getUser);
+ * useCache(fetchUser, userCache);
+ * const refresh = useRefresh(fetchUser, [userId], userCache);
+ * useRun(fetchUser, [userId], {signal: true});
+ *
+ * <button type='button' onClick={() => refresh()}>Refresh</button>
+ * // entry gone → hard miss → one fresh request, subscribers re-broadcast
+ * ```
+ */
+export function useRefresh<AF extends AsyncFunc>(
+  injectableFn: AF,
+  args: Parameters<AF> | WithoutSignal<Parameters<AF>>,
+  cacheProvider: CacheProvider<R<AF>, Parameters<AF>>
+): () => Promise<R<AF> | undefined> {
+  // Latest-args funnel (the useRun pattern): the callback stays
+  // referentially stable across renders and args changes alike, and always
+  // refreshes the args of the newest render — no dependency on the args
+  // identity, so inline object literals cost nothing.
+  const argsRef = useRef(args as any[]);
+  argsRef.current = args as any[];
+  return useCallback(() => {
+    const currentArgs = argsRef.current;
+    // Claim the revalidation slot BEFORE deleting (the useInvalidate
+    // pattern): our own deletion event would otherwise make mounted
+    // useCache consumers re-run the same args and fetch a second time.
+    // Both addressings are claimed because the deletion event carries the
+    // entry's raw tuple — written with or without a trailing signal.
+    const pending = getPendingSet(injectableFn, cacheProvider);
+    const signalled = [...currentArgs, new AbortController().signal];
+    for (const tuple of [currentArgs, signalled] as Parameters<AF>[]) {
+      pending.add(stableHash(tuple));
+      cacheProvider.delete(tuple);
+    }
+    purgeInflight(injectableFn, currentArgs);
+    return Promise.resolve(
+      injectableFn(...(currentArgs as Parameters<AF>))
+    )
+      .catch(noop)
+      .finally(() => {
+        for (const tuple of [currentArgs, signalled]) {
+          pending.delete(stableHash(tuple));
+        }
+      });
+  }, [injectableFn, cacheProvider]);
 }
 
 export {
