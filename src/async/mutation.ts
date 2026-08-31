@@ -1,4 +1,9 @@
-import {BoundMutation, CacheProvider, MutationSpec} from '@@/types';
+import {
+  BoundMutation,
+  CacheProvider,
+  CreateMutationBinder,
+  MutationSpec
+} from '@@/types';
 
 /**
  * The optimistic pipeline behind `cache.mutation(spec)`. Layers, in order:
@@ -43,11 +48,7 @@ import {BoundMutation, CacheProvider, MutationSpec} from '@@/types';
  */
 export default function createMutationBinder<T, K extends any[]>(
   cache: CacheProvider<T, K>
-): {
-  mutation: <Args extends any[], Resp>(
-    spec: (...args: Args) => MutationSpec<T, K, Args, Resp>
-  ) => BoundMutation<Args, Resp>;
-} {
+): CreateMutationBinder<T, K> {
   return {
     mutation<Args extends any[], Resp>(
       spec: (...args: Args) => MutationSpec<T, K, Args, Resp>

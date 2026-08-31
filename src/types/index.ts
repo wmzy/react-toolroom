@@ -52,12 +52,15 @@ export type BoundMutation<Args extends any[], Resp> = (
 
 /**
  * The standalone flavor of `cache.mutation`, for providers that predate the
- * member or composition over a provider handled elsewhere.
+ * member or composition over a provider handled elsewhere. `mutation` is
+ * declared here required, and kept as a method signature in lockstep with
+ * `CacheProvider.mutation` (same bivariance rationale; `Pick`ing the
+ * optional member would silently make this one optional too).
  */
 export type CreateMutationBinder<T, K extends any[]> = {
-  mutation: <Args extends any[], Resp>(
+  mutation<Args extends any[], Resp>(
     spec: (...args: Args) => MutationSpec<T, K, Args, Resp>
-  ) => BoundMutation<Args, Resp>;
+  ): BoundMutation<Args, Resp>;
 };
 
 /**
@@ -74,12 +77,24 @@ export type CacheEvent<K extends any[] = any[]> =
   | {type: 'set'}
   | {type: 'delete'; deleted: readonly K[]};
 
+// Method-shorthand members (not property arrows) are load-bearing: under
+// strictFunctionTypes, property signatures check parameters strictly
+// contravariantly, which made a concrete instantiation such as
+// `CacheProvider<Article, [string]>` unassignable to the wide slot
+// `CacheProvider<any, any[]>` (`any[]` → `[string]` fails on tuple
+// length), forcing every wide registry (devtools' ObservableCache,
+// invalidation targets, consumer registries à la painless decisions.md
+// #9) to weaken slots to `K = any` instead. Method parameters are
+// checked bivariantly — the lib.d.ts convention for Array/Map — so any
+// two instantiations whose members relate in either direction stay
+// assignable, while call sites on a concrete provider still check
+// arguments strictly.
 export type CacheProvider<T, K extends any[]> = {
-  set: (k: K, v: T) => void;
-  get: (k: K) => Promise<CacheResult<T>> | CacheResult<T>;
-  delete: (k: K) => void;
-  clear: () => void;
-  use: () => () => void;
+  set(k: K, v: T): void;
+  get(k: K): Promise<CacheResult<T>> | CacheResult<T>;
+  delete(k: K): void;
+  clear(): void;
+  use(): () => void;
   /**
    * Marks/unmarks args tuples as observed by a mounted `useCache`
    * consumer. Observed entries are exempt from garbage collection — the
@@ -88,7 +103,7 @@ export type CacheProvider<T, K extends any[]> = {
    * unobserving hands them back to the GC clock. Optional: custom
    * providers may omit it, and callers must feature-detect.
    */
-  observe?: (args: K[], on: boolean) => void;
+  observe?(args: K[], on: boolean): void;
   // The members below are optional so existing custom providers (localStorage,
   // IndexedDB, no-op stubs, …) keep compiling and stay semantically valid —
   // only the memory provider ships them. Callers must feature-detect
@@ -104,24 +119,24 @@ export type CacheProvider<T, K extends any[]> = {
    * instead of clobbering the newer value. A rejection vacates the slot,
    * keeps any previously settled data and rethrows as-is.
    */
-  load?: (k: K, factory: () => Promise<T>) => Promise<T>;
+  load?(k: K, factory: () => Promise<T>): Promise<T>;
   /**
    * Reads the settled entry for `k` — `{value, cachedAt}` or `undefined` —
    * without observing in-flight requests and without ever creating one.
    */
-  peek?: (k: K) => {value: T; cachedAt: number} | undefined;
+  peek?(k: K): {value: T; cachedAt: number} | undefined;
   /** Serializes every entry into a JSON-safe plain object, for SSR transport. */
-  dehydrate?: () => Record<string, [T, number]>;
+  dehydrate?(): Record<string, [T, number]>;
   /** Merges entries produced by `dehydrate` back in; never clears existing ones. */
-  hydrate?: (data: Record<string, [T, number]>) => void;
+  hydrate?(data: Record<string, [T, number]>): void;
   /** Deletes every entry whose hashed key starts with `prefix`. */
-  deletePrefix?: (prefix: string) => void;
+  deletePrefix?(prefix: string): void;
   /**
    * Deletes every entry whose raw args tuple satisfies `predicate`; entries
    * without a recorded tuple (SSR hydration) are skipped. This is the
    * addressing primitive of `[provider, ...argsPrefix]` invalidation targets.
    */
-  deleteWhere?: (predicate: (k: K) => boolean) => void;
+  deleteWhere?(predicate: (k: K) => boolean): void;
   /**
    * Deletes exactly the entry stored under the hashed key `key` — the same
    * string a {@link CacheProvider.snapshot} row carries, so a caller that
@@ -132,7 +147,7 @@ export type CacheProvider<T, K extends any[]> = {
    * carrying the entry's raw tuple when recoverable. Optional — the same
    * feature-detect contract as `deletePrefix`/`deleteWhere`.
    */
-  deleteKey?: (key: string) => void;
+  deleteKey?(key: string): void;
   /**
    * Batch write-side primitive, the symmetric twin of `deleteWhere`: every
    * settled entry whose raw args tuple satisfies `predicate` is passed to
@@ -143,21 +158,23 @@ export type CacheProvider<T, K extends any[]> = {
    * written, so composite callers (e.g. {@link CacheProvider.mutation}) can
    * snapshot the pre-values for rollback.
    */
-  patchWhere?: (
+  patchWhere?(
     predicate: (k: K) => boolean,
     updater: (value: T, k: K) => T | void
-  ) => {args: K; prev: T; next: T}[];
+  ): {args: K; prev: T; next: T}[];
   /**
    * Builds an optimistic mutation bound to this cache. The spec callback
    * receives the call arguments and returns {@link MutationSpec}; the bound
    * function runs the whole optimistic pipeline — see {@link MutationSpec}
    * for the exact semantics.
    */
-  mutation?: CreateMutationBinder<T, K>['mutation'];
+  mutation?<Args extends any[], Resp>(
+    spec: (...args: Args) => MutationSpec<T, K, Args, Resp>
+  ): BoundMutation<Args, Resp>;
   /** Notifies `listener` after any entry mutation; returns an unsubscribe. */
-  subscribe?: (listener: (e: CacheEvent<K>) => void) => () => void;
+  subscribe?(listener: (e: CacheEvent<K>) => void): () => void;
   /** Shallow-copies every settled entry as {key, value, cachedAt} for read-only observation; entries with a request in flight carry an additive `pending: true`, and entries whose raw args tuple is recoverable carry an additive `args` (hydrated ones do not — devtools Remove buttons feature-detect on it). */
-  snapshot?: () => {
+  snapshot?(): {
     key: string;
     value: T;
     cachedAt: number;

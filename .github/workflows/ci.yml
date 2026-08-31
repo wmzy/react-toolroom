@@ -20,6 +20,7 @@ jobs:
           cache: pnpm
       - run: pnpm install
       - run: pnpm run lint
+      - run: pnpm run typecheck
       - run: pnpm run build
       - run: pnpm run size
       - run: pnpm run test

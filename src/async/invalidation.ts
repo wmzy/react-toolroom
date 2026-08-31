@@ -28,11 +28,11 @@ type ValidTarget<T> = T extends readonly [infer P, ...infer A extends any[]]
       ? T
       : never
     : never
-  : // The bare-provider branch matches any key tuple: `K` is invariant in
-    // `CacheProvider` (function-valued members use it in both parameter and
-    // output positions), so a concrete `CacheProvider<string, [string]>`
-    // does not extend `CacheProvider<any, any[]>` even though every
-    // concrete tuple does extend `any[]`.
+  : // The bare-provider branch: a provider alone carries no prefix, so
+    // there is nothing to validate against its key tuple — any provider
+    // instantiation passes (method-shorthand members make concrete tuples
+    // assignable to `CacheProvider<any, ...>`; see the variance note on
+    // `CacheProvider`).
     T extends CacheProvider<any, infer K extends any[]>
     ? T
     : never;
