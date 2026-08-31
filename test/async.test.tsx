@@ -38,7 +38,7 @@ import {
   isAbortSignal
 } from '../src/async';
 import type {ArgsStatus} from '../src/async';
-import {useLoadingFn} from '../src/async/base';
+import {trimTrailingSignal, useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
 
 describe('async hooks', () => {
@@ -1960,9 +1960,7 @@ describe('async hooks', () => {
       const fetchData = vi.fn(async (): Promise<string> => {
         throw new Error('swallowed');
       });
-      let injectableRef:
-        | (() => Promise<string | undefined>)
-        | undefined;
+      let injectableRef: (() => Promise<string | undefined>) | undefined;
 
       function TestComponent() {
         const injectable = useInjectable(fetchData);
@@ -3426,7 +3424,9 @@ describe('async hooks', () => {
     });
 
     it('useRefresh should delete the current args entry and force one fresh fetch', async () => {
-      const fetchData = vi.fn(async (id: number) => `data ${id} v${fetchData.mock.calls.length}`);
+      const fetchData = vi.fn(
+        async (id: number) => `data ${id} v${fetchData.mock.calls.length}`
+      );
       const cache = createMemoryCacheProvider<string, [number]>({
         cacheTime: 60000
       });
@@ -3511,9 +3511,7 @@ describe('async hooks', () => {
         fireEvent.click(screen.getByTestId('refresh'));
       });
       await waitFor(() => {
-        expect(screen.getByTestId('result').textContent).toBe(
-          'data 1 live'
-        );
+        expect(screen.getByTestId('result').textContent).toBe('data 1 live');
         expect(fetchData).toHaveBeenCalledTimes(2);
       });
       // the run's signal-keyed entry is gone (hashed with any signal
@@ -3611,10 +3609,18 @@ describe('async hooks', () => {
         return (
           <div>
             <span data-testid='result'>{result ?? 'no result'}</span>
-            <button data-testid='rerender' type='button' onClick={() => setTick((t) => t + 1)}>
+            <button
+              data-testid='rerender'
+              type='button'
+              onClick={() => setTick((t) => t + 1)}
+            >
               rerender
             </button>
-            <button data-testid='refresh' type='button' onClick={() => void refresh()}>
+            <button
+              data-testid='refresh'
+              type='button'
+              onClick={() => void refresh()}
+            >
               refresh
             </button>
           </div>
@@ -5645,5 +5651,340 @@ describe('useArgsStatus (per-key loading and error)', () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+describe('in-flight abort yielding (load slot vacated synchronously)', () => {
+  // The regression this block exists for: a provider.load in-flight slot is
+  // vacated in a then-microtask, but an aborted request's rejection happens
+  // SYNCHRONOUSLY inside abort(). In the window between the two, a new load
+  // for the same key joined the dead promise: the replacement consumer
+  // inherited AbortError, never ran its factory, and sat in a permanent
+  // error state (painless: PreviewLink hover→click, comments stuck on
+  // "Failed to load comments"). The fix: a signal-carrying load that CREATED
+  // the slot vacates it from the signal's abort listener — synchronously,
+  // silently — so same-stack successors start a fresh request instead.
+
+  // A fetch with real abort semantics: the signal's abort listener rejects
+  // synchronously, exactly like the browser's fetch. A PLAIN function on
+  // purpose: each test wraps it in its own vi.fn, and wrapping an already-
+  // mocked fn shares the mock state (call counts would bleed across tests).
+  const abortAwareFetch = (slug: string, signal?: AbortSignal) =>
+    new Promise<string[]>((resolve, reject) => {
+      const onAbort = () => reject(new DOMException('aborted', 'AbortError'));
+      if (signal) {
+        if (signal.aborted) return onAbort();
+        signal.addEventListener('abort', onAbort, {once: true});
+      }
+      setTimeout(() => resolve([`${slug} ok`]), 30);
+    });
+  // Module-stable args tuple: useRun without {hash} compares by reference,
+  // and an inline literal would re-run (abort + refetch) on every rerender.
+  const ARGS: [string] = ['s'];
+
+  it('unmount-abort then same-stack remount: the new consumer starts fresh, not on the dead promise', async () => {
+    const fetchData = vi.fn(abortAwareFetch);
+    const cache = createMemoryCacheProvider<
+      string[],
+      Parameters<typeof abortAwareFetch>
+    >({cacheTime: 60000});
+    let deleteEvents = 0;
+    cache.subscribe!((e) => {
+      if (e.type === 'delete') deleteEvents++;
+    });
+    let latest!: ArgsStatus;
+    function Consumer() {
+      const injectable = useInjectable(fetchData);
+      useCache(injectable, cache);
+      useRun(injectable, ARGS, {signal: true});
+      latest = useArgsStatus(injectable, ARGS);
+      return null;
+    }
+
+    const a = render(<Consumer />);
+    // A's wrapper chain resolves its cache read in a microtask — the race
+    // is fully set up before any of them run, exactly like the consumer
+    // app's unmount-then-remount in one commit.
+
+    // The race, in one synchronous stack: A's cleanup aborts its signal
+    // (the mock fetch rejects inside abort()), then B mounts with the same
+    // args BEFORE the microtask that would vacate the slot. B's queued
+    // load lands ahead of the dead promise's settle microtask.
+    a.unmount();
+    const b = render(<Consumer />);
+
+    await waitFor(() => {
+      expect(latest.data).toEqual(['s ok']);
+    });
+    expect(latest.error).toBeUndefined();
+    expect(latest.loading).toBe(false);
+    // A's aborted request + B's fresh one. Before the fix B joined the
+    // dead promise: totalCalls stayed at 1 and B sat in AbortError forever.
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    // The drop is silent: not one delete event fired (one would have made
+    // mounted consumers re-run the args — a double fetch).
+    expect(deleteEvents).toBe(0);
+    // B's entry settled in the cache. useRun({signal: true}) appends the
+    // signal to the args, and stableHash collapses every signal to one
+    // placeholder, so the twin tuple addresses the entry.
+    expect(cache.peek!(['s', new AbortController().signal])).toEqual({
+      value: ['s ok'],
+      cachedAt: expect.any(Number)
+    });
+    b.unmount();
+  });
+
+  it('same race under a signal-stripping custom hash (consumer-app config): fresh request, one shared key', async () => {
+    // The consumer app that hit this bug hashes with a signal-STRIPPING
+    // custom hash, so a plain tuple and its trailing-signal twin collapse
+    // into ONE key — a different collision surface than the default
+    // stableHash's #sig placeholder. The abort-yield reads the RAW tuple,
+    // so it must work identically here.
+    const fetchData = vi.fn(abortAwareFetch);
+    const cache = createMemoryCacheProvider<string[], [string, AbortSignal?]>({
+      cacheTime: 60000,
+      hash: (k) => stableHash(trimTrailingSignal(k))
+    });
+    let deleteEvents = 0;
+    cache.subscribe!((e) => {
+      if (e.type === 'delete') deleteEvents++;
+    });
+    let latest!: ArgsStatus;
+    function Consumer() {
+      const injectable = useInjectable(fetchData);
+      useCache(injectable, cache);
+      useRun(injectable, ARGS, {signal: true});
+      latest = useArgsStatus(injectable, ARGS);
+      return null;
+    }
+
+    const a = render(<Consumer />);
+    a.unmount();
+    const b = render(<Consumer />);
+
+    await waitFor(() => {
+      expect(latest.data).toEqual(['s ok']);
+    });
+    expect(latest.error).toBeUndefined();
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    expect(deleteEvents).toBe(0);
+    // Under the stripping hash the PLAIN tuple addresses the same entry.
+    expect(cache.peek!(ARGS)).toEqual({
+      value: ['s ok'],
+      cachedAt: expect.any(Number)
+    });
+    b.unmount();
+  });
+
+  it("the creator's abort drops the slot but joiners keep their held promise to settlement", async () => {
+    // Signal-IGNORING fetch: the abort drops the slot, but the shared
+    // promise itself keeps pending — the joiner must still receive it.
+    const resolvers: Array<(v: string) => void> = [];
+    const fetchData = vi.fn(
+      (_slug: string, _signal?: AbortSignal) =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+    const cache = createMemoryCacheProvider<
+      string,
+      Parameters<typeof fetchData>
+    >({cacheTime: 60000});
+    let deleteEvents = 0;
+    cache.subscribe!((e) => {
+      if (e.type === 'delete') deleteEvents++;
+    });
+    let latest!: ArgsStatus;
+    // Both consumers run through useRun({signal: true}) — distinct signals,
+    // one shared twin key (stableHash collapses every signal to one
+    // placeholder). The first to mount CREATES the slot; the second JOINS.
+    function SignalConsumer({read}: {read?: boolean}) {
+      const injectable = useInjectable(fetchData);
+      useCache(injectable, cache);
+      useRun(injectable, ARGS, {signal: true});
+      if (read) latest = useArgsStatus(injectable, ARGS);
+      return null;
+    }
+
+    const a = render(<SignalConsumer />);
+    const b = render(<SignalConsumer read />);
+    // Let both wrapper chains run their microtask hops: one shared request,
+    // B joined A's slot.
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+    expect(resolvers).toHaveLength(1);
+
+    // The creator unmounts: its abort vacates the slot (a successor would
+    // start fresh), but the JOINER's held promise is untouched — still
+    // pending, still the one it subscribed to, and no delete event fired.
+    a.unmount();
+    expect(deleteEvents).toBe(0);
+
+    await act(async () => {
+      resolvers[0]!('v1');
+    });
+    await waitFor(() => {
+      expect(latest.data).toBe('v1');
+    });
+    expect(latest.error).toBeUndefined();
+    expect(deleteEvents).toBe(0);
+    b.unmount();
+  });
+
+  it("a joiner's abort never drops a slot its own signal cannot cancel", async () => {
+    const resolvers: Array<(v: string) => void> = [];
+    const fetchData = vi.fn(
+      (_slug: string, _signal?: AbortSignal) =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+    const cache = createMemoryCacheProvider<
+      string,
+      Parameters<typeof fetchData>
+    >({cacheTime: 60000});
+    let latest!: ArgsStatus;
+    function SignalConsumer({read}: {read?: boolean}) {
+      const injectable = useInjectable(fetchData);
+      useCache(injectable, cache);
+      useRun(injectable, ARGS, {signal: true});
+      if (read) latest = useArgsStatus(injectable, ARGS);
+      return null;
+    }
+
+    // A creates the slot; B joins the pending promise.
+    const a = render(<SignalConsumer />);
+    const b = render(<SignalConsumer />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    // B unmounts: B's signal never reached the fetch (it joined, it did
+    // not create), so the abort must NOT vacate the slot — a consumer
+    // mounting in the same synchronous stack still JOINS the pending
+    // request instead of double-fetching.
+    b.unmount();
+    const c = render(<SignalConsumer read />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvers[0]!('shared');
+    });
+    await waitFor(() => {
+      expect(latest.data).toBe('shared');
+    });
+    expect(latest.error).toBeUndefined();
+    a.unmount();
+    c.unmount();
+  });
+
+  it('provider.load abort-yield: synchronous vacation, identity-guarded, silent, no resurrect', async () => {
+    const provider = createMemoryCacheProvider<string, [string, AbortSignal?]>({
+      cacheTime: 60000
+    });
+    const events: string[] = [];
+    provider.subscribe!((e) => {
+      events.push(e.type);
+    });
+
+    // A load whose args end in a signal: the slot is created, the yield
+    // listener attached.
+    const ac = new AbortController();
+    let resolveFirst!: (v: string) => void;
+    const first = provider.load!(
+      ['k', ac.signal],
+      () => new Promise<string>((r) => (resolveFirst = r))
+    );
+    let resolveJoiner!: (v: string) => void;
+    const joinerFactory = vi.fn(
+      () => new Promise<string>((r) => (resolveJoiner = r))
+    );
+    // A concurrent load with a DIFFERENT signal joins — its factory must
+    // not run, and (below) its abort must not vacate the shared slot.
+    const joinerAc = new AbortController();
+    const joined = provider.load!(
+      ['k', joinerAc.signal],
+      vi.fn(async () => 'x')
+    );
+    expect(events).toEqual(['set']);
+
+    // The joiner's abort: no-op — the slot survives. Proven by another
+    // loader in the same synchronous stack: it still JOINS the pending
+    // request (its factory does not run).
+    joinerAc.abort();
+    const thirdFactory = vi.fn(async () => 'x');
+    provider.load!(['k', new AbortController().signal], thirdFactory);
+    expect(thirdFactory).not.toHaveBeenCalled();
+
+    // The creator's abort: the slot is vacated SYNCHRONOUSLY (no microtask
+    // checkpoint since the abort), silently — no delete event, and not even
+    // a set event beyond the load registration's own.
+    const setEventsBefore = events.filter((t) => t === 'set').length;
+    ac.abort();
+    // A load in the same synchronous stack now runs its factory: the slot
+    // was vacated by the abort listener, not by a settle microtask (none
+    // has run — no await since the abort).
+    let resolveSecond!: (v: string) => void;
+    const successorFactory = vi.fn(
+      () => new Promise<string>((r) => (resolveSecond = r))
+    );
+    const second = provider.load!(
+      ['k', new AbortController().signal],
+      successorFactory
+    );
+    expect(successorFactory).toHaveBeenCalledTimes(1);
+    expect(events.filter((t) => t === 'delete')).toHaveLength(0);
+    // Two set events since the abort: the drop's own (the slot vacation is
+    // a provider-state change snapshot readers deserve to hear) and the
+    // successor load's registration. Neither is a delete.
+    expect(events.filter((t) => t === 'set').length).toBe(setEventsBefore + 2);
+
+    // The successor settles; the dropped request settles LAST: the
+    // identity guard keeps it from writing back over the successor's value.
+    resolveSecond!('v2');
+    await second;
+    expect(provider.peek!(['k', new AbortController().signal])!.value).toBe(
+      'v2'
+    );
+    resolveFirst('late-v1');
+    await first;
+    expect(provider.peek!(['k', new AbortController().signal])!.value).toBe(
+      'v2'
+    );
+    // The shared promise never rejected; silence the joiner reference too.
+    joined.catch(() => {});
+  });
+
+  it("StrictMode remount: the aborted first run yields its slot to the second run's fresh request", async () => {
+    const fetchData = vi.fn(abortAwareFetch);
+    const cache = createMemoryCacheProvider<
+      string[],
+      Parameters<typeof abortAwareFetch>
+    >({cacheTime: 60000});
+    let latest!: ArgsStatus;
+    function Consumer() {
+      const injectable = useInjectable(fetchData);
+      useCache(injectable, cache);
+      useRun(injectable, ARGS, {signal: true});
+      latest = useArgsStatus(injectable, ARGS);
+      return null;
+    }
+
+    render(
+      <StrictMode>
+        <Consumer />
+      </StrictMode>
+    );
+
+    // StrictMode's mount→cleanup→mount fires the first signal's abort
+    // synchronously; the slot yields, and the second run starts its own
+    // request. The first was genuinely cancelled — joining its dead
+    // promise would leave the app in a permanent AbortError state (the
+    // bug this block regression-tests).
+    await waitFor(() => {
+      expect(latest.data).toEqual(['s ok']);
+    });
+    expect(latest.error).toBeUndefined();
+    expect(fetchData).toHaveBeenCalledTimes(2);
   });
 });

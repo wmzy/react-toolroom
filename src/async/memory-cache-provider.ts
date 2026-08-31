@@ -1,5 +1,5 @@
 import {CacheEvent, CacheProvider} from '@@/types';
-import {noop, stableHash} from '@@/util';
+import {isAbortSignal, noop, stableHash} from '@@/util';
 
 import createMutationBinder from './mutation';
 
@@ -291,6 +291,39 @@ export default function create<T, K extends any[]>({
         if (!cur.settled) map.delete(h);
         notifySet();
       };
+      // Abort-yield, wired into the creation path so every load caller (a
+      // `useCache` wrapper, a router loader, a raw provider consumer) gets
+      // it for free: when the args tuple ends in an AbortSignal — the
+      // established convention for "this call is cancellable" (`useRun`'s
+      // `{signal: true}` appends it; `stableHash` collapses every signal
+      // to one placeholder) — the freshly created slot dies with that
+      // signal. A signal's `abort` event fires SYNCHRONOUSLY, ahead of the
+      // microtask that would vacate the slot through the settle `then`
+      // below; in that window a new load for the same key would join the
+      // dead promise and inherit its AbortError forever (the replacement
+      // consumer mounting in the same synchronous stack as the old one's
+      // unmount). The creation path is the exact creator/joiner
+      // discriminator: a joiner returned `existing.promise` above before
+      // ever reaching here, so its own signal — which cannot cancel the
+      // underlying request — never vacates the shared slot. The drop is
+      // `finish()` with no value: same identity guard (an aborted request
+      // can never knock a successor's registration out of the table), same
+      // husk rule, and the one honest `set` event for snapshot readers —
+      // but never a `delete` event, which would make mounted consumers
+      // re-run the args (a double fetch). Holders of the dropped promise
+      // are unaffected: the physical rejection still reaches them, which
+      // is semantically correct — they subscribed to a request that was in
+      // fact cancelled. Only FUTURE loads are pointed at a fresh request,
+      // and the dropped promise's own settle microtask later fails the
+      // identity guard and returns without touching anything.
+      const last = key[key.length - 1];
+      if (isAbortSignal(last)) {
+        // A listener on an already-aborted signal never fires — that call
+        // is its own replacement (e.g. an effect re-ran after its cleanup
+        // aborted), so the dead-on-arrival slot is vacated immediately.
+        if (last.aborted) finish();
+        else last.addEventListener('abort', () => finish(), {once: true});
+      }
       // A rejection is an ordinary settle for the bookkeeping — the
       // in-flight slot is vacated (a retry can start fresh), any settled
       // data is kept (SWR: a failed background refetch leaves the stale

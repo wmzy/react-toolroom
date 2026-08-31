@@ -593,7 +593,9 @@ export function useCache<AF extends AsyncFunc>(
           // consumer of these args — and every other channel using the same
           // provider (another component's injectable, a router loader) —
           // with the factory, i.e. the whole inner wrapper chain including
-          // any useRetry loop, running exactly once.
+          // any useRetry loop, running exactly once. A call whose args end
+          // in an AbortSignal gets abort-yield for free inside the
+          // provider's load (see memory-cache-provider).
           return cacheProvider.load
             ? cacheProvider.load(args, () => f(...args)).then(publish)
             : f(...args).then(publish);

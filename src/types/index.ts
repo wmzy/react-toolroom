@@ -118,6 +118,18 @@ export type CacheProvider<T, K extends any[]> = {
    * the request was in flight, in which case the late response is dropped
    * instead of clobbering the newer value. A rejection vacates the slot,
    * keeps any previously settled data and rethrows as-is.
+   *
+   * Abort-yield (memory provider): when the args tuple ends in an
+   * AbortSignal — the convention `useRun({signal: true})` establishes — a
+   * slot CREATED by that load dies with the signal: the signal's
+   * synchronous `abort` event vacates the slot immediately (no delete
+   * event — mounted consumers are not told to re-run; just the one
+   * ordinary set event every settle emits), so a load for the same key in
+   * the same synchronous stack starts a fresh request instead of joining
+   * the dead promise. Consumers that already joined keep their promise
+   * (the rejection reaches them — correct: the request really was
+   * cancelled), and a joiner's own signal never vacates a slot it did
+   * not create.
    */
   load?(k: K, factory: () => Promise<T>): Promise<T>;
   /**
