@@ -25,9 +25,10 @@ same two-phase idea — but the cache is per entity, not one global store.
 | `select` | `useResultSelect(fn, select)` | Same idea: derive a slice without breaking cache identity. |
 | `placeholderData: keepPreviousData` | default behavior + `usePlaceholderData(fn)` flag | Keeping the previous data on a key change is already the default; the flag tells you WHICH data is on screen. |
 | `initialData` / SSR hydration | `dehydrate()` / `hydrate()` on the provider | Server stamps `cachedAt`; client hydrates before first render. |
-| `useSuspenseQuery` | `useCache` + `useSuspenseResult` | Suspends until the first result resolves. |
-| `refetchInterval` | `usePolling(fn, interval, {args})` | Timer re-arms on args change; pauses while hidden by default (`whenHidden`). |
-| `refetchOnWindowFocus` | `useFocusRevalidate(fn, args)` | Same trigger, explicit composition. |
+| `useSuspenseQuery` | `useCache` + `useSuspenseResult` | Suspends only until the FIRST result exists; later results flow in like `useResult`. Throws the in-flight promise, so its rejection reaches the error boundary. The hook never starts the call — the driver (`useRun`) must live outside the boundary, because a suspended subtree never runs its effects. |
+| `refetchInterval` | `usePolling(fn, interval, {whenHidden?, args?})` | Timer re-arms on args change; skips a tick while the previous call is pending; pauses while the document is hidden by default — `whenHidden: true` is TanStack's `refetchIntervalInBackground`. |
+| `refetchOnWindowFocus` | `useFocusRevalidate(fn, {interval?, args?})` | `focus` + `visibilitychange` back to visible. TanStack defaults this to `true` per query (and gates it on staleness); here there is no default — you mount the hook per scenario, every event revalidates, and `interval` throttles (it is not a poll cadence). |
+| `refetchOnReconnect` | `useReconnectRevalidate(fn, {interval?, args?})` | Window `online` event, guarded by `navigator.onLine`. Also `true` by default in TanStack; same explicit opt-in and `interval` throttle here. |
 | `retry` / exponential backoff | `useRetry(fn, {retries, backoff})` | Preset backoff strategies (`exponential`: 1s, 2s, 4s… / `linear` / custom). |
 
 ## Queries: `useQuery` → `useCache`
@@ -96,12 +97,37 @@ const [rename] = useMutation(
 
 | TanStack | react-toolroom | Notes |
 | --- | --- | --- |
-| `useMutation({mutationFn})` | `useMutation(mutate, {invalidates})` | `invalidates` lists the cache providers (or `[provider, ...argsPrefix]` slices) to purge on success. Returns `[mutate, status, unmount]`. |
+| `useMutation({mutationFn})` | `useMutation(mutate, {invalidates, onMutate, onSuccess, onError, onSettled, scope})` | `invalidates` lists the cache providers (or `[provider, ...argsPrefix]` slices) to purge on success. Returns `[mutate, {isMutating, error, failureCount}, reset]` — see [Return shape](#return-shape) below. |
+| `onMutate(vars)` — may be async, returns the rollback ctx | `onMutate(...args)` | Fires synchronously when `mutate` is called, with the raw args only — no context object, return value ignored. Rollback is not your job: `cache.mutation` does it automatically (see [Optimistic updates](#optimistic-updates) below). |
+| `onSuccess(data, vars, ctx)` | `onSuccess(result, ...args)` | `invalidates` purges BEFORE any user callback runs — library plumbing is not hostage to a throwing `onSuccess`. |
+| `onError(err, vars, ctx)` | `onError(err, ...args)` | A rejected mutation invalidates nothing. |
+| `onSettled(data \| undefined, err, vars, ctx)` | `onSettled(result \| undefined, err, ...args)` | Success passes `(result, undefined, ...args)`; failure passes `(undefined, err, ...args)`. |
 | `queryClient.invalidateQueries({queryKey})` | `useInvalidate(fetcher, cache)(...args)` (hook) / `invalidate([targets])` (imperative) | Invalidate by args; a `[provider, ...prefix]` target sweeps every entry whose args start with the prefix. |
 | `queryClient.setQueryData(key, updater)` | `cache.patchWhere(pred, updater)` | Batch write with per-entry generation guard. |
 | `queryClient.getQueryData(key)` | `cache.peek(args)` / `cache.get(args)` | `peek` never observes or starts requests. |
 | `mutation.isPending` | `useLoading(mutate)` / the tuple's status | Same shape. |
 | `mutationKey` + serial `scope` | `scope` option | Queue same-scope mutations instead of racing them. |
+
+### Return shape
+
+TanStack splits one behavior across two functions: `mutate` is
+fire-and-forget (returns `void`; callbacks ride the options) while
+`mutateAsync` returns the promise. react-toolroom merges them — `mutate`
+is the injectable itself, so the returned promise resolves with the result
+and rejects with the failure, AND the same call feeds the
+`{isMutating, error, failureCount}` stores. Awaiting callers branch on the
+outcome (`rename(id, name).catch(() => {})` opts out of the rejection);
+fire-and-forget callers read `error` from the status instead.
+
+The status is injectable-level shared state, not per-hook-instance: every
+component tracking the same mutation updates together, and a component
+mounted after a call starts from the current values. `failureCount` and
+`reset` do have same-named TanStack counterparts (`mutation.failureCount`,
+`mutation.reset()`), but the semantics differ — TanStack's `reset()`
+restores the whole instance to its initial `idle` state (clears `data`,
+`variables`, `error`), while toolroom's `reset` only clears the settled
+error/failureCount bookkeeping: it writes with the current seq, so a call
+already in flight keeps its ticket valid and still lands afterwards.
 
 ### Optimistic updates
 
