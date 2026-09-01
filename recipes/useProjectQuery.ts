@@ -28,7 +28,6 @@
  */
 
 import {
-  useDedup,
   useError,
   useInitialLoading,
   useInjectable,
@@ -50,7 +49,7 @@ export type ProjectQueryResult = {
 };
 
 /**
- * Load the project list once per mount, deduplicated, cancellable.
+ * Load the project list once per mount, cancellable.
  *
  * @return {ProjectQueryResult} `{data, initialLoading, error}` — read them
  *   directly in JSX: skeleton while `initialLoading`, message while `error`.
@@ -83,16 +82,12 @@ export function useProjectQuery(options?: {size?: number}): ProjectQueryResult {
   //    plus the per-instance wrapper chain every hook below registers on.
   const loadProjects = useInjectable(fetchList);
 
-  // 2. Concurrent calls with the same key share one in-flight promise —
-  //    covers StrictMode double effects and sibling components mounting
-  //    together. The entry is dropped on settle, so failures stay retryable.
-  useDedup(loadProjects);
-
-  // 3. Run on mount and whenever `args` change. `signal: true` appends an
+  // 2. Run on mount and whenever `args` change. `signal: true` appends an
   //    AbortSignal as the trailing argument and aborts it on change/unmount,
-  //    so the fetch layer can cancel superseded requests. `stableHash` maps
-  //    every signal to one placeholder, so signal-appending callers still
-  //    deduplicate against each other above.
+  //    so the fetch layer can cancel superseded requests (a StrictMode
+  //    double-mount cancels its first run this way). Concurrent-call
+  //    deduplication is not part of this base template — it is a cache
+  //    concern; see `useProjectSWRQuery.ts` for the `useCache` variant.
   useRun(loadProjects, options?.size === undefined ? [] : [options.size], {
     signal: true
   });

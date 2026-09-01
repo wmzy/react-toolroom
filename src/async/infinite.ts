@@ -4,10 +4,11 @@ import {emitResult, getResultStore, nextResultSeq, useStoreValue} from './base';
 import {useInject} from './inject';
 
 // Pagination state keyed by the injectable itself, following the registry
-// pattern of dedup.ts: every useInfinite consumer of the same injectable
-// shares one state, and the whole entry is released once the injectable is
-// garbage-collected. `pages`/`pageParams` are replaced (never mutated) on
-// every update, so the pages array identity doubles as the store snapshot.
+// pattern of the other per-injectable stores: every useInfinite consumer
+// of the same injectable shares one state, and the whole entry is released
+// once the injectable is garbage-collected. `pages`/`pageParams` are
+// replaced (never mutated) on every update, so the pages array identity
+// doubles as the store snapshot.
 type PageDir = 'next' | 'prev';
 
 type InfiniteState = {pages: any[]; pageParams: any[]; pendingDirs: PageDir[]};

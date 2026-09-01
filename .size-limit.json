@@ -1,12 +1,12 @@
 [
   {
     "name": "index",
-    "path": ["dist/index.mjs", "dist/util-*.mjs"],
+    "path": ["dist/index.mjs"],
     "limit": "3 kB"
   },
   {
     "name": "async",
-    "path": ["dist/async.mjs", "dist/util-*.mjs"],
+    "path": ["dist/async.mjs"],
     "limit": "7 kB"
   }
 ]

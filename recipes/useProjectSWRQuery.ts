@@ -25,7 +25,6 @@
 import {
   createMemoryCacheProvider,
   useCache,
-  useDedup,
   useError,
   useFocusRevalidate,
   useInitialLoading,
@@ -33,7 +32,6 @@ import {
   useRefresh,
   useResult,
   useRun,
-
   type R
 } from 'react-toolroom/async';
 import {fetchList} from '@/services/user';
@@ -101,10 +99,10 @@ export function useProjectSWRQuery(options?: {
   const staleTime = options?.staleTime ?? 5000;
 
   const loadProjects = useInjectable(fetchList);
-  // Order does not matter (each hook registers one wrapper), but note the
-  // cache wraps around the deduped call: background revalidations triggered
-  // by cache hits and focus events collapse into one request.
-  useDedup(loadProjects);
+  // Order does not matter (each hook registers one wrapper). Every fetch
+  // goes through the provider's `load`, whose per-key in-flight slot is the
+  // deduplication: background revalidations triggered by cache hits and
+  // focus events collapse into one request.
   const isStale = useCache(loadProjects, projectCache, staleTime);
   useFocusRevalidate(loadProjects);
   // Errors as state: the `error` read below claims the instance's
@@ -114,8 +112,8 @@ export function useProjectSWRQuery(options?: {
   // Plain `[]` — see the header note on cache-key alignment with
   // `useFocusRevalidate` before adding options or `{signal: true}`.
   useRun(loadProjects, []);
-  // The refresh button: deletes the current `[]` entry (and its dedup
-  // in-flight registration) and re-runs — never joins the pending request
+  // The refresh button: deletes the current `[]` entry — its in-flight
+  // `load` slot included — and re-runs, never joining the pending request
   // it replaces. Dual-addresses a `{signal: true}` run's key too, so the
   // header's key-alignment note does not restrict it.
   const refetch = useRefresh(loadProjects, [], projectCache);

@@ -9,12 +9,12 @@
 
 ## 特性
 
-- **零依赖、体积极小** — 全量入口 `react-toolroom` 1.4 kB、`react-toolroom/async` 5.64 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
+- **零依赖、体积极小** — 全量入口 `react-toolroom` 2.27 kB、`react-toolroom/async` 6.36 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
-- **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `useDedup` + `usePolling`，用不到的直接被 tree-shaking 掉。
+- **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
 - **React 16.8 – 19** — 一套代码路径，覆盖广谱版本。
-- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；226 个测试。
+- **TypeScript 优先** — 源码即 TypeScript，`.d.ts` 从源码生成；358 个测试。
 
 ## 安装
 
@@ -22,17 +22,17 @@
 npm i react-toolroom
 ```
 
-两个入口：`react-toolroom`（核心：`memo`、`stableHash`）与 `react-toolroom/async`（数据请求 hooks）。
+两个入口：`react-toolroom`（核心：`memo`、`createMemoryCacheProvider`、`stableHash`）与 `react-toolroom/async`（数据请求 hooks）。
 
 ## 什么时候选这个库
 
-React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、断网重连重验证、取消、与 mutation 联动的失效——用约 5.6 kB、无 Provider 的代价交付给你（按需引入更低）。下面是一份诚实的对比：
+React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频率最高的 20% 能力——缓存、去重、轮询、焦点重验证、断网重连重验证、取消、与 mutation 联动的失效——用约 6.4 kB、无 Provider 的代价交付给你（按需引入更低）。下面是一份诚实的对比：
 
 | 能力 | react-toolroom | TanStack Query | SWR | ahooks `useRequest` |
 | --- | --- | --- | --- | --- |
 | 运行时依赖 | **0** | 0 | 0 | ahooks 本体 |
 | 需要全局 Provider | **不需要** | 需要（`QueryClientProvider`） | 不需要 | 不需要 |
-| 请求去重 | `useDedup` | 内置 | 内置 | ✗（只有防抖/节流） |
+| 请求去重 | 内置（缓存 provider 的 `load`） | 内置 | 内置 | ✗（只有防抖/节流） |
 | 轮询 | `usePolling` | `refetchInterval` | `refreshInterval` | `pollingInterval` |
 | 焦点时重新请求 | `useFocusRevalidate` | `refetchOnWindowFocus` | `revalidateOnFocus` | `refreshOnWindowFocus` |
 | 网络恢复时重新请求 | `useReconnectRevalidate` | 内置 | 内置 | ✗ |
@@ -44,7 +44,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **1.4 kB** + **5.64 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **2.27 kB** + **6.36 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、全量入口（未 tree-shaking）的体积，是按需引入的上界。react-toolroom 的数字是 CI 构建产物的实测值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -58,7 +58,7 @@ React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。
 
 | 模板 | 组合方式 |
 | --- | --- |
-| [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | 基础版：`useInjectable` + `useDedup` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`。 |
+| [`useProjectQuery.ts`](./recipes/useProjectQuery.ts) | 基础版：`useInjectable` + `useRun(…, {signal: true})` + `useResult` / `useInitialLoading` / `useError`。 |
 | [`useProjectMutation.ts`](./recipes/useProjectMutation.ts) | 写操作侧，叠在一等 `useMutation` 之上：钉住项目默认的失败上报，显式 `onError` 仍可替换——这是给库 hook 叠加项目约定的范式。 |
 | [`useProjectSWRQuery.ts`](./recipes/useProjectSWRQuery.ts) | 加 `useCache(staleTime)`（模块级缓存实例）+ `useFocusRevalidate`。 |
 | [`useProjectPollingQuery.ts`](./recipes/useProjectPollingQuery.ts) | 加固定间隔的 `usePolling`。 |
@@ -173,7 +173,7 @@ flowchart LR
     S -. 更新 .-> U["订阅者<br/>所有已挂载组件"]
 ```
 
-每个能力 hook——`useResult`、`useLoading`、`useCache`、`useDedup`……——本质上只是一次 `useInject` 注册，所以它们能以任意顺序组合。wrapper **每个 hook 实例只注册一次**（重渲染和 StrictMode 双渲染都不会产生重复注册），并在**注入方组件卸载时自动摘除**。
+每个能力 hook——`useResult`、`useLoading`、`useCache`……——本质上只是一次 `useInject` 注册，所以它们能以任意顺序组合。wrapper **每个 hook 实例只注册一次**（重渲染和 StrictMode 双渲染都不会产生重复注册），并在**注入方组件卸载时自动摘除**。
 
 wrapper 列表挂在 injectable 本身上，因此一个组件可以给*另一个*组件创建的 fetcher 叠加行为——不需要 Provider 的跨组件注入：
 
@@ -228,19 +228,27 @@ wrapper 接收 `(nextFn, callContext)`：`nextFn` 是要调用的下一层内层
 
 ## 实战示例
 
-### 连点去重 — `useDedup`
+### 连点去重 — 缓存 provider
 
 ```tsx
-const loadReport = useInjectable(fetchReport);
-useDedup(loadReport);
-const report = useResult(loadReport);
+import {createMemoryCacheProvider} from 'react-toolroom';
+import {useCache, useInjectable, useResult} from 'react-toolroom/async';
 
-// 接口耗时 2 秒。请求进行中连点 5 次，只会发出 1 次真实请求；
-// 所有并发调用拿到同一个结果。
-<button type='button' onClick={() => loadReport()}>刷新</button>;
+// 模块顶层：一份缓存，被所有引用它的组件共享。
+const reportCache = createMemoryCacheProvider<Report, []>({cacheTime: 60000});
+
+function Widget() {
+  const loadReport = useInjectable(fetchReport);
+  useCache(loadReport, reportCache);
+  const report = useResult(loadReport);
+
+  // 接口耗时 2 秒。请求进行中连点 5 次，只会发出 1 次真实请求；
+  // 所有并发调用拿到同一个结果。
+  return <button type='button' onClick={() => loadReport()}>刷新</button>;
+}
 ```
 
-去重键默认使用 `stableHash`：它对键的插入顺序不敏感，并把每个 `AbortSignal` 映射为固定占位符——所以 `useRun(fn, args, {signal: true})` 的重复运行依然能命中去重。promise 落定后条目即被删除，失败的调用因此可以被重试。
+去重是缓存 provider 的职责，不是单独的 hook：`useCache` 把每次请求都路由进 provider 的 `load`，它给每个键维护一个 in-flight 槽——请求进行中同键调用共享一个 promise、一次请求。槽位在落定后释放，失败的调用因此可以重试；同一 provider 还能跨通道去重：两个组件、`useRun` 的重跑、共享缓存的 router loader，都是同一次请求。没实现 `load` 的自定义 provider（localStorage/IndexedDB 桩）就是不去重，没挂 `useCache` 的 injectable 没有缓存可去——两者都是显式的选择，不是悄悄改变的行为。
 
 ### 轮询与焦点重验证 — `usePolling` + `useFocusRevalidate`
 
@@ -267,7 +275,7 @@ function Ticker() {
 }
 ```
 
-`usePolling` 在上一轮还没结束时跳过本轮（慢接口永远不会堆出并发请求），页面隐藏时自动暂停，除非传 `{whenHidden: true}`。`useFocusRevalidate` 用 `{interval}` 节流（默认 `0`）。两者都接受 `{args}`：当 fetcher 带键参数时（`useRun(loadUser, [userId])`），传入相同的元组——`usePolling(loadUser, 10000, {args: [userId]})`——让每一轮都命中与 `useCache`/`useDedup` 相同的键，而不是开出一条以 `[]` 为键的第二请求线。
+`usePolling` 在上一轮还没结束时跳过本轮（慢接口永远不会堆出并发请求），页面隐藏时自动暂停，除非传 `{whenHidden: true}`。`useFocusRevalidate` 用 `{interval}` 节流（默认 `0`）。两者都接受 `{args}`：当 fetcher 带键参数时（`useRun(loadUser, [userId])`），传入相同的元组——`usePolling(loadUser, 10000, {args: [userId]})`——让每一轮都命中与 `useCache` 相同的键，而不是开出一条以 `[]` 为键的第二请求线。
 
 ### 取消过期请求 — `useRun` 的 signal
 
@@ -666,7 +674,8 @@ function App() {
 | `memo(Component, options?)` | 自动 memoize 事件处理器 props 的 `React.memo`，从此不需要 `useCallback`。`options`：`{testEvent?, propsAreEqual?}` 或直接传 `propsAreEqual(prev, next)` 函数。 |
 | `memoBase(Component, {testEvent, propsAreEqual?})` | 底层变体：必须传完整 options 对象，不帮你填默认值。 |
 | `defaultTestEvent(key)` | 默认的 `testEvent`：`/^on[A-Z]/.test(key)`。 |
-| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符。两个入口均可导入；是 `useDedup` 和 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
+| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
+| `createMemoryCacheProvider({cacheTime?, hash?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
 | `isAbortSignal(value)` | 判断值是否为 `AbortSignal`：`instanceof` 快路径加鸭子类型回退（`aborted` 属性 + `addEventListener` 函数），因此跨 realm 的 signal（iframe、测试替身）乃至没有全局 `AbortSignal` 的环境都能正确识别。两个入口均可导入；是 `stableHash` 的 signal 占位符与 `useRun` signal 桥的基础。 |
 
 ### Async — `react-toolroom/async`
@@ -690,16 +699,15 @@ function App() {
 | `useCatch(fn, catcher)` | 通过 `catcher(e) => result` 把 rejection 转为兜底值。 |
 | `useFinally(fn, handler)` | 调用落定时执行 `handler`，无论成败。 |
 | `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。 |
-| `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useDedup`/`useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
+| `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
 | `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。`scope: key | ((…args) => key)` 把同 key 调用串成 FIFO 链（TanStack `mutationKey` + `scope`）：排队中的调用等所有更早的同 scope 调用 settle 后才执行——失败不断链、模块级链在卸载后依然执行、排队中的调用从发起就计入 `isMutating`；不同 key 并行，不传 `scope` 行为不变。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——该标志是同一 injectable 所有 `useCache` 消费者共享的广播状态，一起更新（最后一次判定生效）。同时订阅 provider 的删除事件——任何清除缓存的写入者（`invalidate` / `invalidates`、`deletePrefix`、DevTools 面板按钮、过期）都会让挂载中的消费者重新请求并广播。 |
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 内存版 `CacheProvider`，提供 `get/set/delete/clear/use`，另有 `dehydrate`/`hydrate`（JSON 安全的 SSR 传输；`hydrate` 为合并语义）、`deletePrefix`（按哈希键前缀批量失效）与 `deleteWhere`（按参数谓词批量失效——前缀型 `invalidates` 目标使用的原语）、`deleteKey(hashedKey)`（按 `snapshot()` 行携带的哈希键结构化删除单条——不受原始元组漂移影响，可寻址水合条目）；还实现了可观察接口 `subscribe`/`snapshot`——写入后发 `set` 事件，删除后发携带被删条目原始参数元组的 `delete` 事件，同时驱动 DevTools 面板与 `useCache` 的被动重验证，`snapshot()` 返回 `{key, value, cachedAt}[]` 条目列表；设置有限 `cacheTime` 且无人使用后，闲置超过该时长即整体清空。 |
-| `useDedup(fn, {hash = stableHash}?)` | 同键并发调用共享同一个 in-flight promise；落定即删条目，失败可重试。 |
-| `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache`/`useDedup` 键——`useRun` 带键时请传相同元组。 |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 此处为便捷再导出——详见上方核心表。 |
+| `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。`args` 命中与 `useRun(fn, args)` 相同的 `useCache` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = []}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。 |
 | `useReconnectRevalidate(fn, {interval = 0, args = []}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
 | `stableHash(value)` | 此处为便捷再导出——见上方核心表。 |
@@ -718,7 +726,7 @@ function App() {
 
 ## API 稳定性与 1.0 路线
 
-承重面已冻结——签名与语义按契约对待，改动它需要出现关键性 bug 才行：注入核心（`useInjectable`、`useInject`、`useInjectBefore`、`getInjectContext`、`addWrapper`）、`useRun`、`useCache` / `useInvalidate` / `createMemoryCacheProvider`、`useDedup`，以及状态 hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`。
+承重面已冻结——签名与语义按契约对待，改动它需要出现关键性 bug 才行：注入核心（`useInjectable`、`useInject`、`useInjectBefore`、`getInjectContext`、`addWrapper`）、`useRun`、`useCache` / `useInvalidate` / `createMemoryCacheProvider`，以及状态 hooks `useResult` / `useError` / `useLoading` / `useInitialLoading`。
 
 仍在演进、欢迎反馈：`useMutation`、`useOptimistic`、`useInfinite`、`useSuspenseResult`、`usePlaceholderData` 与 DevTools 面板。
 
@@ -727,11 +735,11 @@ function App() {
 ## 工程事实
 
 - **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
-- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 6 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 1.4 kB / 5.64 kB。
-- **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useDedup` + `useResult` 读取套件约 1.7 kB。
+- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 7 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 2.27 kB / 6.36 kB。
+- **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useResult` 读取套件约 1.7 kB。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。
-- **测试覆盖** — 226 个测试（vitest + Testing Library）。
+- **测试覆盖** — 358 个测试（vitest + Testing Library）。
 
 ## 示例
 

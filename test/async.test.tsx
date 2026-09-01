@@ -30,7 +30,6 @@ import {
   invalidate,
   getInjectContext,
   useInject,
-  useDedup,
   usePolling,
   useFocusRevalidate,
   useArgsStatus,
@@ -3196,7 +3195,7 @@ describe('async hooks', () => {
       // Two component instances → two independent injectables (separate
       // stores and broadcasts), but one shared provider: the provider-level
       // in-flight slot collapses their concurrent misses into one request —
-      // the cross-component capability useDedup used to own.
+      // deduplication is entirely the provider's job.
       function Consumer({label}: {label: string}) {
         const injectable = useInjectable(fetchData);
         useCache(injectable, cache, 60000);
@@ -3232,6 +3231,60 @@ describe('async hooks', () => {
       });
 
       expect(fetchData).toHaveBeenCalledTimes(1);
+    });
+
+    it('should merge rapid clicks while a request is in flight through the provider load slot', async () => {
+      const data = {value: 42};
+      let resolveFn!: (v: typeof data) => void;
+      const fetchData = vi.fn(
+        () =>
+          new Promise<typeof data>((resolve) => {
+            resolveFn = resolve;
+          })
+      );
+      const cache = createMemoryCacheProvider<typeof data, []>({
+        cacheTime: 60000
+      });
+
+      function TestComponent() {
+        const fetchValue = useInjectable(fetchData);
+        useCache(fetchValue, cache);
+        const value = useResult(fetchValue);
+
+        return (
+          <div>
+            <span data-testid='value'>
+              {value ? String(value.value) : 'none'}
+            </span>
+            <button
+              type='button'
+              data-testid='fetch'
+              onClick={() => {
+                void fetchValue();
+                void fetchValue();
+              }}
+            >
+              fetch
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fetch'));
+      });
+      // A double click in the same tick shares one in-flight request — the
+      // provider's load slot, not a separate dedup registry.
+      expect(fetchData).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolveFn(data);
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('value').textContent).toBe('42');
+      });
     });
 
     it('should work with a legacy provider that has no load() (write-through set)', async () => {
@@ -3655,7 +3708,7 @@ describe('async hooks', () => {
       expect(fetchData).toHaveBeenCalledTimes(3);
     });
 
-    it('useRefresh should bypass an in-flight useDedup request and never reject', async () => {
+    it('useRefresh should bypass an in-flight provider request and never reject', async () => {
       const rejectQueue: Array<(e: Error) => void> = [];
       const fetchData = vi.fn(
         (id: number) =>
@@ -3670,7 +3723,7 @@ describe('async hooks', () => {
 
       function TestComponent() {
         const injectable = useInjectable(fetchData);
-        useDedup(injectable);
+        useCache(injectable, cache, 60000);
         const refresh = useRefresh(injectable, [1], cache);
         refreshFn = refresh;
         useEffect(() => {
@@ -3683,7 +3736,7 @@ describe('async hooks', () => {
       await waitFor(() => {
         expect(fetchData).toHaveBeenCalledTimes(1);
       });
-      // the first request is still in flight here
+      // the first request is still in flight in the provider's load slot
 
       // the returned promise never rejects — track it across a failure
       let settled: unknown = 'pending';
@@ -3698,9 +3751,9 @@ describe('async hooks', () => {
           }
         );
       });
-      // the dedup entry was purged together with the cache entry, so the
-      // refresh started a SECOND request instead of joining the pending
-      // first one (which it would share without the purge)
+      // the entry was deleted with its in-flight load slot, so the refresh
+      // started a SECOND request instead of joining the pending first one
+      // (which it would share without the delete)
       await waitFor(() => {
         expect(fetchData).toHaveBeenCalledTimes(2);
       });
@@ -4333,275 +4386,6 @@ describe('async hooks', () => {
       );
 
       expect(order).toEqual(['useInjectBefore', 'useInject after', 'original']);
-    });
-  });
-
-  describe('useDedup', () => {
-    it('should execute the underlying fn once for concurrent calls with the same args and share the same result', async () => {
-      const data = {users: []};
-      let resolveFn!: (v: typeof data) => void;
-      const fetchData = vi.fn(
-        (_id: number) =>
-          new Promise<typeof data>((resolve) => {
-            resolveFn = resolve;
-          })
-      );
-
-      function TestComponent() {
-        const injectable = useInjectable(fetchData);
-        useDedup(injectable);
-        const [a, setA] = useState<typeof data>();
-        const [b, setB] = useState<typeof data>();
-
-        useEffect(() => {
-          injectable(1).then(setA);
-          injectable(1).then(setB);
-        }, [injectable]);
-
-        return (
-          <div>
-            <span data-testid='a'>{a ? 'done' : 'pending'}</span>
-            <span data-testid='b'>{b ? 'done' : 'pending'}</span>
-          </div>
-        );
-      }
-
-      render(<TestComponent />);
-
-      // Both calls fired while the promise was in flight
-      await act(async () => {
-        resolveFn(data);
-      });
-      await waitFor(() => {
-        expect(screen.getByTestId('a').textContent).toBe('done');
-        expect(screen.getByTestId('b').textContent).toBe('done');
-      });
-
-      expect(fetchData).toHaveBeenCalledTimes(1);
-    });
-
-    it('should re-run after settle and allow retrying a failed call', async () => {
-      let fail = true;
-      let resolveFn!: (v: string) => void;
-      const fetchData = vi.fn(
-        (_id: number) =>
-          new Promise<string>((resolve, reject) => {
-            if (fail) reject(new Error('network down'));
-            else resolveFn = resolve;
-          })
-      );
-
-      let retry!: () => void;
-      function TestComponent() {
-        const injectable = useInjectable(fetchData);
-        useDedup(injectable);
-        const [result, setResult] = useState<string | undefined>();
-
-        const run = () => {
-          injectable(1).then(setResult, () => setResult(undefined));
-        };
-        useEffect(run, [injectable]);
-        retry = () => {
-          fail = false;
-          run();
-        };
-
-        return (
-          <div>
-            <span data-testid='result'>{result ?? 'no result'}</span>
-            <button type='button' data-testid='retry' onClick={retry}>
-              retry
-            </button>
-          </div>
-        );
-      }
-
-      render(<TestComponent />);
-
-      await waitFor(() => {
-        expect(screen.getByTestId('result').textContent).toBe('no result');
-      });
-      // First call failed and settled — it must not stay in the map
-      expect(fetchData).toHaveBeenCalledTimes(1);
-
-      await act(async () => {
-        fireEvent.click(screen.getByTestId('retry'));
-      });
-      // The retry re-executed the underlying fn
-      expect(fetchData).toHaveBeenCalledTimes(2);
-
-      await act(async () => {
-        resolveFn!('ok');
-      });
-      await waitFor(() => {
-        expect(screen.getByTestId('result').textContent).toBe('ok');
-      });
-    });
-
-    it('should not dedupe calls with different args', async () => {
-      const fetchData = vi.fn(async (id: number) => `result ${id}`);
-
-      function TestComponent() {
-        const injectable = useInjectable(fetchData);
-        useDedup(injectable);
-        const [results, setResults] = useState<string[]>([]);
-
-        useEffect(() => {
-          Promise.all([injectable(1), injectable(2)]).then((r) =>
-            setResults(r)
-          );
-        }, [injectable]);
-
-        return <div>{results.join(',')}</div>;
-      }
-
-      render(<TestComponent />);
-
-      await waitFor(() => {
-        expect(screen.getByText('result 1,result 2')).toBeDefined();
-      });
-      expect(fetchData).toHaveBeenCalledTimes(2);
-    });
-
-    it('should dedupe button double clicks combined with useRun/useResult', async () => {
-      const data = {value: 42};
-      let resolveFn!: (v: typeof data) => void;
-      const fetchData = vi.fn(
-        () =>
-          new Promise<typeof data>((resolve) => {
-            resolveFn = resolve;
-          })
-      );
-
-      function TestComponent() {
-        const fetchValue = useInjectable(fetchData);
-        useDedup(fetchValue);
-        const value = useResult(fetchValue);
-
-        return (
-          <div>
-            <span data-testid='value'>
-              {value ? String(value.value) : 'none'}
-            </span>
-            <button
-              type='button'
-              data-testid='fetch'
-              onClick={() => {
-                void fetchValue();
-                void fetchValue();
-              }}
-            >
-              fetch
-            </button>
-          </div>
-        );
-      }
-
-      render(<TestComponent />);
-
-      await act(async () => {
-        fireEvent.click(screen.getByTestId('fetch'));
-      });
-      // A double click in the same tick shares one in-flight promise
-      expect(fetchData).toHaveBeenCalledTimes(1);
-
-      await act(async () => {
-        resolveFn(data);
-      });
-      await waitFor(() => {
-        expect(screen.getByTestId('value').textContent).toBe('42');
-      });
-    });
-
-    it('should dedupe through a custom hash option', async () => {
-      let resolveFn!: (v: string) => void;
-      const fetchData = vi.fn(
-        (id: number) =>
-          new Promise<string>((resolve) => {
-            resolveFn = resolve;
-          })
-      );
-
-      function TestComponent() {
-        const injectable = useInjectable(fetchData);
-        useDedup(injectable, {hash: () => 'one-bucket'});
-        const [joined, setJoined] = useState<string>();
-        useEffect(() => {
-          Promise.all([injectable(1), injectable(2)]).then((r) =>
-            setJoined(r.join(','))
-          );
-        }, [injectable]);
-        return <div>{joined ?? 'pending'}</div>;
-      }
-
-      render(<TestComponent />);
-      await act(async () => {
-        resolveFn('shared');
-      });
-      await waitFor(() => {
-        expect(screen.getByText('shared,shared')).toBeDefined();
-      });
-      // different args, one bucket: a single request serves both callers
-      expect(fetchData).toHaveBeenCalledTimes(1);
-    });
-
-    it('should ignore the trailing AbortSignal when hashing args', async () => {
-      const data = {value: 7};
-      const signals: AbortSignal[] = [];
-      let resolveFn!: (v: typeof data) => void;
-      const fetchData = vi.fn(
-        (signal: AbortSignal) =>
-          new Promise<typeof data>((resolve) => {
-            signals.push(signal);
-            resolveFn = resolve;
-          })
-      );
-
-      function Child({fetchValue}: {fetchValue: any}) {
-        // Each useRun instance creates its own AbortController, so the two
-        // children run with distinct signals but identical call arguments.
-        useRun(fetchValue, [1], {signal: true});
-        return null;
-      }
-
-      function TestComponent() {
-        const fetchValue = useInjectable(fetchData);
-        useDedup(fetchValue);
-        const [extra, setExtra] = useState(false);
-        return (
-          <div>
-            <Child fetchValue={fetchValue} />
-            <Child fetchValue={fetchValue} />
-            <button
-              type='button'
-              data-testid='add'
-              onClick={() => setExtra(true)}
-            >
-              add
-            </button>
-            {extra && <Child fetchValue={fetchValue} />}
-          </div>
-        );
-      }
-
-      render(<TestComponent />);
-
-      // Both children's runs are in flight concurrently with the same args:
-      // they share one promise, so the fn runs once with one of the signals
-      // while the other is aborted by cleanup after its shared run settles.
-      await act(async () => {
-        resolveFn(data);
-      });
-      await waitFor(() => {
-        expect(fetchData).toHaveBeenCalledTimes(1);
-      });
-      expect(signals).toHaveLength(1);
-
-      // After settling, the entry is gone — a later run executes again
-      fireEvent.click(screen.getByTestId('add'));
-      await waitFor(() => {
-        expect(fetchData).toHaveBeenCalledTimes(2);
-      });
     });
   });
 

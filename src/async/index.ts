@@ -110,7 +110,7 @@ import {
   invalidate,
   isCacheProvider
 } from './invalidation';
-import createMemoryCacheProvider from './memory-cache-provider';
+import createMemoryCacheProvider from '../memory-cache-provider';
 
 export {useInject, useInjectBefore, getInjectContext, isInjectable};
 export type {
@@ -122,8 +122,6 @@ export type {
   CacheEvent
 } from '@@/types';
 
-export {useDedup} from './dedup';
-import {purgeInflight} from './dedup';
 export {useOptimistic} from './optimistic';
 export {useInfinite} from './infinite';
 
@@ -1379,8 +1377,7 @@ export function useArgsStatus<AF extends AsyncFunc>(
   // (emitResult) maintains `lastKey` in lockstep with `lastResult`, so the
   // data-scoped reads below all gate on one comparison instead of
   // re-hashing `lastArgs` per field.
-  const dataMatches =
-    resultStore.hasResult && resultStore.lastKey === argsKey;
+  const dataMatches = resultStore.hasResult && resultStore.lastKey === argsKey;
   return {
     loading: slot ? slot.count > 0 : false,
     error: slot ? slot.error : undefined,
@@ -1426,7 +1423,7 @@ const attachSignal = <F extends Func>(f: F, callContext: any): F =>
  * `useRun(fn, [{page, filters}])`) would re-run on each render. The `hash`
  * option swaps the reference comparison for a key computed from the
  * arguments: the effect re-runs only when the key changes, matching the
- * structural semantics of `useDedup` and `createMemoryCacheProvider`.
+ * structural semantics of `createMemoryCacheProvider` keys.
  *
  * @param {F} fn - The function to run.
  * @param {Parameters<F>} args - The arguments to pass to the function.
@@ -1531,9 +1528,9 @@ export function useRun<F extends Func>(
  * `args` of a cached injectable: calling it deletes the cache entry under
  * those args and immediately re-runs the injectable with them — a forced
  * fresh fetch that bypasses both the settled cache and any in-flight
- * request (the provider's `load` slot and the `useDedup` registry are
- * purged with the entry, so the refresh can never be folded back into the
- * very request it replaces).
+ * request (the entry — in-flight `load` slot included — is deleted first,
+ * so the refresh can never be folded back into the very request it
+ * replaces).
  *
  * Key linkage with `useRun({signal: true})`: a run stores its entry under
  * the args tuple WITH the trailing `AbortSignal` appended. The delete
@@ -1605,7 +1602,6 @@ export function useRefresh<AF extends AsyncFunc>(
     const tuples = [currentArgs, signalled] as Parameters<AF>[];
     for (const tuple of tuples) pending.add(stableHash(tuple));
     for (const tuple of tuples) cacheProvider.delete(tuple);
-    purgeInflight(injectableFn, currentArgs);
     return Promise.resolve(injectableFn(...(currentArgs as Parameters<AF>)))
       .catch(noop)
       .finally(() => {
@@ -1623,6 +1619,6 @@ export {
 } from './polling';
 
 export {useInjectable, createMemoryCacheProvider};
-export {default as createMutationBinder} from './mutation';
+export {default as createMutationBinder} from '../mutation';
 export type {MutationSpec, BoundMutation, CreateMutationBinder} from '@@/types';
 export {stableHash, isAbortSignal} from '@@/util';

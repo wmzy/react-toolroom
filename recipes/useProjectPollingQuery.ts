@@ -21,7 +21,6 @@
  */
 
 import {
-  useDedup,
   useError,
   useInitialLoading,
   useInjectable,
@@ -79,9 +78,10 @@ export function useProjectPollingQuery(
   interval?: number
 ): ProjectPollingQueryResult {
   const loadTicker = useInjectable(fetchTicker);
-  // Both `useRun` and `usePolling` call with `[]`, so they address the same
-  // dedup key — a rerun racing a tick shares one request instead of two.
-  useDedup(loadTicker);
+  // `usePolling` skips a tick while the previous call is still pending, so
+  // a slow API never piles up concurrent requests on its own. A `useRun`
+  // rerun racing an in-flight tick runs as its own request — merging the
+  // two needs a cache provider; see `useProjectSWRQuery.ts`.
   useRun(loadTicker, []);
   usePolling(loadTicker, interval ?? 3000);
 

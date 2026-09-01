@@ -11,8 +11,8 @@ import {useEffect} from 'react';
  * polling is paused unless `whenHidden` is set, and changing `interval`
  * restarts the timer. The timer is cleaned up on unmount.
  *
- * `args` keeps polling on the same keyed entry as `useRun`: `useCache` and
- * `useDedup` hash the call arguments, so polling an injectable that
+ * `args` keeps polling on the same keyed entry as `useRun`: `useCache`
+ * hashes the call arguments, so polling an injectable that
  * `useRun(fn, [id])` also drives without passing the same `args` would
  * resolve to a different key — a cache miss that spawns a second request
  * line. Arguments are compared element-wise by reference exactly like
@@ -33,7 +33,7 @@ import {useEffect} from 'react';
  * ```tsx
  * const fetchUser = useInjectable((id: string) => api.user(id));
  * useRun(fetchUser, [userId]);
- * // Ticks reuse the cache/dedup key of [userId] instead of opening a
+ * // Ticks reuse the cache key of [userId] instead of opening a
  * // second request line keyed by [].
  * usePolling(fetchUser, 10000, {args: [userId]});
  * ```
@@ -85,7 +85,7 @@ export function usePolling<AF extends AsyncFunc>(
  * `refetchOnWindowFocus` in react-query.
  *
  * `args` keeps revalidation on the same keyed entry as `useRun`: `useCache`
- * and `useDedup` hash the call arguments, so revalidating an injectable
+ * hashes the call arguments, so revalidating an injectable
  * that `useRun(fn, [id])` also drives without passing the same `args` would
  * resolve to a different key — a cache miss that spawns a second request
  * line. Arguments are compared element-wise by reference exactly like
@@ -106,7 +106,7 @@ export function usePolling<AF extends AsyncFunc>(
  * ```tsx
  * const fetchUser = useInjectable((id: string) => api.user(id));
  * useRun(fetchUser, [userId]);
- * // Focus revalidates the cache/dedup key of [userId], not of [].
+ * // Focus revalidates the cache key of [userId], not of [].
  * useFocusRevalidate(fetchUser, {args: [userId]});
  * ```
  */
@@ -153,7 +153,7 @@ export function useFocusRevalidate<AF extends AsyncFunc>(
  * back online.
  *
  * `args` keeps revalidation on the same keyed entry as `useRun`: `useCache`
- * and `useDedup` hash the call arguments, so revalidating an injectable
+ * hashes the call arguments, so revalidating an injectable
  * that `useRun(fn, [id])` also drives without passing the same `args` would
  * resolve to a different key — a cache miss that spawns a second request
  * line. Arguments are compared element-wise by reference exactly like
@@ -174,7 +174,7 @@ export function useFocusRevalidate<AF extends AsyncFunc>(
  * ```tsx
  * const fetchUser = useInjectable((id: string) => api.user(id));
  * useRun(fetchUser, [userId]);
- * // Reconnect revalidates the cache/dedup key of [userId], not of [].
+ * // Reconnect revalidates the cache key of [userId], not of [].
  * useReconnectRevalidate(fetchUser, {args: [userId]});
  * ```
  */

@@ -15,8 +15,8 @@ beyond the package itself:
 ```tsx
 'use client';
 
+import {createMemoryCacheProvider} from 'react-toolroom';
 import {
-  createMemoryCacheProvider,
   useCache,
   useInjectable,
   useResult,
@@ -54,7 +54,7 @@ request.
 
 ```ts
 // app/projects/cache.ts
-import {createMemoryCacheProvider} from 'react-toolroom/async';
+import {createMemoryCacheProvider} from 'react-toolroom';
 import type {Project} from '@/services/projects';
 
 export const projectsCache = createMemoryCacheProvider<Project[], any[]>({
@@ -138,7 +138,7 @@ Notes:
 - The server's `set([], …)` and the client's `useRun(loadProjects, [])`
   address the same entry — cache keys hash the raw args tuple, so keep the
   tuples identical on both sides (same lesson as
-  `useFocusRevalidate`/`useDedup` key alignment).
+  `useFocusRevalidate` key alignment).
 - `hydrate` **merges** and preserves the server timestamps, so the
   client-side staleness math is computed against when the server actually
   fetched the data.
