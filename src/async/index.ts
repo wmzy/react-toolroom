@@ -83,7 +83,6 @@ import {
   ErrorStore,
   LoadingStore,
   ResultStore,
-  currentErrorSeq,
   emitError,
   emitLoading,
   emitResult,
@@ -98,6 +97,7 @@ import {
   nextErrorSeq,
   nextKeyedErrorSeq,
   nextResultSeq,
+  resetError,
   trimTrailingSignal,
   useStoreValue
 } from './base';
@@ -869,6 +869,17 @@ export type MutationStatus = {
   error: Error | undefined;
   /** Consecutive failures so far; a success resets it to `0`. */
   failureCount: number;
+  /**
+   * The derived lifecycle, TanStack Query's `mutation.status` semantics
+   * on the `isMutating` clock: `'idle'` before any call and after
+   * `reset`, `'pending'` from the moment a call is made (a scope-queued
+   * call is pending while it *waits*, exactly like `isMutating` counts
+   * it), `'success'` after the latest settled call succeeded, `'error'`
+   * after it failed. A call in flight dominates: `reset` during one
+   * keeps `pending` — the in-flight ticket stays valid and its outcome
+   * still lands afterwards.
+   */
+  status: 'idle' | 'pending' | 'success' | 'error';
 };
 
 // Module-level FIFO chains, one per scope key: the tail promise of every
@@ -907,17 +918,20 @@ const enqueueByScope = <T>(
  * closure, and the chain that `useOptimistic` / `useInvalidate` (or any
  * other wrapper) can also be registered on. The status reads the
  * injectable's shared stores — `isMutating` from the loading store,
- * `error` / `failureCount` from the error store — so every consumer of
- * the same mutation updates together and components mounted after a call
- * start from the shared snapshot.
+ * `error` / `failureCount` (and the settle outcome behind `status`) from
+ * the error store — so every consumer of the same mutation updates
+ * together and components mounted after a call start from the shared
+ * snapshot. `status` is the TanStack-style derived lifecycle
+ * (`'idle' | 'pending' | 'success' | 'error'`) on the `isMutating` clock.
  *
  * Rejections keep flowing: `mutate` behaves like the original function, so
  * per-call callbacks are simply `.then` / `.catch` on the returned promise
  * — no separate per-call options API. Hook-level callbacks go through a
  * ref funnel: `options` may be a fresh inline object every render and the
- * latest closures still fire. `reset` writes a success-shaped clearance
- * without raising the seq watermark, so a call already in flight still
- * lands afterwards — reset only wipes what has already settled.
+ * latest closures still fire. `reset` clears the settled bookkeeping
+ * without touching the ticket sequence: with no call in flight `status`
+ * reads `'idle'` again, while an in-flight call keeps `pending` and its
+ * outcome still lands after the reset.
  *
  * `invalidates` is the declarative mutation→query link: on success (only)
  * each target — a cache provider for its whole cache, or a
@@ -943,9 +957,10 @@ const enqueueByScope = <T>(
  *   `onError` / `onSettled` callbacks, `invalidates` cache targets and an
  *   optional `scope` serializing same-key calls; all optional.
  * @return {[M, MutationStatus, function]} `[mutate, status, reset]` —
- *   call `mutate` from event handlers; render `isMutating` on the submit
- *   button and `error` / `failureCount` for feedback UI; `reset` clears
- *   the failure bookkeeping between submissions.
+ *   call `mutate` from event handlers; render `isMutating` or
+ *   `status === 'pending'` on the submit button and `error` /
+ *   `failureCount` for feedback UI; `reset` clears the failure
+ *   bookkeeping between submissions.
  * @example
  * ```tsx
  * function RenameForm({id, name, fetchUsers}: Props) {
@@ -1073,16 +1088,33 @@ export function useMutation<
     errorStore,
     useCallback(() => errorStore.failureCount, [errorStore])
   );
+  // The settle outcome of the last applied emission — the signal that
+  // separates "never called" from "last call succeeded" once `error` is
+  // `undefined` (`lastOutcome === 'error'` is exactly `error !==
+  // undefined`: every applied emission writes both in lockstep). Derived
+  // on the isMutating clock, so status and isMutating can never disagree
+  // about whether a call — queued or running — is outstanding.
+  const lastOutcome = useStoreValue(
+    errorStore,
+    useCallback(() => errorStore.lastOutcome, [errorStore])
+  );
+  const status: MutationStatus['status'] = isMutating
+    ? 'pending'
+    : lastOutcome === 'success'
+      ? 'success'
+      : lastOutcome === 'error'
+        ? 'error'
+        : 'idle';
 
-  // 4. Clear the settled error bookkeeping. Writing with the CURRENT seq
-  //    does not raise the watermark, so an in-flight call's ticket stays
-  //    valid and its outcome still lands after the reset.
+  // 4. Clear the settled error bookkeeping. resetError never touches the
+  // ticket sequence, so an in-flight call's ticket stays valid and its
+  // outcome still lands after the reset — reset only wipes what has
+  // already settled (status included: it reads `idle` again).
   const reset = useCallback(() => {
-    const store = getErrorStore(mutate);
-    emitError(store, undefined, currentErrorSeq(store));
+    resetError(getErrorStore(mutate));
   }, [mutate]);
 
-  return [mutate, {isMutating, error, failureCount}, reset];
+  return [mutate, {isMutating, error, failureCount, status}, reset];
 }
 
 // Base delay (ms) of the preset backoff strategies of useRetry.
@@ -1264,13 +1296,18 @@ export function useInitialLoading<AF extends AsyncFunc>(injectableFn: AF) {
 }
 
 /** What {@link useArgsStatus} returns for one args key. */
-export type ArgsStatus = {
+export type ArgsStatus<E = Error> = {
   /** `true` while a call with THESE args is in flight — sibling calls of
    * the same injectable with different args do not flip it. */
   loading: boolean;
-  /** The last error of THESE args; a later same-args success clears it.
-   * Independent of the injectable-level `useError` broadcast. */
-  error: any | undefined;
+  /**
+   * The last error of THESE args; a later same-args success clears it.
+   * Independent of the injectable-level `useError` broadcast. Typed by
+   * the `E` type parameter (`Error` by default — no assertion needed at
+   * the call site; narrow it for APIs rejecting richer errors via
+   * `useArgsStatus<typeof fn, ApiError>`).
+   */
+  error: E | undefined;
   /** Failures of THESE args since their last success. */
   failureCount: number;
   /**
@@ -1328,6 +1365,13 @@ export type ArgsStatus = {
  * data — both `undefined` whenever `data` is, and untouched by failures
  * (a failed refetch of the same args leaves the last success stamped).
  *
+ * `error` is typed `Error | undefined` by default (no assertion needed at
+ * the call site). The `E` type parameter narrows it for APIs that reject
+ * with richer error shapes: `useArgsStatus<typeof fetchUser, ApiError>`
+ * reports `ApiError | undefined`. Like `useError`'s type parameter it is
+ * a declaration, not an inference — the runtime slot holds whatever the
+ * call actually rejected with.
+ *
  * @param injectableFn the injectable to observe
  * @param args the args tuple identifying the call slot
  * @returns `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly these args
@@ -1341,10 +1385,10 @@ export type ArgsStatus = {
  * }
  * ```
  */
-export function useArgsStatus<AF extends AsyncFunc>(
+export function useArgsStatus<AF extends AsyncFunc, E = Error>(
   injectableFn: AF,
   args: Parameters<AF>
-): ArgsStatus {
+): ArgsStatus<E> {
   // Mounting this hook claims the instance's errors, exactly like
   // `useError`/`useFailureCount`: the keyed failure reads declare
   // ownership, so the instance's calls stop rejecting at the boundary.

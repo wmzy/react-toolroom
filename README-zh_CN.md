@@ -9,7 +9,7 @@
 
 ## 特性
 
-- **零依赖、体积极小** — 全量入口 `react-toolroom` 2.27 kB、`react-toolroom/async` 6.36 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
+- **零依赖、体积极小** — 全量入口 `react-toolroom` 2.27 kB、`react-toolroom/async` 6.45 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
 - **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
@@ -44,7 +44,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **2.27 kB** + **6.36 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **2.27 kB** + **6.45 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、全量入口（未 tree-shaking）的体积，是按需引入的上界。react-toolroom 的数字是 CI 构建产物的实测值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -476,7 +476,7 @@ function FavoriteButton({slug}: Props) {
 语义：
 
 1. **同 key ⇒ 一条 FIFO 链。** 排队中的调用等到所有更早的同 scope 调用 *settle*（成功或失败）才执行，不丢弃任何调用。不同 key 并行；不传 `scope` 的调用保持原行为不变。
-2. **`isMutating` 从点击那一刻就计数。** 队列位于 loading store 内层，排队中的调用在*等待期间*就是 mutating，而非只有真正执行时才算。
+2. **`isMutating` 从点击那一刻就计数。** 队列位于 loading store 内层，排队中的调用在*等待期间*就是 mutating，而非只有真正执行时才算。`status` 与之同钟——从点击到 settle 全程为 `'pending'`。
 3. **链是模块级的。** 调用方卸载不会丢弃排队中的调用——它们会执行到底，与 TanStack 的 mutation scope 行为一致。
 4. **失败不断链。** 被拒绝的调用把队列交给下一个，它自己的 rejection 照常传给调用方（`.catch` 掉，或交给 `onError` 上报）。
 5. **scope 函数抛错——或解析出假值——回退为无 scope 的并行执行**：坏掉的 keyer 不能把调用方炸掉。
@@ -693,6 +693,7 @@ function App() {
 | `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。首个结果后，更新与 `useResult` 完全一致地流入。 |
 | `useLoading(fn)` | 任意调用进行中为 `true`。 |
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
+| `useArgsStatus(fn, args)` | 按参数观测——`{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` 只描述一个参数元组（结构化键，忽略末尾 `AbortSignal`）。`useLoading`/`useError` 的按 key 对应物：同一 injectable 并发服务多组参数时各自独立上报，互不覆盖对方 injectable 级的标志位。`error` 默认类型即 `Error \| undefined`（调用处无需 as 断言）；`E` 类型参数可收窄——`useArgsStatus<typeof fn, ApiError>` 得到 `ApiError \| undefined`。`data` 是收窄到该 key 的 `useResult` 契约：仅当共享结果的 provenance 匹配这组参数时非空。挂载即认领实例错误（errors-as-state，同 `useError`）。 |
 | `usePlaceholderData(fn, args, placeholderData?)` | 当前显示的结果并非由 `args` 取回时为 `true`——默认 keep-previous-data 行为的可观察标志（经 `stableHash` 结构化比较，忽略末尾追加的 `AbortSignal`）。传入 `placeholderData` 时，首个结果到来之前也为 `true`。 |
 | `useError(fn)` | 最近一次抛出的错误；成功时清空。错误状态挂在 injectable 级的共享广播 store 上：晚挂载的组件直接从共享快照读到上一次错误，多个消费者同步更新；写入带序号保护，慢的旧调用失败不会覆盖新调用的成功状态。 |
 | `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。与 `useError` 共用 injectable 级的共享广播 store，晚挂载的组件同样从共享快照起步。 |
@@ -700,7 +701,7 @@ function App() {
 | `useFinally(fn, handler)` | 调用落定时执行 `handler`，无论成败。 |
 | `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。 |
 | `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
-| `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。`scope: key | ((…args) => key)` 把同 key 调用串成 FIFO 链（TanStack `mutationKey` + `scope`）：排队中的调用等所有更早的同 scope 调用 settle 后才执行——失败不断链、模块级链在卸载后依然执行、排队中的调用从发起就计入 `isMutating`；不同 key 并行，不传 `scope` 行为不变。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
+| `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount` / `status`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。`status` 是 TanStack 同款的派生生命周期 `'idle' \| 'pending' \| 'success' \| 'error'`，走 `isMutating` 的时钟：调用发起即 `pending`（scope 排队中的调用等待期间就计入）、最近一次落定为 `success`/`error`、任何调用之前与 `reset` 之后为 `idle`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。`scope: key | ((…args) => key)` 把同 key 调用串成 FIFO 链（TanStack `mutationKey` + `scope`）：排队中的调用等所有更早的同 scope 调用 settle 后才执行——失败不断链、模块级链在卸载后依然执行、排队中的调用从发起就计入 `isMutating`；不同 key 并行，不传 `scope` 行为不变。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
 | `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——该标志是同一 injectable 所有 `useCache` 消费者共享的广播状态，一起更新（最后一次判定生效）。同时订阅 provider 的删除事件——任何清除缓存的写入者（`invalidate` / `invalidates`、`deletePrefix`、DevTools 面板按钮、过期）都会让挂载中的消费者重新请求并广播。 |
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
@@ -735,7 +736,7 @@ function App() {
 ## 工程事实
 
 - **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
-- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 7 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 2.27 kB / 6.36 kB。
+- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 7 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 2.27 kB / 6.45 kB。
 - **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useResult` 读取套件约 1.7 kB。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。

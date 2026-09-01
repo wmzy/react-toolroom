@@ -2089,10 +2089,8 @@ describe('useMutation', () => {
     seen?: {mutates: unknown[]};
     onPromise?: (p: Promise<string>) => void;
   }) {
-    const [mutate, {isMutating, error, failureCount}, reset] = useMutation(
-      save,
-      options
-    );
+    const [mutate, {isMutating, error, failureCount, status}, reset] =
+      useMutation(save, options);
     seen?.mutates.push(mutate);
     return createElement(
       'div',
@@ -2100,6 +2098,10 @@ describe('useMutation', () => {
       createElement('p', null, isMutating ? 'mutating' : 'idle'),
       ...(error ? [createElement('p', null, error.message)] : []),
       createElement('p', null, `failures ${failureCount}`),
+      // The derived lifecycle rides the same harness: exact-match text
+      // assertions ('status idle' etc.) never collide with the
+      // isMutating flag's own 'idle'/'mutating' texts.
+      createElement('p', null, `status ${status}`),
       createElement(
         'button',
         {
@@ -2211,6 +2213,81 @@ describe('useMutation', () => {
     expect(screen.getByText('failures 1')).toBeTruthy();
   });
 
+  it('should walk the full status machine: idle → pending → success/error, reset → idle', async () => {
+    // Every call hands back its own deferred, so each settle is chosen
+    // by the test and the status transitions are asserted one by one.
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const save = () => {
+      const d = deferred<string>();
+      calls.push(d);
+      return d.promise;
+    };
+
+    render(createElement(MutationView, {save}));
+    expect(screen.getByText('status idle')).toBeTruthy(); // never called
+
+    // A call flips pending from the moment it is made.
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('status pending')).toBeTruthy();
+    await act(async () => {
+      calls[0]!.resolve('saved');
+    });
+    expect(screen.getByText('status success')).toBeTruthy();
+
+    // A new call re-enters pending, then settles into error.
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('status pending')).toBeTruthy();
+    await act(async () => {
+      calls[1]!.reject(new Error('boom'));
+    });
+    expect(screen.getByText('status error')).toBeTruthy();
+
+    // A success after the failure clears it back to success.
+    fireEvent.click(screen.getByText('rename'));
+    expect(screen.getByText('status pending')).toBeTruthy();
+    await act(async () => {
+      calls[2]!.resolve('saved again');
+    });
+    expect(screen.getByText('status success')).toBeTruthy();
+    expect(screen.queryByText('boom')).toBeNull();
+
+    // Reset wipes the settled outcome — back to idle, not success.
+    fireEvent.click(screen.getByText('reset'));
+    await act(async () => {});
+    expect(screen.getByText('status idle')).toBeTruthy();
+  });
+
+  it('should keep status pending across a reset during an in-flight call, landing its outcome afterwards', async () => {
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const save = () => {
+      const d = deferred<string>();
+      calls.push(d);
+      return d.promise;
+    };
+
+    render(createElement(MutationView, {save}));
+
+    // Reset during an in-flight call: isMutating dominates, so status
+    // never flashes idle — and the outcome still lands after the reset.
+    fireEvent.click(screen.getByText('rename'));
+    fireEvent.click(screen.getByText('reset'));
+    expect(screen.getByText('status pending')).toBeTruthy();
+    await act(async () => {
+      calls[0]!.resolve('saved');
+    });
+    expect(screen.getByText('status success')).toBeTruthy();
+
+    // Same clock for a failure landing after a reset.
+    fireEvent.click(screen.getByText('rename'));
+    fireEvent.click(screen.getByText('reset'));
+    expect(screen.getByText('status pending')).toBeTruthy();
+    await act(async () => {
+      calls[1]!.reject(new Error('late'));
+    });
+    expect(screen.getByText('status error')).toBeTruthy();
+    expect(screen.getByText('failures 1')).toBeTruthy();
+  });
+
   it('should keep mutate stable and funnel the latest inline options', async () => {
     const seen = {mutates: [] as unknown[]};
     const stale = vi.fn();
@@ -2301,14 +2378,19 @@ describe('useMutation scope (serial queue)', () => {
     options?: MutationOptions<AnyMutation>;
     fire?: {current?: (...args: any[]) => void};
   }) {
-    const [mutate, {isMutating}] = useMutation(save, options);
+    const [mutate, {isMutating, status}] = useMutation(save, options);
     if (fire) {
       // Imperative trigger: the test fires calls with the args it chooses.
       fire.current = (...args: any[]) => {
         mutate(...args).catch(() => {});
       };
     }
-    return createElement('p', null, isMutating ? 'mutating' : 'idle');
+    return createElement(
+      'div',
+      null,
+      createElement('p', null, isMutating ? 'mutating' : 'idle'),
+      createElement('p', null, `status ${status}`)
+    );
   }
 
   it('should run same-scope calls FIFO — the second starts only after the first settles', async () => {
@@ -2343,6 +2425,44 @@ describe('useMutation scope (serial queue)', () => {
       calls[1]!.resolve('two');
     });
     expect(screen.getByText('idle')).toBeTruthy();
+  });
+
+  it('should count a scope-queued call as pending while it waits — the isMutating clock', async () => {
+    const started: string[] = [];
+    const calls: ReturnType<typeof deferred<string>>[] = [];
+    const fire: {current?: (...args: any[]) => void} = {};
+
+    render(
+      createElement(ScopeView, {
+        save: recordingSave(started, calls),
+        options: {scope: 'job'},
+        fire
+      })
+    );
+    expect(screen.getByText('status idle')).toBeTruthy();
+
+    // Two same-scope calls: the second WAITS behind the first, yet its
+    // status is already pending — the queue sits inside the loading
+    // store, so status and isMutating share one clock.
+    await act(async () => {
+      fire.current!('first');
+      fire.current!('second');
+    });
+    expect(started).toEqual(['first']);
+    expect(screen.getByText('status pending')).toBeTruthy();
+
+    // First settles successfully → the second is RUNNING, still pending.
+    await act(async () => {
+      calls[0]!.resolve('one');
+    });
+    expect(started).toEqual(['first', 'second']);
+    expect(screen.getByText('status pending')).toBeTruthy();
+
+    // Second fails → error, the settled branch of the machine.
+    await act(async () => {
+      calls[1]!.reject(new Error('boom'));
+    });
+    expect(screen.getByText('status error')).toBeTruthy();
   });
 
   it('should keep the chain going after a failure', async () => {

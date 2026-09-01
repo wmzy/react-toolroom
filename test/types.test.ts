@@ -7,15 +7,18 @@
 // 不查类型；运行时用例保证文件在 vitest 里也是真实测试。
 // 从发布入口导入（经 vitest alias 指回 src），与 recipes 的漂移测试同款，
 // 顺带守住类型必须从 'react-toolroom/async' 公开导出。
-import {describe, expect, it} from 'vitest';
+import {describe, expect, expectTypeOf, it} from 'vitest';
 import {
   createMemoryCacheProvider,
   createMutationBinder,
   invalidate,
+  useArgsStatus,
+  type ArgsStatus,
   type BoundMutation,
   type CacheProvider,
   type CreateMutationBinder,
-  type MutationSpec
+  type MutationSpec,
+  type MutationStatus
 } from 'react-toolroom/async';
 
 type Article = {slug: string; title: string};
@@ -108,5 +111,63 @@ describe('CacheProvider 方差：具体元组实例化可赋值给宽泛槽位',
     // @ts-expect-error 属性签名成员按严格逆变检查：any[] → [string] 失败
     const propWide: PropertyMutationCache<any, any[]> = propCache;
     expect(propWide).toBe(propCache);
+  });
+});
+
+// useArgsStatus error 泛型 + useMutation 派生 status：消费方视角的类型
+// 契约。编译期断言同样由 typecheck 强制；探测组件从不渲染（体内只做
+// 类型收口），运行时用例走非 hook 途径保证 describe 在 vitest 里是真测试。
+class ApiError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super(`api ${code}`);
+    this.code = code;
+  }
+}
+const fetchUser = async (id: number) => ({id, name: 'Ada'});
+
+// 探测组件：永不渲染。默认调用形态下 error 即 Error | undefined——
+// 消费方不再需要 as 断言（painless useQuery 的 `as Error | undefined`
+// 由本断言背书删除）；第二泛型显式收窄。
+function ArgsStatusTypeProbe(props: {fn: typeof fetchUser}) {
+  const status = useArgsStatus(props.fn, [1]);
+  expectTypeOf(status.error).toEqualTypeOf<Error | undefined>();
+  expectTypeOf(status.loading).toEqualTypeOf<boolean>();
+  expectTypeOf(status.failureCount).toEqualTypeOf<number>();
+  const api = useArgsStatus<typeof fetchUser, ApiError>(props.fn, [1]);
+  expectTypeOf(api.error).toEqualTypeOf<ApiError | undefined>();
+  return null;
+}
+void ArgsStatusTypeProbe;
+
+describe('useArgsStatus error 泛型与 useMutation status 类型契约', () => {
+  it('ArgsStatus 默认实例化可构造，E 实参收窄 error 字段', () => {
+    const plain: ArgsStatus = {
+      loading: false,
+      error: undefined,
+      failureCount: 0,
+      data: undefined,
+      dataUpdatedAt: undefined,
+      dataUpdateCount: undefined
+    };
+    expect(plain.error).toBeUndefined();
+    const narrowed: ArgsStatus<ApiError> = {
+      ...plain,
+      error: new ApiError(418)
+    };
+    expect(narrowed.error?.code).toBe(418);
+  });
+
+  it('MutationStatus.status 是 TanStack 同款四态字面量联合', () => {
+    expectTypeOf<MutationStatus['status']>().toEqualTypeOf<
+      'idle' | 'pending' | 'success' | 'error'
+    >();
+    const phases: MutationStatus['status'][] = [
+      'idle',
+      'pending',
+      'success',
+      'error'
+    ];
+    expect(phases).toHaveLength(4);
   });
 });

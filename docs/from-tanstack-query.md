@@ -97,7 +97,7 @@ const [rename] = useMutation(
 
 | TanStack | react-toolroom | Notes |
 | --- | --- | --- |
-| `useMutation({mutationFn})` | `useMutation(mutate, {invalidates, onMutate, onSuccess, onError, onSettled, scope})` | `invalidates` lists the cache providers (or `[provider, ...argsPrefix]` slices) to purge on success. Returns `[mutate, {isMutating, error, failureCount}, reset]` — see [Return shape](#return-shape) below. |
+| `useMutation({mutationFn})` | `useMutation(mutate, {invalidates, onMutate, onSuccess, onError, onSettled, scope})` | `invalidates` lists the cache providers (or `[provider, ...argsPrefix]` slices) to purge on success. Returns `[mutate, {isMutating, error, failureCount, status}, reset]` — see [Return shape](#return-shape) below. |
 | `onMutate(vars)` — may be async, returns the rollback ctx | `onMutate(...args)` | Fires synchronously when `mutate` is called, with the raw args only — no context object, return value ignored. Rollback is not your job: `cache.mutation` does it automatically (see [Optimistic updates](#optimistic-updates) below). |
 | `onSuccess(data, vars, ctx)` | `onSuccess(result, ...args)` | `invalidates` purges BEFORE any user callback runs — library plumbing is not hostage to a throwing `onSuccess`. |
 | `onError(err, vars, ctx)` | `onError(err, ...args)` | A rejected mutation invalidates nothing. |
@@ -105,7 +105,8 @@ const [rename] = useMutation(
 | `queryClient.invalidateQueries({queryKey})` | `useInvalidate(fetcher, cache)(...args)` (hook) / `invalidate([targets])` (imperative) | Invalidate by args; a `[provider, ...prefix]` target sweeps every entry whose args start with the prefix. |
 | `queryClient.setQueryData(key, updater)` | `cache.patchWhere(pred, updater)` | Batch write with per-entry generation guard. |
 | `queryClient.getQueryData(key)` | `cache.peek(args)` / `cache.get(args)` | `peek` never observes or starts requests. |
-| `mutation.isPending` | `useLoading(mutate)` / the tuple's status | Same shape. |
+| `mutation.isPending` | `status === 'pending'` / `isMutating` | Same shape. The tuple's `status` is the full TanStack lifecycle — `'idle' \| 'pending' \| 'success' \| 'error'` — derived on the `isMutating` clock. |
+| `mutation.status` / `mutation.reset()` → `idle` | `status` / `reset` | `status` reads `'idle'` before any call and after `reset`, which clears the settled bookkeeping (a call in flight keeps `pending` and still lands). |
 | `mutationKey` + serial `scope` | `scope` option | Queue same-scope mutations instead of racing them. |
 
 ### Return shape
@@ -115,19 +116,23 @@ fire-and-forget (returns `void`; callbacks ride the options) while
 `mutateAsync` returns the promise. react-toolroom merges them — `mutate`
 is the injectable itself, so the returned promise resolves with the result
 and rejects with the failure, AND the same call feeds the
-`{isMutating, error, failureCount}` stores. Awaiting callers branch on the
-outcome (`rename(id, name).catch(() => {})` opts out of the rejection);
-fire-and-forget callers read `error` from the status instead.
+`{isMutating, error, failureCount, status}` stores. Awaiting callers
+branch on the outcome (`rename(id, name).catch(() => {})` opts out of the
+rejection); fire-and-forget callers read `error` from the status instead.
 
 The status is injectable-level shared state, not per-hook-instance: every
 component tracking the same mutation updates together, and a component
-mounted after a call starts from the current values. `failureCount` and
-`reset` do have same-named TanStack counterparts (`mutation.failureCount`,
-`mutation.reset()`), but the semantics differ — TanStack's `reset()`
-restores the whole instance to its initial `idle` state (clears `data`,
-`variables`, `error`), while toolroom's `reset` only clears the settled
-error/failureCount bookkeeping: it writes with the current seq, so a call
-already in flight keeps its ticket valid and still lands afterwards.
+mounted after a call starts from the current values. `status` carries
+TanStack's `mutation.status` semantics — `'idle' | 'pending' | 'success' |
+'error'` — derived on the `isMutating` clock (a scope-queued call is
+`pending` while it waits). `failureCount` and `reset` do have same-named
+TanStack counterparts (`mutation.failureCount`, `mutation.reset()`), but
+the semantics differ — TanStack's `reset()` restores the whole instance
+to its initial `idle` state (clears `data`, `variables`, `error`), while
+toolroom's `reset` only clears the settled error/failureCount bookkeeping
+(with no call in flight, `status` reads `'idle'` again): it never touches
+the ticket sequence, so a call already in flight keeps `pending` and its
+ticket valid — the outcome still lands afterwards.
 
 ### Optimistic updates
 

@@ -116,6 +116,17 @@ export type StaleStore = {
 export type ErrorStore = {
   error: any | undefined;
   failureCount: number;
+  /**
+   * Outcome of the last APPLIED settle emission: `'success'` | `'error'`,
+   * or `undefined` until one settles — and again after
+   * {@link resetError} clears it. Maintained in lockstep with `error` by
+   * every applied emission, so `lastOutcome === 'error'` is exactly
+   * `error !== undefined`. Dropped (stale-ticket) emissions leave it
+   * untouched, like they leave `error`. The field `useMutation`'s
+   * `status` derivation reads to tell "never called" (`idle`) from
+   * "last call succeeded" (`success`).
+   */
+  lastOutcome: 'success' | 'error' | undefined;
   listeners: Set<(value: any) => void>;
 };
 
@@ -215,7 +226,12 @@ export function getErrorStore(fn: Func): ErrorStore {
   const context = getInjectContext(fn);
   let store = context[errorKey] as ErrorStore | undefined;
   if (!store) {
-    store = {listeners: new Set(), error: undefined, failureCount: 0};
+    store = {
+      listeners: new Set(),
+      error: undefined,
+      failureCount: 0,
+      lastOutcome: undefined
+    };
     context[errorKey] = store;
   }
   return store;
@@ -534,7 +550,9 @@ export function nextKeyedErrorSeq(store: KeyedStore, key: string): number {
  * Stores the latest error (or its clearance) and broadcasts it to every
  * subscriber. An emission whose ticket is older than the latest applied
  * one is dropped, so the failure of a slow old call can never clobber the
- * success of a newer call.
+ * success of a newer call. Every APPLIED emission also records the settle
+ * outcome (`'success'` / `'error'`) — the field reset clears back to
+ * `undefined` and `useMutation`'s `status` derivation reads.
  *
  * @param store the shared error store of the injectable
  * @param error the error to publish, or `undefined` on success
@@ -545,9 +563,28 @@ export function emitError(store: ErrorStore, error: any, seq: number) {
   if (seq < guard.applied) return;
   guard.applied = seq;
   store.error = error;
+  store.lastOutcome = error === undefined ? 'success' : 'error';
   // A success resets the failure tally; each failure increments it.
   store.failureCount = error === undefined ? 0 : store.failureCount + 1;
   for (const listener of store.listeners) listener(error);
+}
+
+/**
+ * Clears the settled error bookkeeping — `error`, `failureCount` and the
+ * settle outcome — and broadcasts the clearance. Unlike a success
+ * emission this never touches the ticket sequence: a call already in
+ * flight keeps its reserved ticket valid and still lands afterwards, so
+ * reset only wipes what has already settled (the semantics
+ * `useMutation`'s `reset` — and its `status` flipping back to `'idle'` —
+ * build on).
+ *
+ * @param store the shared error store of the injectable
+ */
+export function resetError(store: ErrorStore) {
+  store.error = undefined;
+  store.failureCount = 0;
+  store.lastOutcome = undefined;
+  for (const listener of store.listeners) listener(undefined);
 }
 
 // React 18+ exports useSyncExternalStore; React 16.8–17 peers do not, and
