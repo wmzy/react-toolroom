@@ -2292,6 +2292,126 @@ describe('async hooks', () => {
 
       expect(shouldRetry).toHaveBeenCalledTimes(2);
     });
+
+    it('should stop retrying after the driver aborts (unmount)', async () => {
+      const fetchData = vi.fn(async () => {
+        throw new Error('fail');
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useRetry(injectable, {retries: 10, backoff: () => 20});
+        useRun(injectable, [], {signal: true});
+        return null;
+      }
+
+      const {unmount} = render(<TestComponent />);
+      // Let at least one retry land before tearing down.
+      await waitFor(
+        () => {
+          expect(fetchData.mock.calls.length).toBeGreaterThanOrEqual(2);
+        },
+        {timeout: 2000}
+      );
+      unmount();
+      const countAtUnmount = fetchData.mock.calls.length;
+      // Long enough for several 20ms backoffs to have fired pre-fix.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      });
+      expect(fetchData.mock.calls.length).toBe(countAtUnmount);
+    });
+
+    it('should stop retrying a dependency-changed call while its preset backoff sleep is armed', async () => {
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      const seen: string[] = [];
+      const fetchData = vi.fn(async (id: string) => {
+        seen.push(id);
+        throw new Error('fail');
+      });
+
+      function TestComponent({id}: {id: string}) {
+        const injectable = useInjectable(fetchData);
+        // retries: 1 → at most 2 attempts per args; linear first delay is
+        // 1000ms jittered by the mocked 0.5 → exactly 1000ms.
+        useRetry(injectable, {retries: 1, backoff: 'linear'});
+        useRun(injectable, [id], {signal: true});
+        return null;
+      }
+
+      try {
+        const {rerender} = render(<TestComponent id='a' />);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(seen).toEqual(['a']);
+        // Rerender mid-sleep: the old run's signal aborts synchronously,
+        // so the armed 1000ms sleep belongs to a cancelled call now.
+        rerender(<TestComponent id='b' />);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(seen).toEqual(['a', 'b']);
+        // Well past the original 1000ms sleep: the aborted 'a' loop must
+        // never fire its second attempt, while 'b' runs its full budget
+        // (b1 → backoff → b2 → exhausted).
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(3000);
+        });
+        expect(seen).toEqual(['a', 'b', 'b']);
+      } finally {
+        random.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it('should jitter preset backoff delays by ±25% (custom backoffs untouched)', async () => {
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random');
+      const fetchData = vi.fn(async () => {
+        throw new Error('fail');
+      });
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useRetry(injectable, {retries: 2, backoff: 'linear'});
+        useRun(injectable, []);
+        return null;
+      }
+
+      try {
+        // random() → 0: linear first delay = 1000 · (0.75 + 0) = 750ms.
+        random.mockReturnValue(0);
+        render(<TestComponent />);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(749);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(2);
+        // random() → 1: linear second delay = 2000 · (0.75 + 0.5) = 2500ms.
+        random.mockReturnValue(1);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2500);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(3);
+        // retries: 2 exhausted — no further attempts regardless of timers.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10000);
+        });
+        expect(fetchData).toHaveBeenCalledTimes(3);
+      } finally {
+        random.mockRestore();
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('useCache', () => {

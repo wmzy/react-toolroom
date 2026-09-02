@@ -1132,6 +1132,18 @@ const retryBaseDelay = 1000;
  * or a custom `(attempt) => ms`). The wait reuses the existing
  * promise-based mechanism — returning a `Promise` from `shouldRetry`
  * delays the retry until it resolves.
+ *
+ * The preset delays of the named strategies carry ±25% jitter (a uniform
+ * factor in `[0.75, 1.25]`, the same spread fetch-fun's `backoffDelay`
+ * uses), so a fleet of clients retrying the same failing endpoint does
+ * not sync up into a thundering herd. A custom `(attempt) => ms` backoff
+ * owns its timing completely — including any jitter — and is passed
+ * through untouched.
+ *
+ * The returned callback accepts the call's `AbortSignal` as an optional
+ * third argument: while the sleep is armed, an abort settles it
+ * immediately (`false`, timer cleared) instead of letting a cancelled
+ * call wait out a delay whose retry will never happen.
  */
 function presetShouldRetry(
   options: {
@@ -1140,20 +1152,38 @@ function presetShouldRetry(
   },
   retries = options.retries ?? 3,
   backoff = options.backoff ?? 'exponential'
-): (failureCount: number, e: any) => boolean | Promise<any> {
-  return (failureCount, e) => {
+): (failureCount: number, e: any, signal?: AbortSignal) => boolean | Promise<any> {
+  return (failureCount, e, signal) => {
     if (failureCount >= retries) return false;
-    const delay =
+    const base =
       typeof backoff === 'function'
         ? backoff(failureCount)
         : backoff === 'linear'
           ? retryBaseDelay * (failureCount + 1)
           : retryBaseDelay * 2 ** failureCount;
+    // Only the named strategies are jittered — a custom backoff function
+    // expresses its own timing by contract.
+    const delay =
+      typeof backoff === 'function'
+        ? base
+        : Math.round(base * (0.75 + Math.random() * 0.5));
     // A zero delay skips the timer entirely (also keeps tests fast).
     if (delay <= 0) return true;
-    return new Promise<boolean>((resolve) =>
-      setTimeout(() => resolve(true), delay)
-    );
+    return new Promise<boolean>((resolve) => {
+      // Abort-aware sleep: an aborted call settles the backoff right
+      // away with `false` (retry verdict "no"), timer cleared, so the
+      // useRetry loop terminates instead of idling through a delay for
+      // an attempt nobody will consume.
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(true);
+      }, delay);
+      signal?.addEventListener('abort', onAbort, {once: true});
+    });
   };
 }
 
@@ -1171,7 +1201,16 @@ function presetShouldRetry(
  *   `retries` times after the initial failure, waiting between attempts
  *   (`'exponential'`: 1s, 2s, 4s…; `'linear'`: 1s, 2s, 3s…; a custom
  *   function receives the 0-based attempt index and returns the delay in
- *   ms).
+ *   ms). The named strategies jitter each delay by ±25% (a uniform factor
+ *   in `[0.75, 1.25]`) so concurrent clients do not retry in lockstep;
+ *   custom functions own their timing, jitter included.
+ *
+ * Cancellation: when the call was made with an `AbortSignal` — the
+ * convention `useRun(fn, args, {signal: true})` establishes — aborting it
+ * (unmount, dependency change) terminates the retry loop: the backoff
+ * sleep settles immediately and no further attempt is issued. The final
+ * rejection carries the last error, exactly like a `false` shouldRetry
+ * verdict.
  *
  * @param {AF} injectableFn - The asynchronous function to call.
  * @param {(failureCount: number, e: any) => boolean | Promise<any>} shouldRetry - A function that determines whether to retry or not.
@@ -1179,10 +1218,12 @@ function presetShouldRetry(
  * @example
  * ```tsx
  * const fetchFlaky = useInjectable(api.flaky);
- * // Up to 5 attempts (1 initial + 4 retries), 1s/2s/4s/8s between them:
+ * // Up to 5 attempts (1 initial + 4 retries), jittered 1s/2s/4s/8s between them:
  * useRetry(fetchFlaky, {retries: 4});
- * // Custom jittered backoff:
+ * // Custom backoff — passed through untouched, jitter included if you want it:
  * useRetry(fetchFlaky, {retries: 3, backoff: (n) => 500 * 2 ** n + Math.random() * 100});
+ * // Aborting the driver stops the loop: no request leaves after the abort.
+ * useRun(fetchFlaky, [id], {signal: true});
  * ```
  */
 export function useRetry<AF extends AsyncFunc>(
@@ -1205,17 +1246,48 @@ export function useRetry<AF extends AsyncFunc>(
         backoff?: 'exponential' | 'linear' | ((attempt: number) => number);
       }
 ) {
-  const shouldRetry =
+  // The preset consumes the call's AbortSignal (abort-aware backoff); a
+  // user callback with the documented two-parameter signature simply
+  // ignores the extra argument.
+  const shouldRetry: (
+    failureCount: number,
+    e: any,
+    signal?: AbortSignal
+  ) => boolean | Promise<any> =
     typeof retry === 'function' ? retry : presetShouldRetry(retry);
   useInject(
     injectableFn,
-    (f: AF) =>
+    (f: AF, callContext: any) =>
       ((...args: Parameters<AF>) => {
+        // Cancellation discipline: a call whose driver aborted —
+        // `useRun(..., {signal: true})` on unmount or dependency change —
+        // must not keep issuing attempts; nobody is left to consume them.
+        // The signal comes from the callContext the attachSignal bridge
+        // maintains; when this layer sits OUTSIDE that bridge (registered
+        // after useRun, so the bridge has not forwarded the call yet), a
+        // trailing AbortSignal is duck-typed from the args themselves —
+        // useRun appends it to the very tuple this wrapper receives.
+        const last = args[args.length - 1];
+        const signal = (callContext.signal ??
+          (isAbortSignal(last) ? last : undefined)) as
+          | AbortSignal
+          | undefined;
+        const cancelled = () => signal?.aborted === true;
         let n = 0;
         const run = (): Promise<any> =>
           f(...args).catch((e: any) => {
-            const r = shouldRetry(n++, e);
-            if (r instanceof Promise) return r.then(run);
+            // An aborted call never retries: rejecting with the last
+            // error keeps the same terminal semantics as a `false`
+            // shouldRetry verdict.
+            if (cancelled()) return Promise.reject(e);
+            const r = shouldRetry(n++, e, signal);
+            if (r instanceof Promise)
+              // The preset's sleep is itself abort-aware; a custom
+              // promise is guarded here instead — both kinds stop before
+              // the next attempt once aborted.
+              return r.then((again) =>
+                again && !cancelled() ? run() : Promise.reject(e)
+              );
             return r ? run() : Promise.reject(e);
           });
         return run();
