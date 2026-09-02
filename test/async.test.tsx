@@ -4430,6 +4430,207 @@ describe('async hooks', () => {
         vi.useRealTimers();
       }
     });
+
+    it('records a failed tick for error channels that mount later', async () => {
+      vi.useFakeTimers();
+      try {
+        // The gap this test pins: at tick time NO error channel is
+        // mounted (no useError/useFailureCount/useArgsStatus anywhere on
+        // the injectable), so no wrapper in the chain records the settle
+        // outcome. A reader mounting AFTER the failed tick must still
+        // find the retained error — the poller records it itself.
+        const failure = new Error('tick failed');
+        let mode: 'fail' | 'ok' = 'fail';
+        const fetchData = vi.fn(() =>
+          mode === 'fail'
+            ? Promise.reject<string>(failure)
+            : Promise.resolve<string>('ok')
+        );
+        let latest!: ArgsStatus;
+        let sharedError: Error | undefined;
+        function Poller({
+          injectable
+        }: {
+          injectable: (key: string) => Promise<string>;
+        }) {
+          usePolling(injectable, 1000, {args: ['k']});
+          return null;
+        }
+        function Reader({
+          injectable
+        }: {
+          injectable: (key: string) => Promise<string>;
+        }) {
+          sharedError = useError(injectable);
+          latest = useArgsStatus(injectable, ['k']);
+          return null;
+        }
+        function Owner({withReader}: {withReader?: boolean}) {
+          const injectable = useInjectable(fetchData);
+          return (
+            <>
+              <Poller injectable={injectable} />
+              {withReader && <Reader injectable={injectable} />}
+            </>
+          );
+        }
+
+        const {rerender} = render(<Owner />);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(fetchData).toHaveBeenCalledTimes(1);
+
+        // The reader mounts after the failed tick and must see the
+        // outcome on both channels: the injectable-level broadcast
+        // (useError) and the keyed slot (useArgsStatus).
+        rerender(<Owner withReader />);
+        expect(sharedError).toBe(failure);
+        expect(latest.error).toBe(failure);
+        expect(latest.failureCount).toBe(1);
+
+        // A successful tick clears the record; the late reader observes
+        // the cleared state without ever having seen the failure live.
+        mode = 'ok';
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(sharedError).toBeUndefined();
+        expect(latest.error).toBeUndefined();
+        expect(latest.failureCount).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('clears the recorded error on the next successful tick even with no reader mounted', async () => {
+      vi.useFakeTimers();
+      try {
+        // The unclaimed emission path end to end: fail a tick with no
+        // reader mounted (the poller records), succeed a tick with no
+        // reader mounted (the poller clears), THEN mount the reader —
+        // a stale failure left behind would surface here.
+        const failure = new Error('tick failed');
+        let mode: 'fail' | 'ok' = 'fail';
+        const fetchData = vi.fn(() =>
+          mode === 'fail'
+            ? Promise.reject<string>(failure)
+            : Promise.resolve<string>('ok')
+        );
+        let latest!: ArgsStatus;
+        let sharedError: Error | undefined;
+        function Poller({
+          injectable
+        }: {
+          injectable: (key: string) => Promise<string>;
+        }) {
+          usePolling(injectable, 1000, {args: ['k']});
+          return null;
+        }
+        function Reader({
+          injectable
+        }: {
+          injectable: (key: string) => Promise<string>;
+        }) {
+          sharedError = useError(injectable);
+          latest = useArgsStatus(injectable, ['k']);
+          return null;
+        }
+        function Owner({withReader}: {withReader?: boolean}) {
+          const injectable = useInjectable(fetchData);
+          return (
+            <>
+              <Poller injectable={injectable} />
+              {withReader && <Reader injectable={injectable} />}
+            </>
+          );
+        }
+
+        const {rerender} = render(<Owner />);
+        await vi.advanceTimersByTimeAsync(1000);
+        mode = 'ok';
+        await vi.advanceTimersByTimeAsync(1000);
+        rerender(<Owner withReader />);
+        expect(sharedError).toBeUndefined();
+        expect(latest.error).toBeUndefined();
+        expect(latest.failureCount).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not double-count a failed tick when an error channel is mounted', async () => {
+      vi.useFakeTimers();
+      try {
+        // Reader mounted from the start: its useErrorWrapper owns the
+        // emission. The poller's own tracking must stay passive for that
+        // call — one failed tick, one failureCount tally, one broadcast.
+        const failure = new Error('tick failed');
+        let mode: 'fail' | 'ok' = 'fail';
+        const fetchData = vi.fn((_key: string) =>
+          mode === 'fail'
+            ? Promise.reject<string>(failure)
+            : Promise.resolve<string>('ok')
+        );
+        let latest!: ArgsStatus;
+        let sharedError: Error | undefined;
+        function TestComponent() {
+          const injectable = useInjectable(fetchData);
+          usePolling(injectable, 1000, {args: ['k']});
+          sharedError = useError(injectable);
+          latest = useArgsStatus(injectable, ['k']);
+          return null;
+        }
+        render(<TestComponent />);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(sharedError).toBe(failure);
+        expect(latest.error).toBe(failure);
+        expect(latest.failureCount).toBe(1);
+
+        mode = 'ok';
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(latest.error).toBeUndefined();
+        expect(latest.failureCount).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('skips ticks while pending without writing an error', async () => {
+      vi.useFakeTimers();
+      try {
+        const resolvers: Array<(v: string) => void> = [];
+        const rejects: Array<(e: Error) => void> = [];
+        const fetchData = vi.fn(
+          (_key: string) =>
+            new Promise<string>((resolve, reject) => {
+              resolvers.push(resolve);
+              rejects.push(reject);
+            })
+        );
+        let latest!: ArgsStatus;
+        function TestComponent() {
+          const injectable = useInjectable(fetchData);
+          usePolling(injectable, 1000, {args: ['k']});
+          latest = useArgsStatus(injectable, ['k']);
+          return null;
+        }
+        render(<TestComponent />);
+        await vi.advanceTimersByTimeAsync(3000);
+        // one pending call; the three skipped ticks wrote nothing
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(latest.loading).toBe(true);
+        expect(latest.error).toBeUndefined();
+        expect(latest.failureCount).toBe(0);
+
+        await act(async () => {
+          rejects[0]!(new Error('slow failure'));
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(latest.loading).toBe(false);
+        expect(latest.error?.message).toBe('slow failure');
+        expect(latest.failureCount).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('useFocusRevalidate', () => {

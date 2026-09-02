@@ -1,5 +1,17 @@
 import {AsyncFunc} from '@@/types';
-import {useEffect} from 'react';
+import {useEffect, useRef} from 'react';
+import {stableHash} from '@@/util';
+import {
+  emitError,
+  emitKeyedError,
+  errorEmissionClaimed,
+  getErrorStore,
+  getKeyedStore,
+  nextErrorSeq,
+  nextKeyedErrorSeq,
+  trimTrailingSignal
+} from './base';
+import {isInjectable, useInject} from './inject';
 
 /**
  * Calls an injectable function on a fixed interval, optionally with
@@ -10,6 +22,16 @@ import {useEffect} from 'react';
  * `refetchInterval` in react-query. While `document.hidden` is `true` the
  * polling is paused unless `whenHidden` is set, and changing `interval`
  * restarts the timer. The timer is cleaned up on unmount.
+ *
+ * Every tick's settle outcome is recorded on the injectable's error
+ * channels — the shared broadcast `useError` reads and the keyed slot
+ * `useArgsStatus(fn, args)` reads — even when no error channel is mounted
+ * at tick time: a failed tick published while nobody watches stays
+ * readable for a channel mounting later, and the next successful tick
+ * clears it (the same clear-on-success semantics a mounted `useError`
+ * wrapper gives its own calls). A call whose emission a live
+ * useError-family wrapper already serves is left entirely to it, so one
+ * failed tick tallies `failureCount` exactly once.
  *
  * `args` keeps polling on the same keyed entry as `useRun`: `useCache`
  * hashes the call arguments, so polling an injectable that
@@ -53,15 +75,72 @@ export function usePolling<AF extends AsyncFunc>(
   options?: {whenHidden?: boolean; args?: Parameters<AF>}
 ): void {
   const {whenHidden = false, args = []} = options ?? {};
+  // Tick marker: the error-recording wrapper below must observe ONLY the
+  // calls this instance's own timer issued — every other call through the
+  // shared chain (a `useRun` rerun, a manual call, a focus revalidation)
+  // passes through untouched, exactly as before this hook grew an error
+  // channel. The marker is set around the synchronous call fold, so a
+  // wrapper of ANOTHER usePolling instance on the same injectable never
+  // mistakes this tick for its own.
+  const tickingRef = useRef(false);
+  if (isInjectable(injectableFn)) {
+    useInject(
+      injectableFn,
+      (f: AF, callContext: any) =>
+        ((...callArgs: Parameters<AF>) => {
+          if (!tickingRef.current) return f(...callArgs);
+          const key = stableHash(trimTrailingSignal(callArgs));
+          // The fold below runs synchronously — every useError-family
+          // wrapper this call passes through claims the settle emission
+          // before this line resumes, so the claim check afterwards sees
+          // the chain's final composition for THIS call (never a wrapper
+          // that mounted later, never one that already left).
+          const p = Promise.resolve(f(...callArgs));
+          if (errorEmissionClaimed(callContext)) return p;
+          // Unclaimed: this tick's outcome would otherwise be invisible
+          // (nothing in the chain records it), so the poller records it
+          // itself — reservations happen after the fold, still inside the
+          // call's synchronous extent, so ticket order stays call order.
+          // The rejection is rethrown for outer layers (useCatch, the
+          // boundary's swallow) exactly like useErrorWrapper rethrows.
+          const errorStore = getErrorStore(injectableFn);
+          const keyedStore = getKeyedStore(injectableFn);
+          const seq = nextErrorSeq(errorStore);
+          const keyedSeq = nextKeyedErrorSeq(keyedStore, key);
+          return p.then(
+            (result) => {
+              emitError(errorStore, undefined, seq);
+              emitKeyedError(keyedStore, key, undefined, keyedSeq);
+              return result;
+            },
+            (e) => {
+              emitError(errorStore, e, seq);
+              emitKeyedError(keyedStore, key, e, keyedSeq);
+              throw e;
+            }
+          );
+        }) as AF
+    );
+  }
   useEffect(() => {
     let inFlight = false;
     const tick = () => {
       if (!whenHidden && document.hidden) return;
       if (inFlight) return;
       inFlight = true;
+      tickingRef.current = true;
+      let call: Promise<unknown>;
+      try {
+        call = Promise.resolve(injectableFn(...args));
+      } finally {
+        tickingRef.current = false;
+      }
       // Both handlers release the slot: a rejected call must not block the
-      // next tick forever.
-      Promise.resolve(injectableFn(...args)).then(
+      // next tick forever. The settle outcome itself is recorded on the
+      // error channels by the wrapper above (or by a useError-family
+      // wrapper that claimed the emission), so this handler only tends to
+      // the cadence.
+      call.then(
         () => {
           inFlight = false;
         },

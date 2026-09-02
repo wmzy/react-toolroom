@@ -546,6 +546,30 @@ export function nextKeyedErrorSeq(store: KeyedStore, key: string): number {
   return ++keyedSeqOf(store, key).next;
 }
 
+// Per-call error-emission claim. A `useErrorWrapper` layer sets this flag
+// on the callContext synchronously while the chain folds, so an ALTERNATIVE
+// settle-emitter riding the same call (usePolling's tick tracking) can tell
+// — after the synchronous fold, before any settle handler runs — that the
+// outcome is already owned by a live error wrapper, and stay passive: one
+// failed call must tally `failureCount` exactly once no matter how many
+// emitters observe it. The flag is a FACT about the folded chain (every
+// useErrorWrapper instance sets it; every instance still emits its own
+// ticket, exactly as before), never an ownership transfer.
+const errorClaimKey = Symbol('error emission claim');
+
+/** Marks the call's error emission as served by a useError-family wrapper. */
+export function claimErrorEmission(callContext: any): void {
+  callContext[errorClaimKey] = true;
+}
+
+/**
+ * True when a useError-family wrapper in this call's chain already owns
+ * the settle emission — the caller should not attach a second one.
+ */
+export function errorEmissionClaimed(callContext: any): boolean {
+  return callContext[errorClaimKey] === true;
+}
+
 /**
  * Stores the latest error (or its clearance) and broadcasts it to every
  * subscriber. An emission whose ticket is older than the latest applied

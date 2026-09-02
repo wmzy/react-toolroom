@@ -83,6 +83,7 @@ import {
   ErrorStore,
   LoadingStore,
   ResultStore,
+  claimErrorEmission,
   emitError,
   emitLoading,
   emitResult,
@@ -746,8 +747,12 @@ function useErrorWrapper<AF extends AsyncFunc>(injectableFn: AF): ErrorStore {
   const keyedStore = getKeyedStore(injectableFn);
   useInject(
     injectableFn,
-    (f: AF) =>
+    (f: AF, callContext: any) =>
       ((...args) => {
+        // This layer serves the call's settle emission; alternative
+        // emitters riding the same call (usePolling's tick tracking)
+        // read the claim after the synchronous fold and stay passive.
+        claimErrorEmission(callContext);
         // Same key derivation as the read side (useArgsStatus) — trailing
         // AbortSignal trimmed, see useLoadingWrapper's mirror comment.
         const key = stableHash(trimTrailingSignal(args));
