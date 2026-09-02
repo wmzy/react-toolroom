@@ -1,6 +1,6 @@
-import {AsyncFunc} from '@@/types';
+import {AsyncFunc, CacheProvider, CacheResult, R} from '@@/types';
 import {useEffect, useRef} from 'react';
-import {stableHash} from '@@/util';
+import {noop, stableHash} from '@@/util';
 import {
   emitError,
   emitKeyedError,
@@ -12,6 +12,65 @@ import {
   trimTrailingSignal
 } from './base';
 import {isInjectable, useInject} from './inject';
+
+/** Options shared by {@link useFocusRevalidate} and {@link useReconnectRevalidate}. */
+export type RevalidateOptions<AF extends AsyncFunc> = {
+  /** Throttle window in ms — events arriving within it after a
+   * revalidation are ignored (default `0`). */
+  interval?: number;
+  /** Arguments spread into every revalidation, keyed like `useRun`
+   * (default `[]`). */
+  args?: Parameters<AF>;
+  /**
+   * Read the entry's age through this cache provider and skip the
+   * revalidation while the entry is younger than `staleTime` — the
+   * semantics of TanStack Query's `refetchOnWindowFocus` under a
+   * `staleTime`: refocusing on fresh data does not refetch. Without a
+   * provider (the default) every event revalidates, exactly as before.
+   */
+  cacheProvider?: CacheProvider<R<AF>, Parameters<AF>>;
+  /** Maximum age (ms) that still counts as fresh when `cacheProvider` is
+   * given (default `0` — every existing entry is due a revalidation, the
+   * historical behavior). */
+  staleTime?: number;
+};
+
+// One focus/reconnect revalidation. Fire-and-forget like every other
+// trigger channel, but never a bare `void` call: the promise is always
+// observed, so a rejecting fetch surfaces through the injectable's error
+// channels (a mounted useError/useArgsStatus records it) and is otherwise
+// swallowed here — an unwatched revalidation can never surface as an
+// unhandled rejection.
+//
+// With a `cacheProvider`, TanStack's refetchOnWindowFocus gating: read the
+// entry's age (through `get`, so providers without `peek` work too) and
+// skip the call entirely while `now - cachedAt < staleTime`. A missing
+// entry revalidates — there is nothing fresh to serve.
+function revalidateOnce<AF extends AsyncFunc>(
+  injectableFn: AF,
+  // `readonly any[]`: the hooks destructure `args` with a `never[]`
+  // default, which is assignable here without a cast; the call sites
+  // spread it back into the injectable below.
+  args: readonly any[],
+  cacheProvider: CacheProvider<R<AF>, Parameters<AF>> | undefined,
+  staleTime: number,
+  at: number
+) {
+  const call = () => injectableFn(...(args as Parameters<AF>));
+  if (!cacheProvider) {
+    Promise.resolve(call()).catch(noop);
+    return;
+  }
+  new Promise<CacheResult<R<AF>>>((resolve) =>
+    resolve(cacheProvider.get(args as Parameters<AF>))
+  )
+    .catch(() => undefined)
+    .then((cached) => {
+      if (cached && at - cached[1] < staleTime) return;
+      return call();
+    })
+    .catch(noop);
+}
 
 /**
  * Calls an injectable function on a fixed interval, optionally with
@@ -171,11 +230,22 @@ export function usePolling<AF extends AsyncFunc>(
  * `useRun`, so an inline literal such as `{args: [id]}` only re-subscribes
  * when `id` itself changes.
  *
+ * With `cacheProvider` (and its `staleTime`) the revalidation is gated by
+ * the entry's age — TanStack's `refetchOnWindowFocus` under a `staleTime`:
+ * refocusing on an entry younger than `staleTime` skips the refetch, a
+ * missing or stale entry refetches. Without a provider every event
+ * revalidates. Rejections never surface as unhandled: they flow through the
+ * injectable's error channels (`useError`/`useArgsStatus`) and are
+ * otherwise swallowed — the revalidation is fire-and-forget.
+ *
  * @param {AsyncFunc} injectableFn - the wrapped async function to call.
  * @param {object} [options] - `interval` (default `0`): throttle window in
  *   milliseconds; events arriving within the window after a revalidation
  *   are ignored; `args` (default `[]`): arguments spread into every
- *   revalidation.
+ *   revalidation; `cacheProvider`: read the entry's age through this
+ *   provider and skip the refetch while it is younger than `staleTime`
+ *   (default `0`, which keeps the always-refetch behavior);
+ *   see {@link RevalidateOptions}.
  * @example
  * ```tsx
  * const fetchUserList = useInjectable(fetchList);
@@ -188,26 +258,36 @@ export function usePolling<AF extends AsyncFunc>(
  * // Focus revalidates the cache key of [userId], not of [].
  * useFocusRevalidate(fetchUser, {args: [userId]});
  * ```
+ * @example
+ * ```tsx
+ * // TanStack refetchOnWindowFocus semantics under a staleTime:
+ * // a refocus within 30s of the last fetch does nothing.
+ * useFocusRevalidate(fetchUser, {
+ *   args: [userId],
+ *   cacheProvider: userCache,
+ *   staleTime: 30000
+ * });
+ * ```
  */
 export function useFocusRevalidate<AF extends AsyncFunc>(
   injectableFn: AF
 ): void;
 export function useFocusRevalidate<AF extends AsyncFunc>(
   injectableFn: AF,
-  options: {interval?: number; args?: Parameters<AF>}
+  options: RevalidateOptions<AF>
 ): void;
 export function useFocusRevalidate<AF extends AsyncFunc>(
   injectableFn: AF,
-  options?: {interval?: number; args?: Parameters<AF>}
+  options?: RevalidateOptions<AF>
 ): void {
-  const {interval = 0, args = []} = options ?? {};
+  const {interval = 0, args = [], cacheProvider, staleTime = 0} = options ?? {};
   useEffect(() => {
     let last = 0;
     const revalidate = () => {
       const now = Date.now();
       if (now - last < interval) return;
       last = now;
-      void injectableFn(...args);
+      revalidateOnce(injectableFn, args, cacheProvider, staleTime, now);
     };
     const onVisibilityChange = () => {
       if (!document.hidden) revalidate();
@@ -221,7 +301,7 @@ export function useFocusRevalidate<AF extends AsyncFunc>(
     // `args` is spread element-wise for the same reference comparison
     // `useRun` uses, so the default `[]` adds nothing and never
     // re-subscribes on re-render.
-  }, [injectableFn, interval, ...args]);
+  }, [injectableFn, interval, cacheProvider, staleTime, ...args]);
 }
 
 /**
@@ -230,6 +310,14 @@ export function useFocusRevalidate<AF extends AsyncFunc>(
  * `refetchOnReconnect` in react-query. Complements `useFocusRevalidate`:
  * one covers the user coming back to the tab, the other the browser coming
  * back online.
+ *
+ * With `cacheProvider` (and its `staleTime`) the revalidation is gated by
+ * the entry's age — TanStack's `refetchOnReconnect` under a `staleTime`:
+ * reconnecting with an entry younger than `staleTime` skips the refetch, a
+ * missing or stale entry refetches. Without a provider every event
+ * revalidates. Rejections never surface as unhandled: they flow through the
+ * injectable's error channels (`useError`/`useArgsStatus`) and are
+ * otherwise swallowed — the revalidation is fire-and-forget.
  *
  * `args` keeps revalidation on the same keyed entry as `useRun`: `useCache`
  * hashes the call arguments, so revalidating an injectable
@@ -243,7 +331,10 @@ export function useFocusRevalidate<AF extends AsyncFunc>(
  * @param {object} [options] - `interval` (default `0`): throttle window in
  *   milliseconds; events arriving within the window after a revalidation
  *   are ignored; `args` (default `[]`): arguments spread into every
- *   revalidation.
+ *   revalidation; `cacheProvider`: read the entry's age through this
+ *   provider and skip the refetch while it is younger than `staleTime`
+ *   (default `0`, which keeps the always-refetch behavior);
+ *   see {@link RevalidateOptions}.
  * @example
  * ```tsx
  * const fetchUserList = useInjectable(fetchList);
@@ -262,20 +353,20 @@ export function useReconnectRevalidate<AF extends AsyncFunc>(
 ): void;
 export function useReconnectRevalidate<AF extends AsyncFunc>(
   injectableFn: AF,
-  options: {interval?: number; args?: Parameters<AF>}
+  options: RevalidateOptions<AF>
 ): void;
 export function useReconnectRevalidate<AF extends AsyncFunc>(
   injectableFn: AF,
-  options?: {interval?: number; args?: Parameters<AF>}
+  options?: RevalidateOptions<AF>
 ): void {
-  const {interval = 0, args = []} = options ?? {};
+  const {interval = 0, args = [], cacheProvider, staleTime = 0} = options ?? {};
   useEffect(() => {
     let last = 0;
     const revalidate = () => {
       const now = Date.now();
       if (now - last < interval) return;
       last = now;
-      void injectableFn(...args);
+      revalidateOnce(injectableFn, args, cacheProvider, staleTime, now);
     };
     const onOnline = () => {
       // Best-effort: the event semantics already guarantee connectivity,
@@ -287,5 +378,5 @@ export function useReconnectRevalidate<AF extends AsyncFunc>(
     // `args` is spread element-wise for the same reference comparison
     // `useRun` uses, so the default `[]` adds nothing and never
     // re-subscribes on re-render.
-  }, [injectableFn, interval, ...args]);
+  }, [injectableFn, interval, cacheProvider, staleTime, ...args]);
 }

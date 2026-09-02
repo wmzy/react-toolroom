@@ -33,6 +33,7 @@ import {
   useInject,
   usePolling,
   useFocusRevalidate,
+  useReconnectRevalidate,
   useArgsStatus,
   stableHash,
   isAbortSignal
@@ -4768,6 +4769,122 @@ describe('async hooks', () => {
       fireEvent(window, new Event('focus'));
       expect(fetchUser).toHaveBeenCalledTimes(1);
       expect(fetchUser.mock.calls[0]).toEqual([42]);
+    });
+
+    it('should skip the refetch while the cached entry is younger than staleTime (refetchOnWindowFocus semantics)', async () => {
+      const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>();
+      function TestComponent() {
+        const injectable = useInjectable(fetchUser);
+        useFocusRevalidate(injectable, {
+          args: [42],
+          cacheProvider: cache,
+          staleTime: 20
+        });
+        return null;
+      }
+      render(<TestComponent />);
+      cache.set([42], 'user 42 warmed');
+      // Fresh entry: the focus event skips the revalidation entirely —
+      // not even a call is made.
+      await act(async () => {
+        fireEvent(window, new Event('focus'));
+      });
+      expect(fetchUser).not.toHaveBeenCalled();
+      // Once the entry ages past staleTime, the same event refetches.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
+      await act(async () => {
+        fireEvent(window, new Event('focus'));
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(1);
+      expect(fetchUser).toHaveBeenCalledWith(42);
+    });
+
+    it('should not leak an unhandled rejection when a focus revalidation rejects', async () => {
+      const fetchData = vi.fn(async () => {
+        throw new Error('focus fail');
+      });
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useFocusRevalidate(injectable);
+        return null;
+      }
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandledRejection);
+      try {
+        render(<TestComponent />);
+        await act(async () => {
+          fireEvent(window, new Event('focus'));
+        });
+        // Long enough for an unobserved rejection to surface as unhandled.
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
+    });
+  });
+
+  describe('useReconnectRevalidate', () => {
+    it('should gate the reconnect refetch by the cached entry age when a cacheProvider is given', async () => {
+      const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+      const cache = createMemoryCacheProvider<string, [number]>();
+      function TestComponent() {
+        const injectable = useInjectable(fetchUser);
+        useReconnectRevalidate(injectable, {
+          args: [7],
+          cacheProvider: cache,
+          staleTime: 20
+        });
+        return null;
+      }
+      render(<TestComponent />);
+      cache.set([7], 'user 7 warmed');
+      await act(async () => {
+        fireEvent(window, new Event('online'));
+      });
+      expect(fetchUser).not.toHaveBeenCalled();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
+      await act(async () => {
+        fireEvent(window, new Event('online'));
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(1);
+      expect(fetchUser).toHaveBeenCalledWith(7);
+    });
+
+    it('should not leak an unhandled rejection when a reconnect revalidation rejects', async () => {
+      const fetchData = vi.fn(async () => {
+        throw new Error('reconnect fail');
+      });
+      function TestComponent() {
+        const injectable = useInjectable(fetchData);
+        useReconnectRevalidate(injectable);
+        return null;
+      }
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandledRejection);
+      try {
+        render(<TestComponent />);
+        await act(async () => {
+          fireEvent(window, new Event('online'));
+        });
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+        expect(fetchData).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
     });
   });
 

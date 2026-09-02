@@ -1873,6 +1873,9 @@ describe('useRetry preset options', () => {
 
   it('should wait the linear backoff delay between attempts', async () => {
     vi.useFakeTimers();
+    // Pin the ±25% jitter factor to exactly 1.0, so the delays below are
+    // the exact preset bases (1000ms, 2000ms).
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
     try {
       let calls = 0;
       const flaky = vi.fn(() => {
@@ -1916,12 +1919,15 @@ describe('useRetry preset options', () => {
       expect(flaky).toHaveBeenCalledTimes(3); // retry 2 fired at t=3000
       expect(screen.getByText('ok')).toBeDefined();
     } finally {
+      random.mockRestore();
       vi.useRealTimers();
     }
   });
 
   it('should wait the exponential backoff delay between attempts', async () => {
     vi.useFakeTimers();
+    // Pin the ±25% jitter factor to exactly 1.0 (see the linear test).
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
     try {
       let calls = 0;
       const flaky = vi.fn(() => {
@@ -1966,6 +1972,7 @@ describe('useRetry preset options', () => {
       expect(flaky).toHaveBeenCalledTimes(3); // retry 2 fired at t=3000
       expect(screen.getByText('ok')).toBeDefined();
     } finally {
+      random.mockRestore();
       vi.useRealTimers();
     }
   });
