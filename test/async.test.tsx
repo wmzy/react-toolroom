@@ -1,4 +1,4 @@
-import {describe, it, expect, vi} from 'vitest';
+import {describe, it, expect, vi, beforeEach} from 'vitest';
 import {render, screen, waitFor, act, fireEvent} from '@testing-library/react';
 import {
   memo,
@@ -9,6 +9,7 @@ import {
   useEffect,
   startTransition
 } from 'react';
+import type {ComponentType, ReactNode} from 'react';
 import {
   useRun,
   useInjectable,
@@ -1357,13 +1358,15 @@ describe('async hooks', () => {
       }
 
       // StrictMode double-invokes render and effects; subscriptions stay
-      // deduplicated because Set#add is idempotent, so the effect fires twice
+      // deduplicated because Set#add is idempotent, and the second effect
+      // run JOINS the first run's in-flight request (useRun's concurrent
+      // same-args sharing), so the fetch fires exactly once
       const {rerender} = render(
         <StrictMode>
           <TestComponent showThird={false} />
         </StrictMode>
       );
-      expect(fetchData).toHaveBeenCalledTimes(2);
+      expect(fetchData).toHaveBeenCalledTimes(1);
       expect(screen.getByTestId('a').textContent).toBe('loading');
       expect(screen.getByTestId('b').textContent).toBe('loading');
 
@@ -1381,7 +1384,7 @@ describe('async hooks', () => {
         </StrictMode>
       );
       expect(screen.getByTestId('c').textContent).toBe('shared data');
-      expect(fetchData).toHaveBeenCalledTimes(2);
+      expect(fetchData).toHaveBeenCalledTimes(1);
     });
 
     it('should keep subscribers consistent when a result lands during a transition', async () => {
@@ -5971,5 +5974,268 @@ describe('in-flight abort yielding (load slot vacated synchronously)', () => {
     });
     expect(latest.error).toBeUndefined();
     expect(fetchData).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('useRun concurrent same-args sharing (no cache provider)', () => {
+  // The no-cache counterpart of the provider `load` slot: two components
+  // running the same injectable with the same logical args while a
+  // request is pending share that one request (TanStack Query's default
+  // request deduplication), while different args and sequential reruns
+  // each issue their own call. An entry dies with its promise — a failed
+  // call is retryable, a settled call is refetched.
+  const ARGS_A: [string] = ['a'];
+  const ARGS_B: [string] = ['b'];
+  const latest: Record<string, ArgsStatus> = {};
+
+  beforeEach(() => {
+    for (const key of Object.keys(latest)) delete latest[key];
+  });
+
+  function makeDeferred() {
+    const resolvers: Array<(v: string) => void> = [];
+    const fetchData = vi.fn(
+      (_key: string, _signal?: AbortSignal) =>
+        // The signal is ignored on purpose: the promise pends until the
+        // test resolves it, so a joiner keeps the shared outcome to
+        // settlement even across the creator's abort.
+        new Promise<string>((resolve) => resolvers.push(resolve))
+    );
+    return {fetchData, resolvers};
+  }
+
+  type Injectable = (key: string, signal?: AbortSignal) => Promise<string>;
+
+  function Runner({
+    injectable,
+    args,
+    signal,
+    tag
+  }: {
+    injectable: Injectable;
+    args: [string];
+    signal?: boolean;
+    tag?: string;
+  }) {
+    useRun(injectable, args, {signal});
+    if (tag) latest[tag] = useArgsStatus(injectable, args);
+    return null;
+  }
+
+  // Runners must receive ONE injectable through props: components each
+  // calling useInjectable own separate chains and stores — separate
+  // queries that are not shared, by design.
+  function makeOwner(
+    runners: (injectable: Injectable) => ReactNode
+  ): ComponentType<{fetchData: Injectable}> {
+    return function Owner({fetchData}) {
+      const injectable = useInjectable(fetchData);
+      return <>{runners(injectable)}</>;
+    };
+  }
+
+  it('two concurrent runs of the same injectable and args share one request', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    const View = makeOwner((injectable) => (
+      <>
+        <Runner injectable={injectable} args={ARGS_A} tag='a' />
+        <Runner injectable={injectable} args={ARGS_A} />
+      </>
+    ));
+    render(<View fetchData={fetchData} />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvers[0]!('v1');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('v1');
+    });
+    expect(latest.a!.loading).toBe(false);
+    expect(latest.a!.error).toBeUndefined();
+  });
+
+  it('different args run independently', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    const View = makeOwner((injectable) => (
+      <>
+        <Runner injectable={injectable} args={ARGS_A} tag='a' />
+        <Runner injectable={injectable} args={ARGS_B} tag='b' />
+      </>
+    ));
+    render(<View fetchData={fetchData} />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    expect(fetchData).toHaveBeenCalledWith('a');
+    expect(fetchData).toHaveBeenCalledWith('b');
+
+    await act(async () => {
+      resolvers[0]!('va');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('va');
+    });
+    // The shared result store keeps one provenance: while ['a'] holds the
+    // display, ['b'] reads no data — and vice versa once ['b'] settles.
+    expect(latest.b!.data).toBeUndefined();
+    await act(async () => {
+      resolvers[1]!('vb');
+    });
+    await waitFor(() => {
+      expect(latest.b!.data).toBe('vb');
+    });
+  });
+
+  it('a settled run is not shared: a sequential rerun fetches again', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    const View = makeOwner((injectable) => (
+      <Runner injectable={injectable} args={ARGS_A} tag='a' />
+    ));
+    const first = render(<View fetchData={fetchData} />);
+    await act(async () => {
+      resolvers[0]!('first');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('first');
+    });
+    first.unmount();
+
+    const second = render(<View fetchData={fetchData} />);
+    await act(async () => {});
+    // the first entry died with its promise — the remount fetches fresh
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      resolvers[1]!('second');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('second');
+    });
+    second.unmount();
+  });
+
+  it('a plain run joins a {signal: true} run in flight', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    const View = makeOwner((injectable) => (
+      <>
+        <Runner injectable={injectable} args={ARGS_A} signal tag='a' />
+        <Runner injectable={injectable} args={ARGS_A} />
+      </>
+    ));
+    render(<View fetchData={fetchData} />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+    expect(fetchData).toHaveBeenCalledWith('a', expect.any(AbortSignal));
+
+    await act(async () => {
+      resolvers[0]!('shared');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('shared');
+    });
+  });
+
+  it('a joiner keeps the shared outcome after the creator unmounts', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    function Creator({injectable}: {injectable: Injectable}) {
+      useRun(injectable, ARGS_A, {signal: true});
+      return null;
+    }
+    function View({
+      fetchData,
+      withCreator
+    }: {
+      fetchData: Injectable;
+      withCreator: boolean;
+    }) {
+      const injectable = useInjectable(fetchData);
+      return (
+        <>
+          {withCreator && <Creator injectable={injectable} />}
+          <Runner injectable={injectable} args={ARGS_A} tag='a' />
+        </>
+      );
+    }
+    const mounted = render(<View fetchData={fetchData} withCreator />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    // The creator unmounts: its abort vacates the registry for FUTURE
+    // runs, but the joiner already committed to the shared promise —
+    // and the mock ignores the signal, so the outcome still settles.
+    mounted.rerender(<View fetchData={fetchData} withCreator={false} />);
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolvers[0]!('kept');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('kept');
+    });
+  });
+
+  it('StrictMode without signal: the double effect still issues one request', async () => {
+    const {fetchData, resolvers} = makeDeferred();
+    const View = makeOwner((injectable) => (
+      <Runner injectable={injectable} args={ARGS_A} tag='a' />
+    ));
+    render(
+      <StrictMode>
+        <View fetchData={fetchData} />
+      </StrictMode>
+    );
+    await act(async () => {});
+    expect(fetchData).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvers[0]!('once');
+    });
+    await waitFor(() => {
+      expect(latest.a!.data).toBe('once');
+    });
+  });
+
+  it('StrictMode with {signal: true}: the aborted first run yields, the second fetches fresh', async () => {
+    // A fetch with real abort semantics: the abort listener rejects
+    // synchronously, exactly like the browser's fetch.
+    const resolvers: Array<(v: string) => void> = [];
+    const fetchData = vi.fn(
+      (key: string, signal?: AbortSignal) =>
+        new Promise<string>((resolve, reject) => {
+          const onAbort = () =>
+            reject(new DOMException('aborted', 'AbortError'));
+          if (signal) {
+            if (signal.aborted) return onAbort();
+            signal.addEventListener('abort', onAbort, {once: true});
+          }
+          resolvers.push(resolve);
+        })
+    );
+    let latest!: ArgsStatus;
+    function Consumer() {
+      const injectable = useInjectable(fetchData);
+      useRun(injectable, ARGS_A, {signal: true});
+      latest = useArgsStatus(injectable, ARGS_A);
+      return null;
+    }
+    render(
+      <StrictMode>
+        <Consumer />
+      </StrictMode>
+    );
+    await act(async () => {});
+    // The first run's abort must have vacated the registry synchronously:
+    // the second effect run started a fresh request instead of joining
+    // the dead promise (which would park the query in AbortError).
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    expect(resolvers).toHaveLength(2);
+
+    await act(async () => {
+      resolvers[1]!('fresh');
+    });
+    await waitFor(() => {
+      expect(latest.data).toBe('fresh');
+    });
+    expect(latest.error).toBeUndefined();
   });
 });

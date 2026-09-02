@@ -1457,6 +1457,61 @@ const attachSignal = <F extends Func>(f: F, callContext: any): F =>
     return f(...args);
   }) as F;
 
+// In-flight registry of useRun-driven calls, keyed by the injectable
+// itself plus the keyed store's args derivation (`stableHash` of the tuple
+// with a trailing signal trimmed): concurrent runs of one injectable with
+// the same logical args share a single request — TanStack Query's default
+// request deduplication for the path no cache provider covers (`useCache`
+// already folds concurrent same-key reads through the provider's `load`
+// slot; with both, this registry short-circuits one chain traversal
+// earlier and changes nothing observable). Plain (non-injectable)
+// functions are exempt: they own no shared stores, so two runs are two
+// side effects by design.
+//
+// Lifecycle: an entry dies with its promise — a settled call is never
+// shared, so the next call fetches and a failed call can be retried. A
+// run created with `{signal: true}` vacates its entry from the signal's
+// abort listener SYNCHRONOUSLY, mirroring the memory provider's load-slot
+// abort-yield: a same-stack successor (StrictMode's mount→cleanup→mount,
+// an unmount-then-remount commit) starts a fresh request instead of
+// joining a dead promise. A joiner's own abort never touches the entry —
+// its signal never reached the fetch (the creator's did) — and a joiner
+// that skipped its call keeps the shared outcome to settlement through
+// the injectable's stores.
+const runInflight = new WeakMap<Func, Map<string, Promise<any>>>();
+
+function runInflightOf(fn: Func): Map<string, Promise<any>> {
+  let map = runInflight.get(fn);
+  if (!map) {
+    map = new Map();
+    runInflight.set(fn, map);
+  }
+  return map;
+}
+
+// Registers a run's promise under its key. `settle` is the exact undo in
+// both roles: as the promise's settle handler it drops the entry
+// (identity-guarded against a newer entry already replacing this one),
+// and as the signal's abort listener it vacates the entry synchronously.
+// The settle handler also observes a rejection, so a failed no-cache run
+// no longer surfaces as an unhandled rejection once `useRun`'s void call
+// discards the promise.
+function trackRun(
+  inflight: Map<string, Promise<any>> | undefined,
+  key: string | undefined,
+  promise: Promise<any>,
+  signal?: AbortSignal
+) {
+  if (!inflight || key === undefined) return;
+  inflight.set(key, promise);
+  const settle = () => {
+    if (signal && !signal.aborted) signal.removeEventListener('abort', settle);
+    if (inflight.get(key) === promise) inflight.delete(key);
+  };
+  if (signal) signal.addEventListener('abort', settle, {once: true});
+  promise.then(settle, settle);
+}
+
 /**
  * Runs a function and updates its effects whenever its dependencies change.
  *
@@ -1466,6 +1521,15 @@ const attachSignal = <F extends Func>(f: F, callContext: any): F =>
  * injectable, the signal is also exposed as `signal` on the per-call
  * context seen by the injected wrappers. Plain (non-`useInjectable`)
  * functions are detected via `isInjectable` and run without the bridge.
+ *
+ * Concurrent runs of one injectable with the same logical args — two
+ * mounted components, or one component and StrictMode's double effect —
+ * share the in-flight request: the first run creates it, the later runs
+ * join it and start nothing (the shared stores already serve them both).
+ * A run whose promise settled is never shared; a `{signal: true}` run
+ * whose signal aborted yields its place synchronously, so a same-stack
+ * successor starts fresh. On injectables this matches TanStack Query's
+ * default request deduplication; plain functions keep one-run-one-call.
  *
  * By default the effect re-runs whenever an argument changes by reference,
  * so callers passing fresh object/array literals on every render (e.g.
@@ -1556,12 +1620,26 @@ export function useRun<F extends Func>(
   useEffect(
     () => {
       const currentArgs = argsRef.current;
+      // Concurrent same-args sharing, see the registry above. The joiner
+      // starts nothing and aborts nothing: the creator's chain drives the
+      // shared stores for both, and the joiner's cleanup has no signal on
+      // the wire to abort. `isInjectable` is stable per fn identity, so
+      // the conditional stays render-stable.
+      const inflight = isInjectable(fn) ? runInflightOf(fn) : undefined;
+      const key =
+        inflight && stableHash(trimTrailingSignal(currentArgs as any[]));
+      if (inflight && key !== undefined && inflight.get(key)) return;
       if (!signal) {
-        void fn(...currentArgs);
+        trackRun(inflight, key, Promise.resolve(fn(...currentArgs)));
         return;
       }
       const ac = new AbortController();
-      void (fn as Func)(...currentArgs, ac.signal);
+      trackRun(
+        inflight,
+        key,
+        Promise.resolve((fn as Func)(...currentArgs, ac.signal)),
+        ac.signal
+      );
       return () => ac.abort();
       // Without `hash`, the call arguments participate in the dependencies by
       // reference (existing semantics); with `hash`, the computed key replaces
