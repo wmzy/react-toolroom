@@ -1878,5 +1878,10 @@ export {
 
 export {useInjectable, createMemoryCacheProvider};
 export {default as createMutationBinder} from '../mutation';
-export type {MutationSpec, BoundMutation, CreateMutationBinder} from '@@/types';
+export type {
+  MutationSpec,
+  BoundMutation,
+  CreateMutationBinder,
+  PersistOptions
+} from '@@/types';
 export {stableHash, isAbortSignal, stripVolatile} from '@@/util';

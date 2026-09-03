@@ -194,3 +194,32 @@ export type CacheProvider<T, K extends any[]> = {
     args?: K;
   }[];
 };
+
+/**
+ * Options of `createMemoryCacheProvider`'s `persist` — a localStorage mirror
+ * of every settled entry under one storage key, refilled on the next
+ * creation. The disk holds a rebuildable mirror, not a source of truth: a
+ * stored table that fails the version or shape gate is discarded wholesale,
+ * silently, without wiping what is stored.
+ */
+export type PersistOptions = {
+  /** The localStorage key to mirror under — namespace it per cache. */
+  key: string;
+  /**
+   * Version written into the persisted table `{v, data}` and required to
+   * hydrate it back. A differing `v` (an older schema, a future version)
+   * discards the payload wholesale — no migration (the next real write
+   * overwrites it), no wipe. Default `1`.
+   */
+  version?: number;
+  /**
+   * Evaluated at the creation-time hydrate and before every mirror write.
+   * `false` suspends persistence: nothing is read from or written to the
+   * disk while the memory cache keeps working, and a suspended window only
+   * delays the next mirror write (the next enabled write re-serializes the
+   * full table). The cross-tab clearing and `clear()`'s removeItem are NOT
+   * gated — a suspended tab must still drop another session's data.
+   * Default `() => true`.
+   */
+  enabled?: () => boolean;
+};

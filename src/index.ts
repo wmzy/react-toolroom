@@ -6,4 +6,10 @@
 export {default as memo, memoBase, defaultTestEvent} from './memo';
 export {default as createMemoryCacheProvider} from './memory-cache-provider';
 export {stableHash, isAbortSignal, stripVolatile} from './util';
-export type {Func, CacheProvider, CacheResult, CacheEvent} from './types';
+export type {
+  Func,
+  CacheProvider,
+  CacheResult,
+  CacheEvent,
+  PersistOptions
+} from './types';

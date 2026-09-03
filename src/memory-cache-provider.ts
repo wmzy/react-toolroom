@@ -1,7 +1,8 @@
-import {CacheEvent, CacheProvider} from '@@/types';
+import {CacheEvent, CacheProvider, PersistOptions} from '@@/types';
 import {isAbortSignal, noop, stableHash} from '@@/util';
 
 import createMutationBinder from './mutation';
+import attachPersistence from './persistence';
 
 /**
  * One cache entry in any mixture of its two halves: `settled` data and an
@@ -57,6 +58,12 @@ type Entry<T, K extends any[]> = {
  * @param {(k: K) => string} [options.hash=stableHash] - The hash function used to generate
  * a unique key for each value. Defaults to {@link stableHash}, which serializes keys
  * deterministically (sorted object keys, structural recursion).
+ * @param {PersistOptions} [options.persist] - localStorage persistence: mirror
+ * every settled entry under one storage key and refill from it on the next
+ * creation (`{v, data}` version gate + coarse shape check, `cachedAt`
+ * preserved so restarted entries keep their real age, event-driven mirror
+ * writes with a pre-write diff, cross-tab storage clearing, `clear()` wiping
+ * the key, silent degradation on every storage failure). Default off.
  * @template T - The type of the value to be stored in the cache.
  * @template K - The type of the key used to retrieve the value from the cache.
  * @returns {CacheProvider<T, K>} Returns an object with methods for getting, setting,
@@ -76,10 +83,12 @@ type Entry<T, K extends any[]> = {
  */
 export default function create<T, K extends any[]>({
   cacheTime = Infinity,
-  hash = stableHash
+  hash = stableHash,
+  persist
 }: {
   cacheTime?: number;
   hash?: (k: K) => string;
+  persist?: PersistOptions;
 } = {}): CacheProvider<T, K> {
   const map = new Map<string, Entry<T, K>>();
   // Per-key generation counter, bumped by every write that touches a key
@@ -522,5 +531,8 @@ export default function create<T, K extends any[]>({
   // data surface; the binder only needs peek/set/patchWhere, all closed
   // over already. Assigned after the literal — self-reference at call time.
   provider.mutation = createMutationBinder(provider).mutation;
+  // Persistence composes through the provider's own public seams; attached
+  // last so the mirror observes the fully assembled surface.
+  if (persist) attachPersistence(provider, persist);
   return provider;
 }

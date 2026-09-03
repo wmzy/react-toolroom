@@ -9,7 +9,7 @@
 
 ## Highlights
 
-- **Zero dependencies, tiny footprint** — the full entries are 2.27 kB (`react-toolroom`) and 6.45 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
+- **Zero dependencies, tiny footprint** — the full entries are 2.7 kB (`react-toolroom`) and 7.4 kB (`react-toolroom/async`), minified + brotli, shared chunk included; both tree-shake, so your real cost is the capabilities you import, not the full entry.
 - **No Provider, no Context** — every hook works standalone; state lives on the functions you pass in, so there is nothing to mount at the app root.
 - **Atomic, composable hooks** — each capability is one small hook. Combine `useCache` + `usePolling` like building blocks, and tree-shake the rest.
 - **Cross-component injection** — any component can attach middleware (wrappers) to another component's fetcher via the onion model; wrappers are removed automatically on unmount.
@@ -44,7 +44,7 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | limited |
 | Fetch middleware | onion wrappers, per component, no Provider | ✗ (query cache events only) | ✅ (via `SWRConfig`) | ✗ |
 | React versions | **16.8 – 19** | 18+ (v5) | 16.11+ (v2) | 16.8+ (v3) |
-| Bundle size¹ | **2.27 kB** + **6.45 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| Bundle size¹ | **2.7 kB** + **7.4 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ Minified + compressed, full entry without tree-shaking — an upper bound; cherry-picked imports are smaller. react-toolroom numbers are exact, measured from the CI build; competitor numbers are approximate and vary by version — check their docs.
 
@@ -458,6 +458,25 @@ function User({id}: {id: string}) {
 
 `dehydrate()` flattens the internal map into a plain `{[hashedKey]: [value, timestamp]}` object — `JSON.stringify`-safe, so it can travel through HTML, props, or a hand-rolled RPC. On the client, call `hydrate(payload)` **before** the first render: the first `useCache` lookup is then a cache hit and paints immediately; entries older than `staleTime` are revalidated in the background, exactly like any normal stale hit. `hydrate` **merges** — it never clears entries the client already holds — and timestamps survive the trip, so staleness math stays correct.
 
+### Persist across reloads — `persist`
+
+```tsx
+const tagsCache = createMemoryCacheProvider<string[], any[]>({
+  cacheTime: 60000,
+  persist: {key: 'my-app:tags'}
+});
+```
+
+`persist` mirrors every settled entry to `localStorage` under one key and refills from it on the next creation — a refresh hands back the pre-refresh cache instead of a skeleton flash. The payload is `{v, data}`, and its semantics are deliberately conservative:
+
+- **Version gate** — a stored table whose `v` differs from `persist.version` (default `1`) is discarded wholesale: no migration (the disk is a rebuildable mirror, not a source of truth — bump the version when your entity schema changes) and no wipe (a rejected read must not erase what it rejected). Corrupt JSON and structurally damaged tables get the same silent fresh start.
+- **Real age** — `cachedAt` survives the round trip, so a restarted entry is as old as it really is: it renders immediately, then revalidates in the background like any stale hit under `staleTime`, never masquerading as fresh.
+- **One mirror write per cache event** — set/delete/clear/GC each re-serialize the full table, after a live diff against what is stored: equal writes are skipped, which is what keeps a cross-tab ping-pong at one round.
+- **Cross-tab convergence** — a `storage` event for this key (another tab's new mirror, or its `removeItem` logout wipe) clears this tab's memory so consumers refetch server truth. Foreign bytes are never re-hydrated.
+- **`clear()` wipes** — the empty table is mirrored first, then the key is removed outright, so a quota-swallowed empty write cannot leave the previous session's data behind.
+- **Silent degradation** — SSR (no `window`), a throwing `localStorage`, quota exceeded, or a non-JSON-safe value never throw: the memory cache stays authoritative. Values must be JSON-safe — `undefined` and functions are dropped, `Date`s land as strings.
+- **`enabled`** — a predicate evaluated at the creation-time hydrate and before every mirror write. Return `false` to suspend persistence (a mock-data mode must not dirty the mirror); suspension touches only the disk — memory updates, cross-tab clearing, and the `clear()` wipe keep working, and the next enabled write re-serializes the full table, missed writes included.
+
 ### Prefix invalidation
 
 ```tsx
@@ -786,7 +805,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `memoBase(Component, {testEvent, propsAreEqual?})` | Lower-level variant that requires the full options object (no defaults filled in). |
 | `defaultTestEvent(key)` | The default `testEvent`: `/^on[A-Z]/.test(key)`. |
 | `stableHash(value)` | Structural hash: sorted object keys, `Map`/`Set` aware, circular-reference safe, `AbortSignal` → fixed placeholder, symbols fold by registry key (`sym#…`) or description (`sym:…`) — anonymous symbols and same-description pairs collide by design, object keys holding `undefined` are dropped (`{a: 1, b: undefined}` hashes like `{a: 1}`, so schema outputs that omit defaulted fields and state objects that carry them as `undefined` properties land on one key). Exported from both entries; the default `hash` of `createMemoryCacheProvider`, and a building block for your own keys, e.g. `hash: (args) => 'user:' + stableHash(args)`. |
-| `createMemoryCacheProvider({cacheTime?, hash?})` | The in-memory `CacheProvider`: entries are three-state (settled data, in-flight request, or both), `load` is the atomic get-or-insert of the in-flight slot that deduplicates concurrent same-key reads, and per-entry GC reclaims entries idle for `cacheTime`. Framework-free — import it from the core entry for router loaders and non-React code. |
+| `createMemoryCacheProvider({cacheTime?, hash?, persist?})` | The in-memory `CacheProvider`: entries are three-state (settled data, in-flight request, or both), `load` is the atomic get-or-insert of the in-flight slot that deduplicates concurrent same-key reads, and per-entry GC reclaims entries idle for `cacheTime`. `persist` mirrors every settled entry to `localStorage` — `{v, data}` version gate, `cachedAt` preserved (real-age SWR), event-driven mirror writes with a pre-write diff, cross-tab storage clearing, `clear()` wiping the key, `enabled` suspension. Framework-free — import it from the core entry for router loaders and non-React code. |
 | `isAbortSignal(value)` | `true` for `AbortSignal`s: an `instanceof` fast path plus a duck-typing fallback (`aborted` property + `addEventListener` function), so the check survives cross-realm signals (iframes, test doubles) and environments without a global `AbortSignal`. Exported from both entries; the basis of `stableHash`'s signal placeholder and `useRun`'s signal bridge. |
 | `stripVolatile(value)` | Recursive normalization for multi-channel keys: strips `AbortSignal`s at any depth (top level, array slots, object values — cross-realm aware via `isAbortSignal`) and object keys holding `undefined`, so `stableHash(stripVolatile(args))` lands on ONE key for every channel that assembles the same entity's args differently — a loader handing the provider a schema output (defaulted fields absent, no signal) vs a view handing its state object (defaulted fields as `undefined` properties) plus the trailing signal a `useRun` rerun attached. Arrays keep their remaining slots in order; `Map`/`Set` pass through untouched; not cycle-safe. Exported from both entries. |
 
@@ -820,7 +839,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `invalidate(targets)` | Invalidate caches declaratively, outside a mutation (the `invalidates` option of `useMutation` calls this on success). Each entry of `targets` is a cache provider (all of its entries are purged) or a `[provider, ...argsPrefix]` tuple (only entries whose raw args tuple structurally extends the prefix, removed via the provider's `deleteWhere` — any `hash` convention works). A pure cache operation: no injectable needed, no request issued; mounted `useCache` consumers of the provider refresh themselves through its deletion event (refetch via the wrapper chain, rewrite, broadcast). |
 | `useOptimistic(fn, updater)` | Optimistic updates: every call of `fn` immediately publishes `updater(currentResult, ...args)` to the result store; success overwrites it with the real result, failure rolls back to the pre-call value while the rejection keeps flowing to `useError`/`useCatch`. Pair with `useInvalidate` — optimistic UI for locally predictable edits, hard invalidation for everything else. |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | Infinite loading for a `(pageParam) => page` fetcher: aggregates pages into an array published to the result store and returns `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}` — a subset of TanStack's `useInfiniteQuery`, including bidirectional paging and a `maxPages` sliding window. Only `fetchNextPage()`/`fetchPreviousPage()` calls grow the list (in-flight debounced per direction — TanStack default); any direct call (e.g. a `useRun` rerun) resets `pages`. |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | Re-exported here for convenience — see the core table above. |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash, persist?})` | Re-exported here for convenience — see the core table above. |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | Call `fn(...args)` every `interval` ms; skips ticks while the previous call is pending; pauses while the document is hidden unless `whenHidden`. Changing `interval` restarts the timer. Each tick's settle outcome is recorded on the error channels (`useError`, `useArgsStatus`) even with none mounted at tick time — a later-mounted reader still sees a failure that happened unwatched, and the next successful tick clears it. `args` land on the same `useCache` key as `useRun(fn, args)` — pass the keyed tuple when `useRun` uses one. |
 | `useFocusRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | Refetch on window focus and on `visibilitychange` back to visible, throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. With `cacheProvider`, gate by entry age — TanStack's `refetchOnWindowFocus` under a `staleTime`: an entry younger than `staleTime` skips the refetch, missing/stale entries refetch; without a provider every event revalidates. Rejections flow through the error channels and are otherwise swallowed — never an unhandled rejection. |
 | `useReconnectRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | Refetch when the network connection comes back (window `online` event), guarded by `navigator.onLine` and throttled by `interval`; `args` are spread into every revalidation and keyed like `useRun`. Same `cacheProvider`/`staleTime` age gating as `useFocusRevalidate`; rejections never surface as unhandled. The equivalent of TanStack's `refetchOnReconnect` / SWR's `revalidateOnReconnect`. |
@@ -850,7 +869,7 @@ During 0.x, breaking changes ship as semver **minor** bumps and are called out i
 ## Package facts
 
 - **ESM + CJS** — every entry ships both builds: the `exports` map resolves `import` to `.mjs` and `require` to `.cjs` (with `types` first), so Node SSR, Jest in CJS mode, and other `require()` consumers work without a bundler.
-- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 7 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 2.27 kB / 6.45 kB.
+- **CI size guardrails** — [size-limit](./.size-limit.json) is only a loose tripwire (`react-toolroom` < 3 kB, `react-toolroom/async` < 7.5 kB, brotli, entry + shared chunk) against accidental bloat, not a feature gate — the library is tree-shakable, so users pay only for what they import. Currently 2.7 kB / 7.4 kB.
 - **Tree-shakable** — `sideEffects: false`, two independent entries, atomic hooks: import one capability, pay for it plus a little shared machinery. Measured (brotli): `usePolling` alone ~0.2 kB, `useMutation` alone ~2.0 kB, `useResultSelect` alone ~0.9 kB, the `useCache` + `useResult` read stack ~1.7 kB.
 - **Peer dependencies** — `react` and `react-dom` `^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`.
 - **TypeScript first** — authored in TypeScript; type declarations are generated from source.

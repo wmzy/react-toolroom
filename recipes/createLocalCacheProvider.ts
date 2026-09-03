@@ -2,6 +2,12 @@
  * A localStorage-backed cache provider factory — the persistence variant
  * of `createMemoryCacheProvider`.
  *
+ * NOTE: `createMemoryCacheProvider` now ships an official `persist` option
+ * ({key, version?, enabled?}) with strictly richer semantics — version
+ * gate, cross-tab convergence, pre-write diff, clear() wipe, suspension.
+ * Prefer it; keep this template only as the starting point for a storage
+ * backend the option does not cover (sessionStorage, IndexedDB, …).
+ *
  * Same "copy me and customize" contract as the hook recipes, applied to
  * the cache side of `useCache`. It COMPOSES the memory provider instead of
  * reimplementing it: the memory map stays the single source of truth for

@@ -9,7 +9,7 @@
 
 ## 特性
 
-- **零依赖、体积极小** — 全量入口 `react-toolroom` 2.27 kB、`react-toolroom/async` 6.45 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
+- **零依赖、体积极小** — 全量入口 `react-toolroom` 2.7 kB、`react-toolroom/async` 7.4 kB（minified + brotli，含共享 chunk）；可 tree-shaking、按需付费——实际成本取决于你引入的能力，而非全量入口。
 - **无 Provider、无 Context** — 每个 hook 独立生效，状态挂在传入的函数上，应用根部不需要挂载任何东西。
 - **原子化、可组合** — 每个能力就是一个小 hook。像积木一样组合 `useCache` + `usePolling`，用不到的直接被 tree-shaking 掉。
 - **跨组件注入** — 任意组件都能通过洋葱模型给另一个组件的 fetcher 叠加中间件（wrapper），注入方卸载时自动摘除。
@@ -44,7 +44,7 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 | SSR / hydration | ✅ `dehydrate`/`hydrate` | ✅ | ✅ | 有限支持 |
 | 请求中间件 | 洋葱 wrapper，组件级，无 Provider | ✗（仅 query cache 事件） | ✅（经 `SWRConfig`） | ✗ |
 | React 版本 | **16.8 – 19** | 18+（v5） | 16.11+（v2） | 16.8+（v3） |
-| 包体积¹ | **2.27 kB** + **6.45 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
+| 包体积¹ | **2.7 kB** + **7.4 kB** | ≈ 13 kB | ≈ 4 kB | ≈ 5 kB+ |
 
 ¹ 均为 minified + 压缩后、全量入口（未 tree-shaking）的体积，是按需引入的上界。react-toolroom 的数字是 CI 构建产物的实测值；竞品数字是大致值，随版本变化，请以各自文档为准。
 
@@ -387,6 +387,25 @@ function User({id}: {id: string}) {
 
 `dehydrate()` 把内部 map 展开成普通的 `{[hashedKey]: [value, timestamp]}` 对象——可直接 `JSON.stringify`，因此能随 HTML、props 或自建 RPC 传输。客户端在**首屏渲染前**调用 `hydrate(payload)`：组件第一次 `useCache` 查询即为缓存命中、立即渲染；超过 `staleTime` 的条目照常在后台重新验证，与普通的过期命中完全一致。`hydrate` 是**合并**语义——绝不清空客户端已有的条目——且时间戳原样保留，过期计算因此保持正确。
 
+### 刷新后持久化 — `persist`
+
+```tsx
+const tagsCache = createMemoryCacheProvider<string[], any[]>({
+  cacheTime: 60000,
+  persist: {key: 'my-app:tags'}
+});
+```
+
+`persist` 把全部已落定条目镜像到 `localStorage` 的一个键上，下次创建时回灌——刷新拿到的是刷新前的缓存，而不是一次骨架屏闪现。载荷是 `{v, data}`，语义刻意保守：
+
+- **版本门禁** — 盘上 `v` 与 `persist.version`（默认 `1`）不符即整体丢弃：不做迁移（盘上是可重建的镜像而非事实数据源——实体 schema 变了就升版本），也不清盘（读侧丢弃 ≠ 写侧擦除）。坏 JSON 与结构性损坏的表同样静默空开始。
+- **真实年龄** — `cachedAt` 原样往返，重启后条目按真实年龄计：立即渲染旧值、后台重验证（`staleTime` 的 SWR 语义），陈旧数据不会冒充新鲜值。
+- **每个缓存事件一次镜像写** — set/delete/clear/GC 都全量重序列化表，写前与盘上现值实时 diff：同值跳过，跨 tab 乒乓因此一轮收敛。
+- **跨 tab 收敛** — 本键的 `storage` 事件（别 tab 的新镜像，或它 `removeItem` 的登出擦盘）清空本 tab 内存，消费者重拉服务端真相；绝不回灌别 tab 的字节。
+- **`clear()` 擦盘** — 先镜像写空表，再直接 removeItem 兜底：即使空表写回被配额吞掉，上个会话的数据也不会残留。
+- **静默降级** — SSR（无 `window`）、`localStorage` 抛异常、配额超限、非 JSON 安全值都不抛错：内存缓存始终权威。值必须 JSON 安全——`undefined`/函数会被丢弃、`Date` 落成字符串。
+- **`enabled`** — 创建期 hydrate 与每次镜像写之前求值。返回 `false` 即挂起持久化（mock 数据模式不能写脏镜像）；挂起只影响磁盘——内存更新、跨 tab 清理、`clear()` 擦盘照常，恢复后下一次写盘重新序列化全量表（挂起窗口漏写的一并补上）。
+
 ### 按前缀批量失效
 
 ```tsx
@@ -675,7 +694,7 @@ function App() {
 | `memoBase(Component, {testEvent, propsAreEqual?})` | 底层变体：必须传完整 options 对象，不帮你填默认值。 |
 | `defaultTestEvent(key)` | 默认的 `testEvent`：`/^on[A-Z]/.test(key)`。 |
 | `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符，symbol 按注册键（`sym#…`）或 description（`sym:…`）折叠——匿名 symbol 与同 description 的不同 symbol 刻意碰撞；值为 `undefined` 的对象键直接丢弃（`{a: 1, b: undefined}` 与 `{a: 1}` 同 hash，schema 输出省略缺省字段与状态对象带 undefined 属性因此落同一个 key）。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
-| `createMemoryCacheProvider({cacheTime?, hash?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
+| `createMemoryCacheProvider({cacheTime?, hash?, persist?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。`persist` 把全部已落定条目镜像到 `localStorage`——`{v, data}` 版本门禁、`cachedAt` 保留（真实年龄 SWR）、事件驱动的镜像写盘（写前 diff）、跨 tab storage 收敛、`clear()` 擦盘、`enabled` 挂起。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
 | `isAbortSignal(value)` | 判断值是否为 `AbortSignal`：`instanceof` 快路径加鸭子类型回退（`aborted` 属性 + `addEventListener` 函数），因此跨 realm 的 signal（iframe、测试替身）乃至没有全局 `AbortSignal` 的环境都能正确识别。两个入口均可导入；是 `stableHash` 的 signal 占位符与 `useRun` signal 桥的基础。 |
 | `stripVolatile(value)` | 多通道 key 的递归归一：全深度剥 `AbortSignal`（顶层、数组槽位、对象值——经 `isAbortSignal` 跨 realm 可判）与值为 `undefined` 的对象键，`stableHash(stripVolatile(args))` 让各渠道组装的同一实体参数落到同一个 key——loader 交给 provider 的 schema 输出（缺省字段无键、无 signal）vs 视图的状态对象（缺省字段为 undefined 属性）加上 `useRun` 重跑附带的尾部 signal。数组保持剩余槽位顺序；`Map`/`Set` 原样透传；不做循环引用防护。两个入口均可导入。 |
 
@@ -708,7 +727,7 @@ function App() {
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表（按方向在飞防抖——TanStack 默认行为）；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 此处为便捷再导出——详见上方核心表。 |
+| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash, persist?})` | 此处为便捷再导出——详见上方核心表。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。每轮落定结果都会记录到错误通道（`useError`/`useArgsStatus`），即使 tick 时无一挂载——之后挂载的读者仍能看到无人观看期间发生的失败，下一次成功 tick 将其清除。`args` 命中与 `useRun(fn, args)` 相同的 `useCache` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。传 `cacheProvider` 时按条目年龄门控——TanStack `refetchOnWindowFocus` 配 `staleTime` 的语义：年龄小于 `staleTime` 跳过重取，缺失/过期才重取；不传 provider 每次事件都重验证。rejection 走错误通道、无人认领则静默吞掉，绝不产生 unhandled rejection。 |
 | `useReconnectRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。与 `useFocusRevalidate` 相同的 `cacheProvider`/`staleTime` 年龄门控；rejection 绝不产生 unhandled rejection。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
@@ -738,7 +757,7 @@ function App() {
 ## 工程事实
 
 - **ESM + CJS 双构建** — 每个入口都有双份产物：`exports` 映射把 `import` 解析到 `.mjs`、`require` 解析到 `.cjs`（`types` 条件在前），因此 Node SSR、CJS 模式下的 Jest 及其它 `require()` 消费者无需打包器即可直接使用。
-- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 7 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 2.27 kB / 6.45 kB。
+- **CI 体积护栏** — [size-limit](./.size-limit.json) 只是宽松护栏（`react-toolroom` < 3 kB、`react-toolroom/async` < 7.5 kB，brotli，入口 + 共享 chunk），用于拦截意外膨胀，不限制功能添加——库可 tree-shaking，用户只为引入的能力付费。当前实测 2.7 kB / 7.4 kB。
 - **可 tree-shaking** — `sideEffects: false`，两个独立入口，原子化 hooks：引入一个能力，只为它及少量共享机制买单。实测（brotli）：只引 `usePolling` 约 0.2 kB，只引 `useMutation` 约 2.0 kB，只引 `useResultSelect` 约 0.9 kB，`useCache` + `useResult` 读取套件约 1.7 kB。
 - **peerDependencies** — `react` 与 `react-dom`：`^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0`。
 - **TypeScript 优先** — 以 TypeScript 编写；类型声明由源码生成。
