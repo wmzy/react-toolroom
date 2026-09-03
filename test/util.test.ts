@@ -6,7 +6,8 @@ import {
   noop,
   getDisplayName,
   stableHash,
-  isAbortSignal
+  isAbortSignal,
+  stripVolatile
 } from '../src/util';
 
 describe('util', () => {
@@ -289,6 +290,16 @@ describe('util', () => {
       expect(stableHash(Symbol())).toBe(stableHash(Symbol()));
     });
 
+    it('should drop object keys holding undefined', () => {
+      // A schema output that omits defaulted fields and a state object
+      // that carries them as undefined properties name the same entity.
+      expect(stableHash({a: undefined})).toBe(stableHash({}));
+      expect(stableHash({a: 1, b: undefined})).toBe(stableHash({a: 1}));
+      expect(stableHash({a: undefined})).not.toBe(stableHash({a: null}));
+      // Array slots keep their position — a hole is information.
+      expect(stableHash([undefined])).not.toBe(stableHash([]));
+    });
+
     it('should mark invalid dates distinctly from valid ones', () => {
       const invalid = new Date(Number.NaN);
       expect(stableHash(invalid)).toBe(stableHash(new Date('not a date')));
@@ -328,6 +339,71 @@ describe('util', () => {
       expect(stableHash({signal: foreignSignal})).toBe(
         stableHash({signal: new AbortController().signal})
       );
+    });
+  });
+
+  describe('stripVolatile', () => {
+    it('should strip AbortSignals at every depth', () => {
+      const controller = new AbortController();
+      expect(stripVolatile(controller.signal)).toBeUndefined();
+      expect(stripVolatile([1, controller.signal])).toEqual([1]);
+      expect(stripVolatile({a: {signal: controller.signal, b: 2}})).toEqual({
+        a: {b: 2}
+      });
+      expect(
+        stripVolatile([{sig: controller.signal}, [controller.signal]])
+      ).toEqual([{}, []]);
+    });
+
+    it('should drop undefined-valued keys recursively', () => {
+      expect(stripVolatile({a: undefined, b: 1})).toEqual({b: 1});
+      expect(stripVolatile({a: {b: undefined, c: undefined}})).toEqual({
+        a: {}
+      });
+      // a nested object that strips to empty still occupies its slot
+      expect(stripVolatile([0, {x: undefined}])).toEqual([0, {}]);
+    });
+
+    it('should normalize loader-side and view-side args to one hash', () => {
+      // The multi-channel contract: the loader passes the schema output
+      // (no key for the defaulted field), the view passes its state object
+      // (undefined property) plus the signal a useRun rerun attached.
+      const loaderArgs = [{offset: 0, limit: 10}];
+      const viewArgs = [
+        {offset: 0, limit: 10, tag: undefined},
+        new AbortController().signal
+      ];
+      expect(stableHash(stripVolatile(loaderArgs))).toBe(
+        stableHash(stripVolatile(viewArgs))
+      );
+      // and a different real field still separates the keys
+      expect(stableHash(stripVolatile(loaderArgs))).not.toBe(
+        stableHash(stripVolatile([{offset: 10, limit: 10}]))
+      );
+    });
+
+    it('should strip cross-realm (duck-typed) signals', () => {
+      const foreignSignal = {
+        aborted: false,
+        addEventListener() {}
+      };
+      expect(stripVolatile([foreignSignal, 'x'])).toEqual(['x']);
+      expect(stripVolatile({signal: foreignSignal})).toEqual({});
+    });
+
+    it('should keep undefined array slots positional', () => {
+      expect(stripVolatile([undefined, 1])).toEqual([undefined, 1]);
+      expect(stripVolatile([1, undefined])).not.toEqual([1]);
+    });
+
+    it('should pass primitives and Map/Set contents through', () => {
+      expect(stripVolatile(1)).toBe(1);
+      expect(stripVolatile('a')).toBe('a');
+      expect(stripVolatile(null)).toBe(null);
+      const map = new Map([['a', 1]]);
+      expect(stripVolatile(map)).toBe(map);
+      const set = new Set([1]);
+      expect(stripVolatile(set)).toBe(set);
     });
   });
 });

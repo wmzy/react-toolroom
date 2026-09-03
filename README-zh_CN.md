@@ -674,9 +674,10 @@ function App() {
 | `memo(Component, options?)` | 自动 memoize 事件处理器 props 的 `React.memo`，从此不需要 `useCallback`。`options`：`{testEvent?, propsAreEqual?}` 或直接传 `propsAreEqual(prev, next)` 函数。 |
 | `memoBase(Component, {testEvent, propsAreEqual?})` | 底层变体：必须传完整 options 对象，不帮你填默认值。 |
 | `defaultTestEvent(key)` | 默认的 `testEvent`：`/^on[A-Z]/.test(key)`。 |
-| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符，symbol 按注册键（`sym#…`）或 description（`sym:…`）折叠——匿名 symbol 与同 description 的不同 symbol 刻意碰撞。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
+| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符，symbol 按注册键（`sym#…`）或 description（`sym:…`）折叠——匿名 symbol 与同 description 的不同 symbol 刻意碰撞；值为 `undefined` 的对象键直接丢弃（`{a: 1, b: undefined}` 与 `{a: 1}` 同 hash，schema 输出省略缺省字段与状态对象带 undefined 属性因此落同一个 key）。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
 | `createMemoryCacheProvider({cacheTime?, hash?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
 | `isAbortSignal(value)` | 判断值是否为 `AbortSignal`：`instanceof` 快路径加鸭子类型回退（`aborted` 属性 + `addEventListener` 函数），因此跨 realm 的 signal（iframe、测试替身）乃至没有全局 `AbortSignal` 的环境都能正确识别。两个入口均可导入；是 `stableHash` 的 signal 占位符与 `useRun` signal 桥的基础。 |
+| `stripVolatile(value)` | 多通道 key 的递归归一：全深度剥 `AbortSignal`（顶层、数组槽位、对象值——经 `isAbortSignal` 跨 realm 可判）与值为 `undefined` 的对象键，`stableHash(stripVolatile(args))` 让各渠道组装的同一实体参数落到同一个 key——loader 交给 provider 的 schema 输出（缺省字段无键、无 signal）vs 视图的状态对象（缺省字段为 undefined 属性）加上 `useRun` 重跑附带的尾部 signal。数组保持剩余槽位顺序；`Map`/`Set` 原样透传；不做循环引用防护。两个入口均可导入。 |
 
 ### Async — `react-toolroom/async`
 
@@ -712,6 +713,7 @@ function App() {
 | `useFocusRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。传 `cacheProvider` 时按条目年龄门控——TanStack `refetchOnWindowFocus` 配 `staleTime` 的语义：年龄小于 `staleTime` 跳过重取，缺失/过期才重取；不传 provider 每次事件都重验证。rejection 走错误通道、无人认领则静默吞掉，绝不产生 unhandled rejection。 |
 | `useReconnectRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。与 `useFocusRevalidate` 相同的 `cacheProvider`/`staleTime` 年龄门控；rejection 绝不产生 unhandled rejection。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
 | `stableHash(value)` | 此处为便捷再导出——见上方核心表。 |
+| `stripVolatile(value)` | 此处为便捷再导出——见上方核心表。多通道 key 的归一工具，配 `stableHash(stripVolatile(args))` 使用。 |
 
 ### DevTools — `react-toolroom/devtools`
 

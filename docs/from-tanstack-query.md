@@ -18,7 +18,7 @@ same two-phase idea — but the cache is per entity, not one global store.
 | TanStack Query | react-toolroom | Notes |
 | --- | --- | --- |
 | `useQuery({queryKey, queryFn})` | `useCache(fetcher, cache)` + `useInjectable(fetcher)` + `useResult`/`useLoading`/`useError` | The fetcher is a plain function; the hook reads/writes the provider keyed by the call arguments. |
-| `queryKey` tree (`['users', id]`) | raw args tuple (`[id]`) + one provider per entity | No key serialization layer — the tuple *is* the key; `stableHash` handles structural hashing (or supply `hash`). |
+| `queryKey` tree (`['users', id]`) | raw args tuple (`[id]`) + one provider per entity | No key serialization layer — the tuple *is* the key; `stableHash` handles structural hashing (or supply `hash`). Keys differing only in `undefined`-valued fields hash identically, and `stableHash(stripVolatile(args))` additionally removes `AbortSignal`s — so loader-side and view-side derivations of one entry (schema output vs state object + trailing signal) share a key without any manual normalization. |
 | one global `QueryClient` | one `createMemoryCacheProvider()` per entity | Providers are module-scope singletons you create and wire explicitly. |
 | `queryFn` receives `{queryKey, signal}` | your function receives its args + trailing `AbortSignal` | `useRun(fn, args, {signal: true})` (and the hooks built on it) appends the signal as the trailing argument; cancellation works the same. |
 | `enabled: !!id` | conditional rendering / early return, or guard inside the fetcher | No declarative `enabled` — compose hooks the normal React way. |

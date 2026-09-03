@@ -63,7 +63,10 @@ function withCycleGuard(value: object, hash: () => string): string {
  *
  * Primitives are prefixed by type so that e.g. `1` and `'1'` never collide.
  * Object keys are sorted, and `Map` entries / `Set` values are sorted, so that
- * equivalent values with different insertion order hash identically. Function
+ * equivalent values with different insertion order hash identically; object
+ * keys holding `undefined` are dropped, so `{a: 1, b: undefined}` hashes like
+ * `{a: 1}` (schema outputs that omit defaulted fields and state objects that
+ * carry them as `undefined` properties land on one key). Function
  * references get a per-reference incrementing id (same reference, same hash).
  * Symbols fold to a discriminating placeholder: the registry key for
  * registered ones (`sym#…`), the description for the rest (`sym:…`);
@@ -129,7 +132,65 @@ export function stableHash(value: any): string {
     });
   }
   return withCycleGuard(value, () => {
-    const keys = Object.keys(value).sort();
+    // Keys holding `undefined` are dropped before hashing: the two sides
+    // of a multi-channel key derivation must land on one hash — a schema
+    // output that omits defaulted fields (no key at all) and a component
+    // state object that carries them as `undefined` properties. Array
+    // slots keep their position: `[undefined]` stays distinct from `[]`.
+    const keys = Object.keys(value)
+      .filter((k) => value[k] !== undefined)
+      .sort();
     return `{${keys.map((k) => `${k}:${stableHash(value[k])}`).join(',')}}`;
   });
+}
+
+/**
+ * Recursively strip the volatile parts of a value: `AbortSignal`s (at the
+ * top level, inside arrays, and as object values — detected via
+ * {@link isAbortSignal}, so cross-realm signals are stripped too) and
+ * object keys whose value is `undefined`.
+ *
+ * The multi-channel use case: when several channels derive the same cache
+ * key from arguments assembled differently — a router loader handing a
+ * schema output (defaulted fields absent, no signal) to the provider, a
+ * component handing its state object (defaulted fields present as
+ * `undefined` properties) plus the trailing `AbortSignal` a `useRun`
+ * rerun attached — the raw tuples hash differently even though they name
+ * the same entity. `stableHash` folds a signal *value* to a fixed
+ * placeholder, but the extra key/slot still participates in the
+ * structural comparison; this pass removes it entirely. Compose as
+ * `stableHash(stripVolatile(args))` (or hand it to a custom `hash`) and
+ * every channel lands on one key.
+ *
+ * Arrays keep their remaining slots in order (a signal occupying a slot
+ * is dropped, positional holes of literal `undefined` stay);
+ * `Map`/`Set` contents pass through untouched — hash them separately if
+ * needed. Not cycle-safe: argument tuples are expected to be acyclic
+ * (circular structures raise a RangeError instead of hashing, unlike
+ * {@link stableHash} on its own).
+ *
+ * @param value the value to normalize (typically an args tuple)
+ * @returns a structurally equal copy without signals and undefined keys,
+ *   or the value itself when it is a primitive; a top-level signal
+ *   normalizes to `undefined`
+ */
+export function stripVolatile(value: any): any {
+  if (isAbortSignal(value)) return undefined;
+  if (Array.isArray(value)) {
+    return value.filter((e) => !isAbortSignal(e)).map(stripVolatile);
+  }
+  if (value !== null && typeof value === 'object') {
+    // Map/Set entries live in internal slots, invisible to Object.entries:
+    // recursing them as plain objects would mangle them into {}. They pass
+    // through as-is — stableHash folds signal VALUES inside them to '#sig',
+    // the one structural difference this pass deliberately leaves alone.
+    if (value instanceof Map || value instanceof Set) return value;
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(value)) {
+      const next = stripVolatile(v);
+      if (next !== undefined) out[k] = next;
+    }
+    return out;
+  }
+  return value;
 }
