@@ -517,7 +517,7 @@ function UserTable({fetchUsers}: {fetchUsers: typeof fetchList}) {
 }
 ```
 
-`useSuspenseResult` 抛出 in-flight promise 而不是返回 `undefined`，让声明式 fallback 取代手写的 loading 标志。它只负责读——发起请求依然是 `useRun`、轮询或手动调用的职责。⚠️ 驱动方必须位于 `<Suspense>` boundary **之外**的父组件：被挂起的子树永远不会 commit，其 effect 也就不会执行——在*同一个*组件里同时调用 `useRun` 和 `useSuspenseResult` 会死锁（本该结束挂起的那次请求根本不会发出）。首个结果落地后，后续结果与 `useResult` 一样经共享 result store 持续流入。
+`useSuspenseResult` 抛出 in-flight promise 而不是返回 `undefined`，让声明式 fallback 取代手写的 loading 标志。它只负责读——发起请求依然是 `useRun`、轮询或手动调用的职责。⚠️ 驱动方必须位于 `<Suspense>` boundary **之外**的父组件：被挂起的子树永远不会 commit，其 effect 也就不会执行——在*同一个*组件里同时调用 `useRun` 和 `useSuspenseResult` 会死锁（本该结束挂起的那次请求根本不会发出）。驱动方从未启动是一种无声挂起——抛出的 promise 只在首个结果落地时才 settle——因此 DEV 构建在挂起超过约 1s 宽限期且无结果、无在飞行调用时，会一次性 `console.warn` 提示。首个结果落地后，后续结果与 `useResult` 一样经共享 result store 持续流入。
 
 ### 翻页时保留旧数据
 
@@ -690,7 +690,7 @@ function App() {
 | `subscribeInjectEvents(fn, {onCall, onSettle})` | 非 hook 的观察 API，面向 devtools/日志面板：链执行前触发 `onCall(args)`，每次调用落定时恰好触发一次 `onSettle({args, result?, error?, duration})`，`duration` 覆盖观察者之下的整条洋葱链。返回退订函数。 |
 | `useResult(fn, init?)` | 订阅最新结果；结果广播给所有消费者，晚订阅的组件直接从共享的上次结果起步。 |
 | `useResultSelect(fn, select, init?)` | 经 `select` 投影的 `useResult`（对应 TanStack 的 `select`）：组件只订阅切片——按结果与 selector 的身份 memo，返回新对象的投影也保持引用稳定。 |
-| `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。首个结果后，更新与 `useResult` 完全一致地流入。 |
+| `useSuspenseResult(fn)` | 类似 `useResult`，但在首个结果存在前挂起（抛出 in-flight promise）。必须配 `<Suspense>` boundary，且驱动方（`useRun` 或手动调用）必须位于 boundary 之外的父组件。驱动方从未启动会让 boundary 永远停在 fallback——DEV 构建在挂起超过约 1s 宽限期且无结果、无在飞行调用时一次性 `console.warn`。首个结果后，更新与 `useResult` 完全一致地流入。 |
 | `useLoading(fn)` | 任意调用进行中为 `true`。 |
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
 | `useArgsStatus(fn, args)` | 按参数观测——`{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` 只描述一个参数元组（结构化键，忽略末尾 `AbortSignal`）。`useLoading`/`useError` 的按 key 对应物：同一 injectable 并发服务多组参数时各自独立上报，互不覆盖对方 injectable 级的标志位。`error` 默认类型即 `Error \| undefined`（调用处无需 as 断言）；`E` 类型参数可收窄——`useArgsStatus<typeof fn, ApiError>` 得到 `ApiError \| undefined`。`data` 是收窄到该 key 的 `useResult` 契约：仅当共享结果的 provenance 匹配这组参数时非空。挂载即认领实例错误（errors-as-state，同 `useError`）。 |

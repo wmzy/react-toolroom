@@ -5180,6 +5180,80 @@ describe('async hooks', () => {
       expect(screen.queryByText('first loading…')).toBeNull();
       expect(screen.queryByText('second loading…')).toBeNull();
     });
+
+    it('should warn in DEV when a suspension outlives the grace window with no call ever started', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // No driver anywhere: nothing ever calls the injectable.
+      const fetchData = vi.fn(async () => 'never fetched');
+
+      function Owner() {
+        const fetchValue = useInjectable(fetchData);
+        return (
+          <Suspense fallback={<div>loading…</div>}>
+            <SuspenseReader fetchValue={fetchValue} />
+          </Suspense>
+        );
+      }
+
+      try {
+        render(<Owner />);
+        expect(screen.getByText('loading…')).toBeDefined();
+        await waitFor(
+          () => {
+            expect(warn).toHaveBeenCalled();
+          },
+          {timeout: 3000}
+        );
+        expect(warn.mock.calls[0]![0]).toMatch(/useSuspenseResult/);
+        expect(warn.mock.calls[0]![0]).toMatch(/no call in flight/);
+        // The warning is purely diagnostic: nothing fetched, still stalled.
+        expect(fetchData).not.toHaveBeenCalled();
+        expect(screen.getByText('loading…')).toBeDefined();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('should not warn while a driver keeps a call in flight through the grace window', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let resolveFn!: (value: string) => void;
+      const fetchData = vi.fn(
+        () => new Promise<string>((resolve) => (resolveFn = resolve))
+      );
+
+      function Owner() {
+        const fetchValue = useInjectable(fetchData);
+        useRun(fetchValue, []);
+        return (
+          <Suspense fallback={<div>loading…</div>}>
+            <SuspenseReader fetchValue={fetchValue} />
+          </Suspense>
+        );
+      }
+
+      try {
+        render(<Owner />);
+        expect(screen.getByText('loading…')).toBeDefined();
+        // Well past the grace window with the call still pending: the
+        // in-flight promise is exactly what the reader suspends on, so no
+        // stall warning may fire.
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+        });
+        expect(
+          warn.mock.calls.filter((call) =>
+            String(call[0]).includes('useSuspenseResult')
+          )
+        ).toEqual([]);
+        await act(async () => {
+          resolveFn('late data');
+        });
+        expect(await screen.findByText('late data')).toBeDefined();
+        expect(fetchData).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   describe('keepPreviousData', () => {

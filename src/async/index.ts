@@ -336,7 +336,11 @@ export function usePlaceholderData<AF extends AsyncFunc>(
 // error boundary instead of silently hanging the fallback.
 const suspenseKey = Symbol('suspense in-flight promise');
 
-type SuspenseSlot = {promise: Promise<any> | undefined};
+type SuspenseSlot = {
+  promise: Promise<any> | undefined;
+  /** DEV-only: one stall warning per injectable (see warnIfSuspenseStalled). */
+  stallWarned?: boolean;
+};
 
 /** Lazily creates and returns the shared in-flight slot of an injectable. */
 function getSuspenseSlot(fn: Func): SuspenseSlot {
@@ -349,12 +353,43 @@ function getSuspenseSlot(fn: Func): SuspenseSlot {
   return slot;
 }
 
+// DEV-only stall detector. `firstResultPromise` below never settles while
+// no call runs, so a driver that is never started leaves the boundary on
+// its fallback forever — the deadlock the docs warn about (a driver inside
+// the suspended subtree never runs its effects). The warning waits out a
+// grace window first: a suspension thrown during the first render pass is
+// EXPECTED to outlive the pass — the driver (a parent's useRun) starts
+// from an effect, which runs only after this render committed the
+// fallback. Only when the window passes with no result AND no in-flight
+// call does the heuristic conclude nobody is coming. It is a hint, not an
+// error: a deliberately delayed driver (debounced input, enable gating)
+// may still start later.
+const suspenseStallGraceMs = 1000;
+
+/** Schedules the one-shot DEV stall warning of a fresh suspension. */
+function warnIfSuspenseStalled(store: ResultStore, slot: SuspenseSlot): void {
+  if (slot.stallWarned) return;
+  slot.stallWarned = true;
+  setTimeout(() => {
+    if (store.hasResult || slot.promise !== undefined) return;
+    // eslint-disable-next-line no-console -- the dev warning IS the feature
+    console.warn(
+      'useSuspenseResult: suspended with no call in flight and no result ' +
+        'yet — a driver that never starts leaves this boundary on its ' +
+        'fallback forever. Start the fetch from a parent OUTSIDE the ' +
+        'Suspense boundary (useRun or a manual call); a driver inside the ' +
+        'suspended subtree never runs.'
+    );
+  }, suspenseStallGraceMs);
+}
+
 // Suspends until the shared result store publishes anything: the listener
 // removes itself on the first result, so an abandoned suspension (e.g. the
 // boundary unmounted before any call settled) never leaks. Used when no
 // in-flight promise has been recorded yet — the fetch has simply not been
 // started, e.g. it is driven from outside the suspended subtree or starts
-// later in the same render pass.
+// later in the same render pass. Never settles while no call runs: the
+// DEV-only stall warning above is the only signal that deadlock emits.
 function firstResultPromise(store: ResultStore): Promise<void> {
   return new Promise((resolve) => {
     const wake = () => {
@@ -375,9 +410,12 @@ function firstResultPromise(store: ResultStore): Promise<void> {
  * stays the job of `useRun`, polling, or manual calls. Note that a subtree
  * suspended on its initial mount never commits and so never runs its
  * effects: a `useRun` driving the first load must live outside the
- * suspended subtree (or the call must be started before/elsewhere). Once
- * the first result has arrived, every later result flows in through the
- * shared result store exactly like `useResult`.
+ * suspended subtree (or the call must be started before/elsewhere). If the
+ * grace window of ~1s passes with no result and no call in flight, DEV
+ * builds warn about the stalled suspension — a driver that never starts
+ * leaves the boundary on its fallback forever. Once the first result has
+ * arrived, every later result flows in through the shared result store
+ * exactly like `useResult`.
  *
  * @param injectableFn the wrapped async function
  * @returns the result (the component suspends until the first one exists)
@@ -448,6 +486,11 @@ export function useSuspenseResult<AF extends AsyncFunc>(
   );
 
   if (store.hasResult) return result;
+
+  // DEV-only stall detector: fires when the grace window passes with no
+  // result and no in-flight call — the "driver never started" deadlock.
+  if (process.env.NODE_ENV !== 'production')
+    warnIfSuspenseStalled(store, slot);
 
   // Suspend: on the recorded in-flight promise when someone has already
   // started the call (rejections then reach the error boundary), otherwise
