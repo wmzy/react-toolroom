@@ -1,6 +1,6 @@
 import {AsyncFunc, CacheProvider, Func} from '@@/types';
 import {noop, stableHash} from '@@/util';
-import {emitStale, getStaleStore} from './base';
+import {emitKeyedStale, getKeyedStore, trimTrailingSignal} from './base';
 import {getInjectContext} from './inject';
 
 /**
@@ -126,8 +126,9 @@ export function getObservedSet<K extends any[]>(
  * consumer's wrapper has seen among them is re-run through the injectable's
  * full wrapper chain: a hard cache miss that refetches, writes the fresh
  * result and broadcasts it to every subscriber, exactly like a focus
- * revalidation. The shared stale flag is raised first so subscribers can
- * render their refreshing indicator.
+ * revalidation. The purged key's stale verdict is raised first (per key,
+ * in the keyed store) so subscribers displaying that key can render their
+ * refreshing indicator — consumers displaying other args are untouched.
  *
  * `seen` is the consumer's own Map of structurally-keyed args tuples — owned
  * by the hook instance, dropped with it on unmount, so a departed consumer's
@@ -156,9 +157,19 @@ export function bindCacheRevalidation<K extends any[]>(
         if (seen.has(key) && !pending.has(key)) hits.push(args);
       }
       if (hits.length === 0) return;
-      emitStale(getStaleStore(injectableFn), true);
+      // Raise the stale verdict of each purged key FIRST — per key, not
+      // globally: a consumer displaying OTHER args must not see its data
+      // flagged stale by an entry it never showed. The verdict rides the
+      // keyed store (see emitKeyedStale), so it lands on the slot of the
+      // re-run tuple and is cleared by that run's success.
+      const keyedStore = getKeyedStore(injectableFn);
       for (const args of hits) {
         pending.add(stableHash(args));
+        emitKeyedStale(
+          keyedStore,
+          stableHash(trimTrailingSignal(args)),
+          true
+        );
         // Fire-and-forget like the old active revalidation: failures surface
         // through the target's error store (useError), never as an unhandled
         // rejection on the mutating call's promise.

@@ -85,16 +85,15 @@ import {
   ResultStore,
   claimErrorEmission,
   emitError,
+  emitKeyedStale,
   emitLoading,
   emitResult,
-  emitStale,
   beginKeyedCall,
   emitKeyedError,
   getKeyedStore,
   getErrorStore,
   getLoadingStore,
   getResultStore,
-  getStaleStore,
   nextErrorSeq,
   nextKeyedErrorSeq,
   nextResultSeq,
@@ -466,11 +465,14 @@ export function useSuspenseResult<AF extends AsyncFunc>(
  * it is found (SWR semantics): subscribers render the cached value at once
  * and are updated again when a background refetch completes.
  *
- * `stale` is shared state too, just like the result: every `useCache`
- * consumer of the same injectable reads one broadcast flag and updates
- * together, with the last staleness verdict of any registered wrapper
- * winning. Each consumer still registers its own wrapper, so a call still
- * performs the cache lookup once per consumer.
+ * `stale` is keyed state, just like the result's provenance: each args
+ * tuple carries its own verdict in the injectable's keyed store, and the
+ * hook returns the verdict of the tuple the displayed result was fetched
+ * with — one tuple going stale can no longer flip the flag of another
+ * tuple's display. With a single args tuple (the common case) every
+ * consumer still reads one shared verdict and updates together. Each
+ * consumer still registers its own wrapper, so a call still performs the
+ * cache lookup once per consumer.
  *
  * Invalidation is provider-driven: the `invalidates` option of
  * `useMutation` and `invalidate()` only purge the provider, and this hook
@@ -497,7 +499,10 @@ export function useCache<AF extends AsyncFunc>(
   staleTime = 0
 ) {
   const store = getResultStore(injectableFn);
-  const staleStore = getStaleStore(injectableFn);
+  // Staleness lives per key in the keyed store (see emitKeyedStale): with
+  // several args tuples in flight, one tuple's verdict can no longer
+  // clobber another's on a single injectable-level flag.
+  const keyedStore = getKeyedStore(injectableFn);
   // This consumer's own seen-set: every args tuple its wrapper below has
   // fetched, structurally keyed with the latest raw tuple winning. It is
   // hook-local state, dropped on unmount, so a departed consumer's queries
@@ -505,12 +510,20 @@ export function useCache<AF extends AsyncFunc>(
   const seenRef = useRef<Map<string, any[]>>(undefined);
   if (!seenRef.current) seenRef.current = new Map();
   const seen = seenRef.current;
-  // The boolean snapshot is stable by nature, so unchanged emissions bail
-  // out of re-renders exactly like the old local setState did.
-  const stale = useStoreValue(
-    staleStore,
-    useCallback(() => staleStore.stale, [staleStore])
-  );
+  // The verdict of the DISPLAYED key: `lastKey` is the structural args key
+  // the displayed result was fetched with (emitResult maintains it), so
+  // the boolean reads the tuple actually on screen — the useArgsStatus
+  // subscription pattern (keyed version + result provenance), but with a
+  // boolean snapshot so unchanged verdicts still bail out of re-renders.
+  // No result (or provenance unknown — an optimistic snapshot, the
+  // accumulated pages of useInfinite) means no key to have a verdict for:
+  // false, the absent default.
+  const readStale = useCallback(() => {
+    if (!store.hasResult || store.lastKey === undefined) return false;
+    return keyedStore.keyed.get(store.lastKey)?.stale === true;
+  }, [store, keyedStore]);
+  useStoreValue(keyedStore, readStale);
+  const stale = useStoreValue(store, readStale);
 
   useEffect(cacheProvider.use, []);
 
@@ -579,6 +592,9 @@ export function useCache<AF extends AsyncFunc>(
         seen.set(key, args);
         observedSet.add(key);
         const seq = nextResultSeq(store);
+        // The provenance-scoped key every verdict below addresses — the
+        // same derivation emitResult stamps into the store (`lastKey`).
+        const verdictKey = stableHash(trimTrailingSignal(args));
         const refetch = () => {
           const publish = thru<R<AF>>((r) => {
             // With a load-capable provider the settle write-back belongs to
@@ -586,7 +602,7 @@ export function useCache<AF extends AsyncFunc>(
             // landed mid-flight); the legacy path keeps its write-through.
             if (!cacheProvider.load) cacheProvider.set(args, r);
             emitResult(store, r, seq, args);
-            emitStale(staleStore, false);
+            emitKeyedStale(keyedStore, verdictKey, false);
           });
           // Routing through `load` shares ONE in-flight promise across every
           // consumer of these args — and every other channel using the same
@@ -607,7 +623,7 @@ export function useCache<AF extends AsyncFunc>(
             if (!cached) return refetch();
             const [data, cachedAt] = cached;
             const isStale = Date.now() - cachedAt >= staleTime;
-            emitStale(staleStore, isStale);
+            emitKeyedStale(keyedStore, verdictKey, isStale);
             // Broadcast the cached data right away so every subscriber
             // renders it without waiting for the network. The cached value
             // was fetched with these very args, so they are recorded as

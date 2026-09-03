@@ -3306,6 +3306,154 @@ describe('async hooks', () => {
       });
     });
 
+    it('should keep stale verdicts per-key — purging one seen args never flags another key\'s display', async () => {
+      const cache = createMemoryCacheProvider<string, [number]>();
+      let calls = 0;
+      const pending: Array<(v: string) => void> = [];
+      const fetchUser = vi.fn((id: number) => {
+        calls += 1;
+        // The two useRun-driven calls resolve; every revalidation the
+        // purges trigger below is held pending so the display cannot move
+        // on its own.
+        if (calls <= 2) return Promise.resolve(`user ${id}`);
+        return new Promise<string>((resolve) => pending.push(resolve));
+      });
+
+      function TestComponent({id}: {id: number}) {
+        const injectable = useInjectable(fetchUser);
+        // Long staleTime: nothing goes stale on its own — only a purge can
+        // raise a verdict.
+        const isStale = useCache(injectable, cache, 60000);
+        useRun(injectable, [id]);
+        return <span data-testid='stale'>{isStale ? 'stale' : 'fresh'}</span>;
+      }
+
+      const {rerender} = render(<TestComponent id={1} />);
+      await waitFor(() => expect(fetchUser).toHaveBeenCalledTimes(1));
+      rerender(<TestComponent id={2} />);
+      await waitFor(() => expect(fetchUser).toHaveBeenCalledTimes(2));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      });
+      // The display is [2]'s result, and it is fresh.
+      expect(screen.getByTestId('stale').textContent).toBe('fresh');
+
+      // Purge [1] — a key this consumer has SEEN, but not the one on
+      // display. Its re-run is held pending. The old injectable-level
+      // stale flag flipped every consumer here; the per-key verdict lands
+      // on [1]'s slot and leaves [2]'s display untouched.
+      await act(async () => {
+        invalidate([[cache, 1]]);
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(3); // [1] re-run, pending
+      expect(screen.getByTestId('stale').textContent).toBe('fresh');
+
+      // Purging the DISPLAYED key flags exactly that key…
+      await act(async () => {
+        invalidate([[cache, 2]]);
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(4); // [2] re-run, pending
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('stale');
+      });
+
+      // …and each verdict clears when its own re-run succeeds: [1]'s
+      // success takes the display with a cleared verdict, while [2]'s
+      // still-pending verdict lives only on its own slot.
+      await act(async () => {
+        pending[0]!('user 1 v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('fresh');
+      });
+      await act(async () => {
+        pending[1]!('user 2 v2');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('fresh');
+      });
+    });
+
+    it('should report each args tuple\'s own staleness verdict on interleaved cache hits', async () => {
+      const cache = createMemoryCacheProvider<string, [number]>();
+      // Every refetch hangs forever, so a stale verdict stays raised until
+      // the test flips keys — exactly the window the assertions read.
+      const fetchUser = vi.fn(
+        (id: number) => new Promise<string>(() => {}) // never settles
+      );
+      cache.set([1], 'user 1 old');
+      // Let [1] age past staleTime while [2] is written fresh.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      });
+      cache.set([2], 'user 2 fresh');
+
+      function TestComponent() {
+        const injectable = useInjectable(fetchUser);
+        const isStale = useCache(injectable, cache, 30);
+        const data = useResult(injectable);
+        return (
+          <div>
+            <span data-testid='data'>{data ?? 'no result'}</span>
+            <span data-testid='stale'>{isStale ? 'stale' : 'fresh'}</span>
+            <button
+              data-testid='key-1'
+              type='button'
+              onClick={() => {
+                injectable(1);
+              }}
+            >
+              key 1
+            </button>
+            <button
+              data-testid='key-2'
+              type='button'
+              onClick={() => {
+                injectable(2);
+              }}
+            >
+              key 2
+            </button>
+          </div>
+        );
+      }
+
+      render(<TestComponent />);
+
+      // Stale hit on [1]: cached data broadcast, [1]'s verdict raised.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('key-1'));
+      });
+      expect(screen.getByTestId('data').textContent).toBe('user 1 old');
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('stale');
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(1); // the hanging refetch
+
+      // Fresh hit on [2]: display moves, and the flag follows the
+      // DISPLAYED key — [1]'s raised verdict cannot leak into it.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('key-2'));
+      });
+      expect(screen.getByTestId('data').textContent).toBe('user 2 fresh');
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('fresh');
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(1); // no refetch: fresh
+
+      // Back to [1]: its own verdict is raised again. The refetch joins
+      // the still-pending request through the provider's in-flight `load`
+      // slot (never-settling promise), so no second fetch leaves.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('key-1'));
+      });
+      expect(screen.getByTestId('data').textContent).toBe('user 1 old');
+      await waitFor(() => {
+        expect(screen.getByTestId('stale').textContent).toBe('stale');
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(1);
+    });
+
     it('should share one in-flight request across independent injectables using the same provider', async () => {
       let resolveFn!: (v: string) => void;
       const fetchData = vi.fn(

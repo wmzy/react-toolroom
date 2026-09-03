@@ -312,7 +312,7 @@ function UserList() {
 }
 ```
 
-命中缓存时，缓存值**立即**广播给所有订阅者——组件不用等网络就能渲染出数据。若缓存已超过 `staleTime`（默认 `0`：每次命中都重新验证），会触发后台 refetch，完成后更新所有人；后台 refetch 的失败被静默吞掉，过期数据继续留在屏幕上。默认参数下，`createMemoryCacheProvider()` 永久保留条目（`cacheTime: Infinity`）并用 `stableHash` 计算键；设置了有限 `cacheTime` 时，一旦没有任何组件在使用，缓存会在该时长后自行清空。返回的 `stale` 同样是共享状态：同一 injectable 的所有 `useCache` 消费者读取同一个广播标志、一起更新，最后一次判定生效。
+命中缓存时，缓存值**立即**广播给所有订阅者——组件不用等网络就能渲染出数据。若缓存已超过 `staleTime`（默认 `0`：每次命中都重新验证），会触发后台 refetch，完成后更新所有人；后台 refetch 的失败被静默吞掉，过期数据继续留在屏幕上。默认参数下，`createMemoryCacheProvider()` 永久保留条目（`cacheTime: Infinity`）并用 `stableHash` 计算键；设置了有限 `cacheTime` 时，一旦没有任何组件在使用，缓存会在该时长后自行清空。返回的 `stale` 是**按键（per-key）状态**：每个参数元组在 injectable 的 keyed store 里有自己的过期判定，hook 返回的是「当前展示的结果当初是用哪个元组取的」那条判定——同一 injectable 服务多个参数元组时，一个元组过期不会翻转另一个元组的展示（invalidate 某个键也不会让正展示其他键的屏幕被标过期）。单一参数元组下，所有消费者依然共享同一判定、一起更新。
 
 ### mutation 之后失效缓存 — `useInvalidate`
 
@@ -440,7 +440,7 @@ invalidate([feedCache]);
 失效寻址的是 **cache provider**，而不是任何 injectable：provider 是数据的宿主（通常是模块级常量，import 即得），injectable——hook 实例身份、跨组件传递很别扭——只拥有状态广播。前缀参数在编译期按元素逐一对照 provider 的键元组做类型检查。每个目标的行为：
 
 1. **清除。** 裸 provider 直接整体清空；`[provider, ...argsPrefix]` 元组经 provider 的 `deleteWhere` 只删除参数元组在结构上延伸自该前缀的条目——`[feedCache, 'news']` 不会碰 `sports` 的条目——匹配发生在参数空间，任何 `hash` 约定下都成立。这是纯缓存操作：不触碰任何 injectable、不发请求、也不要求有挂载中的消费者——这也是为什么一块已卸载的屏幕只需 provider 在手即可被清除。
-2. **被动重验证。** `useCache` 订阅其 provider 的删除事件：只要消费者见过的条目被移除——无论是 `invalidate`、`invalidates`、`deletePrefix`、DevTools 面板按钮还是过期，任何写入者——这些参数元组就会经 wrapper 链重跑：一次硬缓存 miss，重新请求并把新结果广播给所有订阅者，与焦点重验证完全同一机制。共享的 `stale` 标志先置起，订阅者可以借此渲染"刷新中"指示。一次删除事件无论到达多少消费者，同一参数元组只重跑一次（在飞行程重验证去重）。没有存活消费者时不重跑，但被清空的缓存已经保证下次挂载拿到的是新数据，而不是 mutation 前的旧值。
+2. **被动重验证。** `useCache` 订阅其 provider 的删除事件：只要消费者见过的条目被移除——无论是 `invalidate`、`invalidates`、`deletePrefix`、DevTools 面板按钮还是过期，任何写入者——这些参数元组就会经 wrapper 链重跑：一次硬缓存 miss，重新请求并把新结果广播给所有订阅者，与焦点重验证完全同一机制。被清除键的 stale 判定先按键置起（keyed store，非全局），订阅者可以借此渲染"刷新中"指示——展示其他参数的消费者不受影响。一次删除事件无论到达多少消费者，同一参数元组只重跑一次（在飞行程重验证去重）。没有存活消费者时不重跑，但被清空的缓存已经保证下次挂载拿到的是新数据，而不是 mutation 前的旧值。
 
 与 TanStack Query `invalidateQueries` 的对照：
 
@@ -702,7 +702,7 @@ function App() {
 | `useRetry(fn, shouldRetry)` | `shouldRetry(failureCount, e)` 返回 `true` 就重试；返回 `Promise` 则等它落定后再重试（可实现退避）。预设简写：`useRetry(fn, {retries = 3, backoff = 'exponential'})`——`'exponential'` 依次等待 1s/2s/4s…，`'linear'` 1s/2s/3s…，或传 `(attempt) => ms` 自定义间隔；两种签名共用同一机制。预设策略的每次间隔带 ±25% 抖动（`[0.75, 1.25]` 均匀系数），避免多端同步重试；自定义函数完全自管时序。调用携带的 `AbortSignal` 中止时（`useRun(..., {signal: true})` 的卸载/依赖变更）终止重试循环：退避等待立即落定，不再发起下一次请求。 |
 | `useRun(fn, args, options?)` | 挂载时及 `args` 变化时执行 `fn(...args)`。同一 injectable 的并发同参 run 共享在飞行请求（条目随落定消亡；`{signal: true}` 的 run 在 abort 时同步让位；普通函数不参与）。`{signal: true}` 会向末尾追加 `AbortSignal` 参数，并在变化/卸载时 abort；`{hash}`（如 `stableHash`）用结构化键取代引用比较，`args` 里的不稳定引用只在真正变化时才重跑——与 `useCache` 的键语义一致。普通（非 injectable）函数经 `isInjectable` 探测后直接执行。 |
 | `useMutation(mutation, options?)` | `useRun` 的写操作侧对应物：返回 `[mutate, status, reset]`——引用稳定的 `mutate`（即 injectable 本身，rejection 继续上抛）、injectable 级共享状态（`isMutating` / `error` / `failureCount` / `status`，与 `useLoading`/`useError` 共用 store），以及只清除已落定失败记录、不作废在飞行程票据的 `reset`。`status` 是 TanStack 同款的派生生命周期 `'idle' \| 'pending' \| 'success' \| 'error'`，走 `isMutating` 的时钟：调用发起即 `pending`（scope 排队中的调用等待期间就计入）、最近一次落定为 `success`/`error`、任何调用之前与 `reset` 之后为 `idle`。hook 级 `onMutate` / `onSuccess` / `onError` / `onSettled` 回调经 ref 漏斗始终拿到最新闭包（内联 options 对象没问题）；单次调用的回调直接写在返回的 promise 的 `.then`/`.catch` 上。`invalidates: [cache, [cache, ...argsPrefix], …]` 在成功时清除目标 provider（见 `invalidate`）——挂载中的消费者经删除事件自行刷新。`scope: key | ((…args) => key)` 把同 key 调用串成 FIFO 链（TanStack `mutationKey` + `scope`）：排队中的调用等所有更早的同 scope 调用 settle 后才执行——失败不断链、模块级链在卸载后依然执行、排队中的调用从发起就计入 `isMutating`；不同 key 并行，不传 `scope` 行为不变。乐观快照与手动刷新在同一 injectable 上组合 `useOptimistic` / `useInvalidate` 即可。 |
-| `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——该标志是同一 injectable 所有 `useCache` 消费者共享的广播状态，一起更新（最后一次判定生效）。同时订阅 provider 的删除事件——任何清除缓存的写入者（`invalidate` / `invalidates`、`deletePrefix`、DevTools 面板按钮、过期）都会让挂载中的消费者重新请求并广播。 |
+| `useCache(fn, cacheProvider, staleTime = 0)` | SWR 缓存：命中立即广播；过期条目后台重新验证。返回当前数据是否过期——**按键（per-key）判定**：每个参数元组在 injectable 的 keyed store 里持有自己的过期标志，hook 返回展示结果所属元组的那条（单参数场景下消费者依然共享一条、一起更新）。同时订阅 provider 的删除事件——任何清除缓存的写入者（`invalidate` / `invalidates`、`deletePrefix`、DevTools 面板按钮、过期）都会让挂载中的消费者重新请求并广播；被清除键的 stale 判定先按键置起，展示其他参数的消费者不受影响。 |
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |

@@ -89,23 +89,13 @@ export type ResultStore = {
 };
 
 /**
- * Broadcast store counting the in-flight calls of an injectable. Like the
- * result store it lives on the injectable's context and is shared by every
- * consumer.
+ * Broadcast store counting the in-flight calls of an injectable. Like
+ * the result store it lives on the injectable's context and is shared by
+ * every consumer.
  */
 export type LoadingStore = {
   count: number;
   listeners: Set<(count: number) => void>;
-};
-
-/**
- * Broadcast store holding the staleness flag of an injectable. Like the
- * result store it lives on the injectable's context and is shared by every
- * consumer.
- */
-export type StaleStore = {
-  stale: boolean;
-  listeners: Set<(stale: boolean) => void>;
 };
 
 /**
@@ -132,18 +122,24 @@ export type ErrorStore = {
 
 /**
  * Per-args-key bookkeeping shared by every wrapper of one injectable: an
- * in-flight count and the last settle outcome per structural key. It is
- * the observable surface behind {@link useArgsStatus}-style hooks, which
- * read a single key's slots — so two concurrent calls with different args
- * of the same injectable report independently instead of overwriting each
- * other's injectable-level `loading`/`error`. Never rendered directly.
+ * in-flight count, the last settle outcome and the staleness verdict per
+ * structural key. It is the observable surface behind
+ * {@link useArgsStatus}-style hooks, which read a single key's slots — so
+ * two concurrent calls with different args of the same injectable report
+ * independently instead of overwriting each other's injectable-level
+ * `loading`/`error`. The per-key `stale` field gives `useCache` the same
+ * independence: verdicts of different args tuples no longer clobber each
+ * other on one injectable-level flag. Never rendered directly.
  */
 export type KeyedStore = {
   /** One entry per key any live call has started under. Bounded: clean
    * fully-drained keys are reclaimed by the store's own settle/release
    * paths, and failure slots (observable by contract) are capped at
    * {@link KEYED_SLOTS_LIMIT} with oldest-quiescent-first eviction. */
-  keyed: Map<string, {count: number; error: any; failureCount: number}>;
+  keyed: Map<
+    string,
+    {count: number; error: any; failureCount: number; stale?: boolean}
+  >;
   /**
    * Monotonic version bumped on EVERY keyed mutation; the single
    * subscription point for `useStoreValue` consumers (a per-key listener
@@ -158,7 +154,6 @@ export type KeyedStore = {
 // stores must only be reached through the helpers below.
 const resultKey = Symbol('result store');
 const loadingKey = Symbol('loading store');
-const staleKey = Symbol('stale store');
 const errorKey = Symbol('error store');
 const keyedKey = Symbol('keyed store');
 
@@ -206,17 +201,6 @@ export function getLoadingStore(fn: Func): LoadingStore {
   if (!store) {
     store = {listeners: new Set(), count: 0};
     context[loadingKey] = store;
-  }
-  return store;
-}
-
-/** Lazily creates and returns the shared stale store of an injectable. */
-export function getStaleStore(fn: Func): StaleStore {
-  const context = getInjectContext(fn);
-  let store = context[staleKey] as StaleStore | undefined;
-  if (!store) {
-    store = {listeners: new Set(), stale: false};
-    context[staleKey] = store;
   }
   return store;
 }
@@ -326,10 +310,38 @@ export function emitLoading(store: LoadingStore, count: number) {
   for (const listener of store.listeners) listener(count);
 }
 
-/** Updates the stale flag and broadcasts it to every subscriber. */
-export function emitStale(store: StaleStore, stale: boolean) {
-  store.stale = stale;
-  for (const listener of store.listeners) listener(stale);
+/**
+ * Records one key's staleness verdict and broadcasts it to every
+ * subscriber of the keyed store — the per-key successor of the old
+ * injectable-level stale flag. With several args tuples in flight, one
+ * tuple's verdict can no longer clobber another's: `useCache` consumers
+ * read the verdict of the key their displayed result was fetched with.
+ *
+ * `false` is the absent default, so clearing a verdict never materializes
+ * a slot (and a `{stale: false}`-only slot is reclaimable); `true` is
+ * contract state — "the data of THIS key on display is outdated" — so it
+ * keeps the slot alive against the reclaim below, exactly like a failure
+ * outcome, and leaves through the retention cap's eviction instead.
+ */
+export function emitKeyedStale(
+  store: KeyedStore,
+  key: string,
+  stale: boolean
+) {
+  let slot = store.keyed.get(key);
+  if (!slot) {
+    if (!stale) return;
+    slot = {count: 0, error: undefined, failureCount: 0, stale: true};
+    store.keyed.set(key, slot);
+    evictKeyedSlots(store, key);
+  } else {
+    slot.stale = stale;
+    // Clearing was the last observable content of a drained slot — hand
+    // it to the reclaim the settle paths use.
+    if (!stale) reclaimKeyedSlot(store, key);
+  }
+  store.version += 1;
+  for (const listener of store.listeners) listener(store.version);
 }
 
 /** Lazily creates and returns the shared keyed bookkeeping of an injectable. */
@@ -502,10 +514,17 @@ const keyedQuiescent = (
 // keyed status hooks, so no version bump accompanies the reclaim.
 // Failure slots are NOT reclaimable here: their outcome is contract state
 // ("a later same-args success clears it") — they leave through the cap
-// below instead.
+// below instead. A `stale: true` verdict is contract state too ("the data
+// of this key on display is outdated", see {@link emitKeyedStale}) and is
+// protected the same way.
 function reclaimKeyedSlot(store: KeyedStore, key: string): boolean {
   const slot = store.keyed.get(key);
-  if (!slot || slot.error !== undefined || slot.failureCount !== 0)
+  if (
+    !slot ||
+    slot.error !== undefined ||
+    slot.failureCount !== 0 ||
+    slot.stale
+  )
     return false;
   if (!keyedQuiescent(store, key, slot)) return false;
   store.keyed.delete(key);
@@ -517,12 +536,14 @@ function reclaimKeyedSlot(store: KeyedStore, key: string): boolean {
 // without bound: a failure slot is kept observable by contract, so an app
 // enumerating many distinct args (infinite scroll, filter churn) would
 // retain one slot — key string, Error reference and all — per args tuple
-// it ever failed on, forever. When an insertion exceeds the cap the
-// OLDEST quiescent slot (never one with live calls or pending tickets, so
-// the begin/release pairing invariants are untouched) is evicted, slot
-// and guard entry together. Eviction is observable (a displayed per-key
-// error disappears) — the trade every bounded observability surface makes;
-// insertion order doubles as the LRU clock, refreshed on every begin.
+// it ever failed on, forever; an uncleared `stale: true` verdict keeps
+// its slot the same way. When an insertion exceeds the cap the OLDEST
+// quiescent slot (never one with live calls or pending tickets, so the
+// begin/release pairing invariants are untouched) is evicted, slot and
+// guard entry together. Eviction is observable (a displayed per-key
+// error — or stale verdict — disappears) — the trade every bounded
+// observability surface makes; insertion order doubles as the LRU clock,
+// refreshed on every begin.
 export const KEYED_SLOTS_LIMIT = 100;
 
 // Enforces {@link KEYED_SLOTS_LIMIT}: called after `keep` was inserted
