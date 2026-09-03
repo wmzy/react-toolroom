@@ -603,7 +603,7 @@ function ProjectFeed() {
 
 双向分页：可选传入 `getPreviousPageParam(firstPage, allPages, firstPageParam, allPageParams)`，`fetchPreviousPage()` 会把新页前插到 `pages` 头部；不传则 `hasPreviousPage` 恒为 `false`，`fetchPreviousPage()` 是空操作。可选 `maxPages`（默认 `Infinity` 不设限）给窗口设上限：前向抓取超限时裁掉最旧的页，后向抓取裁掉最新的页，`pages` 与 `pageParams` 同步裁剪——由于边界标志是每次渲染从当前页推导的，被裁掉的一端只要还能推导出参数就重新变为可抓取。
 
-只有经 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；其它任何调用（`useRun` 重跑、手动调用、焦点重验证）都会把 `pages`/`pageParams` 重置为该次结果，因此 refetch 天然从头开始。`getNextPageParam(lastPage, allPages, lastPageParam, allPageParams)` 返回 `undefined` 即到末尾（`hasNextPage` 变为 `false`）。
+只有经 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；其它任何调用（`useRun` 重跑、手动调用、焦点重验证）都会把 `pages`/`pageParams` 重置为该次结果，因此 refetch 天然从头开始。`getNextPageParam(lastPage, allPages, lastPageParam, allPageParams)` 返回 `undefined` 即到末尾（`hasNextPage` 变为 `false`）。`fetchNextPage`/`fetchPreviousPage` 按方向做在飞防抖（TanStack 默认行为）：某方向的请求还在飞行中时（首次落定前的双击），同方向的后续调用以 `undefined` 空操作收场，不会从同一份 pages 再推导同一参数把页重复追加/前插；两个方向互相独立。
 
 ### 观察每一次调用 — `subscribeInjectEvents`
 
@@ -706,7 +706,7 @@ function App() {
 | `useInvalidate(fn, cacheProvider)` | 返回稳定的 `(...args) => Promise<R>`：删除 `args` 下的缓存条目并立刻用这些参数重跑 injectable——面向 mutation 成功路径的硬失效。经由相同 provider 与参数元组与 `useCache` 键联动。 |
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
-| `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
+| `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表（按方向在飞防抖——TanStack 默认行为）；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
 | `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash})` | 此处为便捷再导出——详见上方核心表。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。每轮落定结果都会记录到错误通道（`useError`/`useArgsStatus`），即使 tick 时无一挂载——之后挂载的读者仍能看到无人观看期间发生的失败，下一次成功 tick 将其清除。`args` 命中与 `useRun(fn, args)` 相同的 `useCache` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。传 `cacheProvider` 时按条目年龄门控——TanStack `refetchOnWindowFocus` 配 `staleTime` 的语义：年龄小于 `staleTime` 跳过重取，缺失/过期才重取；不传 provider 每次事件都重验证。rejection 走错误通道、无人认领则静默吞掉，绝不产生 unhandled rejection。 |

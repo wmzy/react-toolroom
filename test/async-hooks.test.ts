@@ -1799,6 +1799,121 @@ describe('useInfinite', () => {
     expect(screen.getByText('pages:p5')).toBeDefined();
     expect(screen.getByText('params:5')).toBeDefined();
   });
+
+  it('should dedupe rapid fetchNextPage double-clicks to one request and one page', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+    const outcomes: Promise<unknown>[] = [];
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor
+      });
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () => {
+              // a double click: the second call fires while the first is
+              // still in flight
+              outcomes.push(fetchNextPage());
+              outcomes.push(fetchNextPage());
+            }
+          },
+          'more-twice'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p0')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('more-twice'));
+    });
+    // both calls derived the same param from the same pages, but only one
+    // request fired
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1]).toEqual([1]);
+
+    await act(async () => {
+      resolvers[1]!();
+    });
+    // and only one page was appended
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+    await act(async () => {
+      // the first call resolves with the grown pages; the second no-ops
+      // with undefined, like an exhausted boundary
+      expect(await outcomes[0]).toEqual(['p0', 'p1']);
+      expect(await outcomes[1]).toBeUndefined();
+    });
+  });
+
+  it('should dedupe rapid fetchPreviousPage double-clicks to one prepend', async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchPreviousPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor,
+        getPreviousPageParam: prevCursor
+      });
+      useRun(fetchPages, [1]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () => {
+              void fetchPreviousPage();
+              void fetchPreviousPage();
+            }
+          },
+          'earlier-twice'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    expect(screen.getByText('pages:p1')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('earlier-twice'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1]).toEqual([0]);
+
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+  });
 });
 
 describe('useRetry preset options', () => {

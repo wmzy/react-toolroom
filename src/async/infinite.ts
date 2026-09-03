@@ -11,7 +11,16 @@ import {useInject} from './inject';
 // doubles as the store snapshot.
 type PageDir = 'next' | 'prev';
 
-type InfiniteState = {pages: any[]; pageParams: any[]; pendingDirs: PageDir[]};
+// `pendingNext`/`pendingPrev` hold the in-flight fetch of each direction:
+// a second call while one is in flight would re-derive the same param from
+// the same pages and append/prepend the page twice (see fetchNextPage).
+type InfiniteState = {
+  pages: any[];
+  pageParams: any[];
+  pendingDirs: PageDir[];
+  pendingNext?: Promise<any>;
+  pendingPrev?: Promise<any>;
+};
 
 const infiniteStates = new WeakMap<Func, InfiniteState>();
 
@@ -48,7 +57,13 @@ function stateOf(fn: Func): InfiniteState {
  * restarts the list (at the refetched page's param). The first page is
  * therefore driven exactly like any other query (`useRun(fetchPages,
  * [initialParam])` or a manual call); this hook never starts requests on
- * its own.
+ * its own. `fetchNextPage`/`fetchPreviousPage` are in-flight debounced
+ * per direction: while a fetch of one direction is still in flight, later
+ * calls of the SAME direction no-op (returning `undefined`, like an
+ * exhausted boundary) instead of re-deriving the same param from the same
+ * pages and appending/prepending the page twice — TanStack
+ * `fetchNextPage`'s default in-flight behavior. The two directions stay
+ * independent: a forward and a backward fetch can be in flight together.
  *
  * `maxPages` (default `Infinity`) caps the window: when a fetch would
  * leave more pages than that, the far end is trimmed — `fetchNextPage`
@@ -207,6 +222,12 @@ export function useInfinite<AF extends AsyncFunc>(
 
   const [isFetchingNextPage, setFetchingNextPage] = useState(false);
   const fetchNextPage = useCallback(async (): Promise<R<AF>[] | undefined> => {
+    // In-flight debounce: a rapid second click (or a second consumer of
+    // the same injectable) re-derives the SAME param from the same pages,
+    // queues a second 'next' mark, and the FIFO verdict appends the page
+    // twice. While a forward fetch is in flight, later calls no-op —
+    // TanStack `fetchNextPage`'s default in-flight behavior.
+    if (state.pendingNext) return undefined;
     const current = state.pages;
     const params = state.pageParams;
     const next = current.length
@@ -222,11 +243,12 @@ export function useInfinite<AF extends AsyncFunc>(
     // consumes the mark when the call flows through it.
     state.pendingDirs.push('next');
     setFetchingNextPage(true);
+    const call = injectableFn(next as Parameters<AF>[0]) as Promise<R<AF>[]>;
+    state.pendingNext = call;
     try {
-      return await (injectableFn(next as Parameters<AF>[0]) as Promise<
-        R<AF>[]
-      >);
+      return await call;
     } finally {
+      state.pendingNext = undefined;
       setFetchingNextPage(false);
     }
   }, [injectableFn, getNextPageParam, state]);
@@ -238,6 +260,10 @@ export function useInfinite<AF extends AsyncFunc>(
     // Without the option there is no way to derive an earlier param —
     // stay a no-op, like fetchNextPage at the end of the list.
     if (!getPreviousPageParam) return undefined;
+    // In-flight debounce, mirroring fetchNextPage (see the comment
+    // there): a backward fetch in flight makes later calls no-op instead
+    // of prepending the same page twice.
+    if (state.pendingPrev) return undefined;
     const current = state.pages;
     const params = state.pageParams;
     const prev = current.length
@@ -248,11 +274,12 @@ export function useInfinite<AF extends AsyncFunc>(
     // consumes the mark when the call flows through it.
     state.pendingDirs.push('prev');
     setFetchingPreviousPage(true);
+    const call = injectableFn(prev as Parameters<AF>[0]) as Promise<R<AF>[]>;
+    state.pendingPrev = call;
     try {
-      return await (injectableFn(prev as Parameters<AF>[0]) as Promise<
-        R<AF>[]
-      >);
+      return await call;
     } finally {
+      state.pendingPrev = undefined;
       setFetchingPreviousPage(false);
     }
   }, [injectableFn, getPreviousPageParam, state]);
