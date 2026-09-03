@@ -65,6 +65,10 @@ function withCycleGuard(value: object, hash: () => string): string {
  * Object keys are sorted, and `Map` entries / `Set` values are sorted, so that
  * equivalent values with different insertion order hash identically. Function
  * references get a per-reference incrementing id (same reference, same hash).
+ * Symbols fold to a discriminating placeholder: the registry key for
+ * registered ones (`sym#…`), the description for the rest (`sym:…`);
+ * anonymous symbols — and distinct symbols sharing a description — collide
+ * on purpose, since nothing distinguishes them structurally.
  * `AbortSignal` maps to the fixed placeholder `'#sig'` so that keyed caches stay
  * stable across calls that pass a fresh signal. Circular references map to
  * `'#circ'` instead of throwing.
@@ -88,7 +92,17 @@ export function stableHash(value: any): string {
     }
     return id;
   }
-  if (type === 'symbol') return 'sym';
+  if (type === 'symbol') {
+    // Registered symbols (Symbol.for) carry a global identity — hash the
+    // registry key. Unregistered ones only expose their description:
+    // hash it, accepting that two distinct symbols sharing a description
+    // collide (documented), and anonymous symbols all fold to one
+    // placeholder — there is nothing to tell them apart by.
+    const key = Symbol.keyFor(value);
+    if (key !== undefined) return `sym#${key}`;
+    const desc = value.description;
+    return desc === undefined ? 'sym' : `sym:${desc}`;
+  }
   if (value instanceof Date) {
     return `d:${Number.isNaN(value.getTime()) ? 'Invalid' : value.toISOString()}`;
   }

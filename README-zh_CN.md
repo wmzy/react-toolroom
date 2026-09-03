@@ -674,7 +674,7 @@ function App() {
 | `memo(Component, options?)` | 自动 memoize 事件处理器 props 的 `React.memo`，从此不需要 `useCallback`。`options`：`{testEvent?, propsAreEqual?}` 或直接传 `propsAreEqual(prev, next)` 函数。 |
 | `memoBase(Component, {testEvent, propsAreEqual?})` | 底层变体：必须传完整 options 对象，不帮你填默认值。 |
 | `defaultTestEvent(key)` | 默认的 `testEvent`：`/^on[A-Z]/.test(key)`。 |
-| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
+| `stableHash(value)` | 结构化哈希：对象键排序、支持 `Map`/`Set`、循环引用安全、`AbortSignal` 映射为固定占位符，symbol 按注册键（`sym#…`）或 description（`sym:…`）折叠——匿名 symbol 与同 description 的不同 symbol 刻意碰撞。两个入口均可导入；是 `createMemoryCacheProvider` 的默认 `hash`，也可以作为自定义键的基础构件，如 `hash: (args) => 'user:' + stableHash(args)`。 |
 | `createMemoryCacheProvider({cacheTime?, hash?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
 | `isAbortSignal(value)` | 判断值是否为 `AbortSignal`：`instanceof` 快路径加鸭子类型回退（`aborted` 属性 + `addEventListener` 函数），因此跨 realm 的 signal（iframe、测试替身）乃至没有全局 `AbortSignal` 的环境都能正确识别。两个入口均可导入；是 `stableHash` 的 signal 占位符与 `useRun` signal 桥的基础。 |
 

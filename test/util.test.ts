@@ -264,12 +264,29 @@ describe('util', () => {
       expect(stableHash(new Set([1, 2]))).not.toBe(stableHash(new Set([1, 3])));
     });
 
-    it('should hash every symbol to one placeholder', () => {
-      expect(stableHash(Symbol('a'))).toBe('sym');
-      expect(stableHash(Symbol('b'))).toBe(stableHash(Symbol('a')));
-      expect(stableHash({tag: Symbol('a')})).toBe(
+    it('should hash symbols by registry key or description', () => {
+      // Registered symbols carry a global identity: same key, same hash;
+      // different keys, different hashes.
+      expect(stableHash(Symbol.for('shared'))).toBe(
+        stableHash(Symbol.for('shared'))
+      );
+      expect(stableHash(Symbol.for('a'))).not.toBe(stableHash(Symbol.for('b')));
+      // Unregistered symbols hash by description.
+      expect(stableHash(Symbol('a'))).not.toBe(stableHash(Symbol('b')));
+      expect(stableHash({tag: Symbol('a')})).not.toBe(
         stableHash({tag: Symbol('b')})
       );
+      // A registered and an unregistered symbol never collide, even with
+      // the same name — the two placeholder forms differ (`sym#` vs `sym:`).
+      expect(stableHash(Symbol.for('a'))).not.toBe(stableHash(Symbol('a')));
+    });
+
+    it('should keep same-description collisions and fold anonymous symbols', () => {
+      // Documented behavior: two distinct symbols sharing a description
+      // are structurally indistinguishable, so they collide.
+      expect(stableHash(Symbol('a'))).toBe(stableHash(Symbol('a')));
+      // Anonymous symbols (no description) all fold to one placeholder.
+      expect(stableHash(Symbol())).toBe(stableHash(Symbol()));
     });
 
     it('should mark invalid dates distinctly from valid ones', () => {
