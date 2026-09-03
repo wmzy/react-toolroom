@@ -96,6 +96,41 @@ describe('async hooks', () => {
       expect(fn).toHaveBeenLastCalledWith({page: 2});
     });
 
+    it('should re-request when switching args and again when switching back (no cacheProvider)', async () => {
+      // The no-cache contract, pinned: without a cacheProvider there is no
+      // memory between runs — every args change is a fresh request, and
+      // returning to a previously fetched key fetches again instead of
+      // serving the old result.
+      const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+
+      function TestComponent({id}: {id: number}) {
+        const injectable = useInjectable(fetchUser);
+        useRun(injectable, [id]);
+        const data = useResult(injectable);
+        return <span>{data ?? 'none'}</span>;
+      }
+
+      const {rerender} = render(<TestComponent id={1} />);
+      await waitFor(() => {
+        expect(screen.getByText('user 1')).toBeDefined();
+      });
+      rerender(<TestComponent id={2} />);
+      // The id=2 run takes the display only once its own result lands —
+      // keep-previous-data shows 'user 1' until then.
+      await waitFor(() => {
+        expect(screen.getByText('user 2')).toBeDefined();
+      });
+      // Switching back is a THIRD request: nothing cached the first one.
+      rerender(<TestComponent id={1} />);
+      await waitFor(() => {
+        expect(screen.getByText('user 1')).toBeDefined();
+      });
+      expect(fetchUser).toHaveBeenCalledTimes(3);
+      expect(fetchUser).toHaveBeenNthCalledWith(1, 1);
+      expect(fetchUser).toHaveBeenNthCalledWith(2, 2);
+      expect(fetchUser).toHaveBeenNthCalledWith(3, 1);
+    });
+
     it('should support plain (non-injectable) functions with the signal option', () => {
       const received: {id: number; signal: AbortSignal}[] = [];
       // Deliberately NOT wrapped in useInjectable: useRun must detect it
@@ -5783,6 +5818,63 @@ describe('useArgsStatus (per-key loading and error)', () => {
     // {next, applied}) per args key forever, the reviewer's ~65B/key
     // A/B heap delta.
     expect(keyedSeqs.get(keyed)?.size ?? 0).toBe(0);
+  });
+
+  it('an uncleared stale verdict keeps its keyed slot; clearing it releases the slot', async () => {
+    // Regression of the per-key stale migration (StaleStore → keyed
+    // field): `stale: true` is contract state like a failure outcome —
+    // reclaimable never — while clearing the verdict is the last
+    // observable content of a drained slot and releases it.
+    const cache = createMemoryCacheProvider<string, [number]>();
+    let resolveRefetch!: (v: string) => void;
+    let calls = 0;
+    const fetchUser = vi.fn((id: number) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(`user ${id}`);
+      return new Promise<string>((resolve) => (resolveRefetch = resolve));
+    });
+    let injectable!: (id: number) => Promise<string>;
+    let isStale!: boolean;
+    function TestComponent() {
+      const fn = useInjectable(fetchUser);
+      injectable = fn;
+      isStale = useCache(fn, cache, 30);
+      useRun(fn, [1]);
+      return null;
+    }
+    render(<TestComponent />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    });
+    expect(isStale).toBe(false);
+    // The settled, drained first call left no slot behind…
+    const {getKeyedStore} = await import('../src/async/base');
+    expect(getKeyedStore(injectable).keyed.size).toBe(0);
+
+    // …the stale cache hit materializes one holding the raised verdict,
+    // and the hanging background refetch keeps it alive.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    await act(async () => {
+      await injectable(1);
+    });
+    await waitFor(() => {
+      expect(isStale).toBe(true);
+    });
+    const keyed = getKeyedStore(injectable);
+    expect(keyed.keyed.size).toBe(1);
+    expect(keyed.keyed.get(stableHash([1]))?.stale).toBe(true);
+
+    // The refetch succeeds: the verdict clears and the drained slot goes
+    // with it — no per-key retention for resolved staleness either.
+    await act(async () => {
+      resolveRefetch!('user 1 v2');
+    });
+    await waitFor(() => {
+      expect(isStale).toBe(false);
+    });
+    expect(keyed.keyed.size).toBe(0);
   });
 
   it('failure slots are capped: 300 failed distinct args retain at most KEYED_SLOTS_LIMIT', async () => {
