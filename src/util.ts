@@ -194,3 +194,26 @@ export function stripVolatile(value: any): any {
   }
   return value;
 }
+
+/**
+ * Derive a cache key from an args tuple in one step — the composition
+ * {@link stableHash}`(`{@link stripVolatile}`(args))`.
+ *
+ * The multi-channel key contract as a single call: signals stripped at
+ * every depth, `undefined`-valued object keys folded away, then hashed
+ * structurally. When several channels assemble the same entity's args
+ * differently — a router loader handing the provider a schema output
+ * (defaulted fields absent, no signal) vs a view handing its state object
+ * (defaulted fields as `undefined` properties) plus the trailing
+ * `AbortSignal` a `useRun` rerun attached — every one of them lands on ONE
+ * key without each call site hand-writing the composition. The signature
+ * also slots straight into the `hash` options of
+ * `createMemoryCacheProvider` and `useRun` for caches whose tuples carry
+ * volatile slots.
+ *
+ * @param args the argument tuple to hash
+ * @returns the structural hash of the normalized tuple
+ */
+export function hashArgs(args: unknown[]): string {
+  return stableHash(stripVolatile(args));
+}

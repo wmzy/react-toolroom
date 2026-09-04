@@ -7,7 +7,8 @@ import {
   getDisplayName,
   stableHash,
   isAbortSignal,
-  stripVolatile
+  stripVolatile,
+  hashArgs
 } from '../src/util';
 
 describe('util', () => {
@@ -404,6 +405,76 @@ describe('util', () => {
       expect(stripVolatile(map)).toBe(map);
       const set = new Set([1]);
       expect(stripVolatile(set)).toBe(set);
+    });
+  });
+
+  describe('hashArgs', () => {
+    it('should equal stableHash(stripVolatile(args)) byte for byte', () => {
+      const controller = new AbortController();
+      const tuples: unknown[][] = [
+        [],
+        [1, 'a', true],
+        [{offset: 0, limit: 10}],
+        [{offset: 0, tag: undefined}, controller.signal],
+        [controller.signal, {a: {signal: controller.signal, b: [1]}}],
+        [new Map([['a', 1]]), new Set([1, 2])],
+        [[new Date(0), null]]
+      ];
+      for (const tuple of tuples) {
+        expect(hashArgs(tuple)).toBe(stableHash(stripVolatile(tuple)));
+      }
+    });
+
+    it('should strip signals recursively — top level and nested', () => {
+      const controller = new AbortController();
+      // a top-level signal slot disappears entirely
+      expect(hashArgs([controller.signal])).toBe(hashArgs([]));
+      // nested object values and array slots too
+      expect(hashArgs([{a: {signal: controller.signal, b: 2}}])).toBe(
+        hashArgs([{a: {b: 2}}])
+      );
+      expect(hashArgs([[controller.signal, 1]])).toBe(hashArgs([[1]]));
+      // fresh signal instances collapse like any other
+      expect(hashArgs([new AbortController().signal])).toBe(hashArgs([]));
+    });
+
+    it('should fold undefined-valued keys into one key', () => {
+      // the loader side (schema output, defaulted field absent) and the
+      // view side (state object, defaulted field undefined) share a key
+      expect(hashArgs([{offset: 0, limit: 10}])).toBe(
+        hashArgs([{offset: 0, limit: 10, tag: undefined}])
+      );
+      // a real field value still separates the keys
+      expect(hashArgs([{offset: 0}])).not.toBe(hashArgs([{offset: 10}]));
+    });
+
+    it('should pass Map/Set contents through to stableHash', () => {
+      // stripVolatile hands Map/Set through untouched; stableHash folds
+      // their entries — equal contents in different insertion orders land
+      // on one key, and signal VALUES inside fold to the placeholder.
+      const controller = new AbortController();
+      expect(
+        hashArgs([
+          new Map([
+            ['a', 1],
+            ['b', 2]
+          ])
+        ])
+      ).toBe(
+        hashArgs([
+          new Map([
+            ['b', 2],
+            ['a', 1]
+          ])
+        ])
+      );
+      expect(hashArgs([new Set([1, 2])])).toBe(hashArgs([new Set([2, 1])]));
+      expect(hashArgs([new Map([['s', controller.signal]])])).toBe(
+        hashArgs([new Map([['s', new AbortController().signal]])])
+      );
+      expect(hashArgs([new Map([['a', 1]])])).toBe(
+        stableHash([new Map([['a', 1]])])
+      );
     });
   });
 });

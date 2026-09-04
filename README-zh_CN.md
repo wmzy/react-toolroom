@@ -697,6 +697,7 @@ function App() {
 | `createMemoryCacheProvider({cacheTime?, hash?, persist?})` | 内存版 `CacheProvider`：条目三态（已落定数据、in-flight 请求、或两者并存），`load` 是 in-flight 槽的原子 get-or-insert——并发同键读取共享一次请求，`cacheTime` 到期的闲置条目按条回收。`persist` 把全部已落定条目镜像到 `localStorage`——`{v, data}` 版本门禁、`cachedAt` 保留（真实年龄 SWR）、事件驱动的镜像写盘（写前 diff）、跨 tab storage 收敛、`clear()` 擦盘、`enabled` 挂起。与框架无关——router loader 与非 React 代码可从核心入口直接导入。 |
 | `isAbortSignal(value)` | 判断值是否为 `AbortSignal`：`instanceof` 快路径加鸭子类型回退（`aborted` 属性 + `addEventListener` 函数），因此跨 realm 的 signal（iframe、测试替身）乃至没有全局 `AbortSignal` 的环境都能正确识别。两个入口均可导入；是 `stableHash` 的 signal 占位符与 `useRun` signal 桥的基础。 |
 | `stripVolatile(value)` | 多通道 key 的递归归一：全深度剥 `AbortSignal`（顶层、数组槽位、对象值——经 `isAbortSignal` 跨 realm 可判）与值为 `undefined` 的对象键，`stableHash(stripVolatile(args))` 让各渠道组装的同一实体参数落到同一个 key——loader 交给 provider 的 schema 输出（缺省字段无键、无 signal）vs 视图的状态对象（缺省字段为 undefined 属性）加上 `useRun` 重跑附带的尾部 signal。数组保持剩余槽位顺序；`Map`/`Set` 原样透传；不做循环引用防护。两个入口均可导入。 |
+| `hashArgs(args)` | 参数元组的一步式 cache key 推导——`stableHash(stripVolatile(args))` 组合的一等导出，多通道调用点不必各自手写。哈希前先全深度剥 signal、折叠值为 `undefined` 的键：loader 侧 schema 输出与视图侧状态对象（加上尾部 `AbortSignal`）落到同一个 key。形状与 `hash` 选项一致——带易变槽位的元组可直接 `createMemoryCacheProvider({hash: hashArgs})` 或 `useRun(fn, args, {hash: hashArgs})`。两个入口均可导入。 |
 
 ### Async — `react-toolroom/async`
 
@@ -733,6 +734,7 @@ function App() {
 | `useReconnectRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。与 `useFocusRevalidate` 相同的 `cacheProvider`/`staleTime` 年龄门控；rejection 绝不产生 unhandled rejection。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
 | `stableHash(value)` | 此处为便捷再导出——见上方核心表。 |
 | `stripVolatile(value)` | 此处为便捷再导出——见上方核心表。多通道 key 的归一工具，配 `stableHash(stripVolatile(args))` 使用。 |
+| `hashArgs(args)` | 此处为便捷再导出——见上方核心表。多通道 key 组合的一步式形态，可直接作 `hash` 选项。 |
 
 ### DevTools — `react-toolroom/devtools`
 

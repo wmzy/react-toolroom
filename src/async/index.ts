@@ -1889,4 +1889,4 @@ export type {
   CreateMutationBinder,
   PersistOptions
 } from '@@/types';
-export {stableHash, isAbortSignal, stripVolatile} from '@@/util';
+export {stableHash, isAbortSignal, stripVolatile, hashArgs} from '@@/util';
