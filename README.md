@@ -69,6 +69,8 @@ Copy the one closest to your screen, swap in your fetcher, and adjust the common
 
 For the server side of the story — priming caches in the App Router, hydration, and what does and does not work inside React Server Components — see the [Next.js / RSC integration guide](./docs/nextjs-rsc.md).
 
+For the render-cost side of the story — why a settle always produces new references (no structural sharing), what that costs your `React.memo` boundaries, and how to keep re-renders cheap (scalar props, stable `on*` identities, `useResultSelect` slices, reference-preserving writes) — see the recipe [No structural sharing: the memo strategy](./docs/no-structural-sharing.md).
+
 ## Quick start
 
 ### Core: `memo`, the `useCallback`-free `React.memo`
@@ -886,6 +888,7 @@ See [demos](./demos/) for runnable examples: `memo`, request deduplication, poll
 [API documentation](https://wmzy.github.io/react-toolroom/)
 
 - [Migrating from TanStack Query](./docs/from-tanstack-query.md) — concept mapping (`useQuery`/`useMutation`/`gcTime`/`staleTime` → hooks/providers/`cacheTime`), optimistic updates, and what is intentionally out of scope.
+- [No structural sharing: the memo strategy](./docs/no-structural-sharing.md) — why settles always produce new references, the O(payload) tradeoff behind it, and the correct mitigations: scalar props + `React.memo`, stable `on*` identities via the core `memo`, `useResultSelect` primitive slices, reference-preserving mutation writes — with painless `ArticlePreview` as the worked example.
 
 ## Related Projects
 

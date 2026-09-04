@@ -69,6 +69,8 @@ React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。
 
 至于服务端的部分——在 App Router 中预热缓存、hydration、以及 React Server Components 里哪些能用哪些不能用——见 [Next.js / RSC 集成指南](./docs/nextjs-rsc.md)。
 
+至于渲染成本的部分——为何 settle 必然产生新引用（无结构共享）、这对 `React.memo` 边界意味着什么、以及如何让重渲染保持廉价（标量 props、`on*` 稳定身份、`useResultSelect` 切片、保引用的写路径）——见 recipe [无结构共享的 memo 策略](./docs/no-structural-sharing.md)。
+
 ## 快速上手
 
 ### 核心：`memo`，不需要 `useCallback` 的 `React.memo`
@@ -772,6 +774,8 @@ function App() {
 ## 文档
 
 [API 文档](https://wmzy.github.io/react-toolroom/)
+
+- [无结构共享的 memo 策略](./docs/no-structural-sharing.md)——settle 必新引用的设计取舍（拒绝每次请求 O(payload) 深比较）、正确缓解（标量 props + `React.memo`、core `memo` 稳定 `on*` 身份、`useResultSelect` 原始值切片、保引用的 mutation 写路径）与反例（memo 边界收对象 props 形同虚设），以 painless `ArticlePreview` 为实例。
 
 ## 相关项目
 
