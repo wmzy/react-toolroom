@@ -489,8 +489,7 @@ export function useSuspenseResult<AF extends AsyncFunc>(
 
   // DEV-only stall detector: fires when the grace window passes with no
   // result and no in-flight call — the "driver never started" deadlock.
-  if (process.env.NODE_ENV !== 'production')
-    warnIfSuspenseStalled(store, slot);
+  if (process.env.NODE_ENV !== 'production') warnIfSuspenseStalled(store, slot);
 
   // Suspend: on the recorded in-flight promise when someone has already
   // started the call (rejections then reach the error boundary), otherwise
@@ -1211,7 +1210,11 @@ function presetShouldRetry(
   },
   retries = options.retries ?? 3,
   backoff = options.backoff ?? 'exponential'
-): (failureCount: number, e: any, signal?: AbortSignal) => boolean | Promise<any> {
+): (
+  failureCount: number,
+  e: any,
+  signal?: AbortSignal
+) => boolean | Promise<any> {
   return (failureCount, e, signal) => {
     if (failureCount >= retries) return false;
     const base =
@@ -1232,12 +1235,16 @@ function presetShouldRetry(
       // Abort-aware sleep: an aborted call settles the backoff right
       // away with `false` (retry verdict "no"), timer cleared, so the
       // useRetry loop terminates instead of idling through a delay for
-      // an attempt nobody will consume.
+      // an attempt nobody will consume. `timer` is declared before
+      // `onAbort` references it — the abort listener is attached only
+      // after the timeout exists, so the TDZ order is also the runtime
+      // order, but the rule reads the declaration order.
+      let timer: ReturnType<typeof setTimeout>;
       const onAbort = () => {
         clearTimeout(timer);
         resolve(false);
       };
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         signal?.removeEventListener('abort', onAbort);
         resolve(true);
       }, delay);
@@ -1328,9 +1335,7 @@ export function useRetry<AF extends AsyncFunc>(
         // useRun appends it to the very tuple this wrapper receives.
         const last = args[args.length - 1];
         const signal = (callContext.signal ??
-          (isAbortSignal(last) ? last : undefined)) as
-          | AbortSignal
-          | undefined;
+          (isAbortSignal(last) ? last : undefined)) as AbortSignal | undefined;
         const cancelled = () => signal?.aborted === true;
         let n = 0;
         const run = (): Promise<any> =>

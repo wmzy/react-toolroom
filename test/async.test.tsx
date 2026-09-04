@@ -3341,7 +3341,7 @@ describe('async hooks', () => {
       });
     });
 
-    it('should keep stale verdicts per-key — purging one seen args never flags another key\'s display', async () => {
+    it("should keep stale verdicts per-key — purging one seen args never flags another key's display", async () => {
       const cache = createMemoryCacheProvider<string, [number]>();
       let calls = 0;
       const pending: Array<(v: string) => void> = [];
@@ -3409,7 +3409,7 @@ describe('async hooks', () => {
       });
     });
 
-    it('should report each args tuple\'s own staleness verdict on interleaved cache hits', async () => {
+    it("should report each args tuple's own staleness verdict on interleaved cache hits", async () => {
       const cache = createMemoryCacheProvider<string, [number]>();
       // Every refetch hangs forever, so a stale verdict stays raised until
       // the test flips keys — exactly the window the assertions read.

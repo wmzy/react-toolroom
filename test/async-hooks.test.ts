@@ -57,9 +57,11 @@ describe('错误认领语义：挂 useError 即吞（与链尾 catch wrapper 等
       const fail = () => Promise.reject(new Error('boom-old'));
       function OldStyle() {
         const injectable = useInjectable(fail);
-        useInject(injectable, (g) =>
-          ((...a: Parameters<typeof fail>) =>
-            g(...a).catch(() => undefined)) as typeof fail
+        useInject(
+          injectable,
+          (g) =>
+            ((...a: Parameters<typeof fail>) =>
+              g(...a).catch(() => undefined)) as typeof fail
         );
         // 渲染期早调用只发一次：不防重的话，settle 触发的重渲染会再次
         // 调用——渲染期调用 + 订阅的组合自身就是循环，与吞错无关。
@@ -116,9 +118,11 @@ describe('错误认领语义：挂 useError 即吞（与链尾 catch wrapper 等
           const injectable = useInjectable(fail);
           if (claim) useError(injectable);
           else
-            useInject(injectable, (g) =>
-              ((...a: Parameters<typeof fail>) =>
-                g(...a).catch(() => undefined)) as typeof fail
+            useInject(
+              injectable,
+              (g) =>
+                ((...a: Parameters<typeof fail>) =>
+                  g(...a).catch(() => undefined)) as typeof fail
             );
           useRun(injectable, []);
           useError(injectable);

@@ -323,11 +323,7 @@ export function emitLoading(store: LoadingStore, count: number) {
  * keeps the slot alive against the reclaim below, exactly like a failure
  * outcome, and leaves through the retention cap's eviction instead.
  */
-export function emitKeyedStale(
-  store: KeyedStore,
-  key: string,
-  stale: boolean
-) {
+export function emitKeyedStale(store: KeyedStore, key: string, stale: boolean) {
   let slot = store.keyed.get(key);
   if (!slot) {
     if (!stale) return;

@@ -165,11 +165,7 @@ export function bindCacheRevalidation<K extends any[]>(
       const keyedStore = getKeyedStore(injectableFn);
       for (const args of hits) {
         pending.add(stableHash(args));
-        emitKeyedStale(
-          keyedStore,
-          stableHash(trimTrailingSignal(args)),
-          true
-        );
+        emitKeyedStale(keyedStore, stableHash(trimTrailingSignal(args)), true);
         // Fire-and-forget like the old active revalidation: failures surface
         // through the target's error store (useError), never as an unhandled
         // rejection on the mutating call's promise.
