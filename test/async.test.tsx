@@ -35,10 +35,11 @@ import {
   useFocusRevalidate,
   useReconnectRevalidate,
   useArgsStatus,
+  useKeyedResult,
   stableHash,
   isAbortSignal
 } from '../src/async';
-import type {ArgsStatus} from '../src/async';
+import type {ArgsStatus, KeyedResult} from '../src/async';
 import {trimTrailingSignal, useLoadingFn} from '../src/async/base';
 import {useInjectBefore} from '../src/async/inject';
 
@@ -6216,6 +6217,162 @@ describe('useArgsStatus (per-key loading and error)', () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+describe('useKeyedResult (keyed result reading)', () => {
+  // The result store is injectable-level and single-value: `lastResult` is
+  // swapped in place and only the provenance stamp (`lastKey`) says which
+  // args tuple fetched what is on display. Bare `useResult` therefore reads
+  // "the last settle" — on a multi-args screen that crosses wires between
+  // tuples. useKeyedResult is that read gated by provenance, so these tests
+  // pin the exact scenarios `useResult` cannot serve.
+  it('alternating settles keep each consumer on its own key: data, loading, dataUpdatedAt', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    const fetchData = vi.fn(
+      (id: string) =>
+        new Promise<string>((resolve) => {
+          resolvers[id] = resolve;
+        })
+    );
+    let injectable!: (id: string) => Promise<string>;
+    let latestA!: KeyedResult<string>;
+    let latestB!: KeyedResult<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latestA = useKeyedResult(fn, ['a']);
+      latestB = useKeyedResult(fn, ['b']);
+      return null;
+    }
+    render(<TestComponent />);
+
+    // Nothing ran: every field reads its "no display" value.
+    expect(latestA).toEqual({
+      data: undefined,
+      dataUpdatedAt: undefined,
+      loading: false,
+      error: undefined
+    });
+
+    const now = vi.spyOn(Date, 'now');
+    try {
+      // Two concurrent calls, different args, one injectable.
+      now.mockReturnValue(1_000);
+      let pa!: Promise<string>;
+      let pb!: Promise<string>;
+      await act(async () => {
+        pa = injectable('a');
+        pb = injectable('b');
+      });
+      expect(latestA.loading).toBe(true);
+      expect(latestB.loading).toBe(true);
+
+      // `a` settles: ONLY a's read flips — b keeps loading with no data
+      // (the injectable-level stores still say a call is in flight).
+      await act(async () => {
+        resolvers['a']!('A');
+        await pa;
+      });
+      expect(latestA.data).toBe('A');
+      expect(latestA.loading).toBe(false);
+      expect(latestA.dataUpdatedAt).toBe(1_000);
+      expect(latestB.data).toBeUndefined();
+      expect(latestB.loading).toBe(true);
+
+      // `b` settles LAST — the shared store's lastResult becomes 'B' and
+      // provenance moves with it. a's keyed read drops to undefined (the
+      // single-value store has no per-key retention — that is the cache
+      // provider's job); the anti-cross-wire guarantee is that a NEVER
+      // renders 'B'. Each key carries its own stamp while on display.
+      now.mockReturnValue(2_000);
+      await act(async () => {
+        resolvers['b']!('B');
+        await pb;
+      });
+      expect(latestB.data).toBe('B');
+      expect(latestB.dataUpdatedAt).toBe(2_000);
+      expect(latestA.data).toBeUndefined();
+      expect(latestA.dataUpdatedAt).toBeUndefined();
+
+      // `a` retakes the display: a's consumer moves, b's drops to
+      // undefined together — provenance gates both directions.
+      now.mockReturnValue(3_000);
+      let pa2!: Promise<string>;
+      await act(async () => {
+        pa2 = injectable('a');
+      });
+      await act(async () => {
+        resolvers['a']!('A2');
+        await pa2;
+      });
+      expect(latestA.data).toBe('A2');
+      expect(latestA.dataUpdatedAt).toBe(3_000);
+      expect(latestB.data).toBeUndefined();
+      expect(latestB.dataUpdatedAt).toBeUndefined();
+      expect(latestB.loading).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('a key failure surfaces on that key only, cleared by its own success', async () => {
+    let failBad = true;
+    const resolvers: Record<string, () => void> = {};
+    const fetchData = vi.fn(
+      (id: string) =>
+        new Promise<string>((resolve, reject) => {
+          resolvers[id] =
+            id === 'bad' && failBad
+              ? () => reject(new Error('boom'))
+              : () => resolve(id);
+        })
+    );
+    let injectable!: (id: string) => Promise<string>;
+    let latestGood!: KeyedResult<string>;
+    let latestBad!: KeyedResult<string>;
+    function TestComponent() {
+      const fn = useInjectable(fetchData);
+      injectable = fn;
+      latestGood = useKeyedResult(fn, ['good']);
+      latestBad = useKeyedResult(fn, ['bad']);
+      return null;
+    }
+    render(<TestComponent />);
+
+    await act(async () => {
+      void injectable('good');
+      // Reading the error slot claims the keyed failure — the rejection
+      // resolves undefined at the call boundary instead of dangling.
+      void injectable('bad');
+    });
+    await act(async () => {
+      resolvers['good']!();
+    });
+    // `good` settled first: provenance is on it, its data reads back.
+    expect(latestGood.data).toBe('good');
+    expect(latestGood.error).toBeUndefined();
+
+    await act(async () => {
+      resolvers['bad']!();
+    });
+    // The rejection surfaces ONLY on the bad key — and it does not clobber
+    // the good key's display (failures never move provenance).
+    expect(latestBad.error).toBeInstanceOf(Error);
+    expect(latestBad.data).toBeUndefined();
+    expect(latestGood.error).toBeUndefined();
+    expect(latestGood.data).toBe('good');
+
+    // A same-key success clears its own slot; the sibling is untouched.
+    failBad = false;
+    await act(async () => {
+      void injectable('bad');
+    });
+    await act(async () => {
+      resolvers['bad']!();
+    });
+    expect(latestBad.error).toBeUndefined();
+    expect(latestGood.error).toBeUndefined();
   });
 });
 

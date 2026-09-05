@@ -50,6 +50,8 @@ React Toolroom does not try to be a full server-state manager. It gives you the 
 
 **Choose react-toolroom** for small-to-mid applications, for embedding inside a component library, or when you only want to cherry-pick a few capabilities at minimal cost. **Choose TanStack Query** when you want a managed server-state client — cache-wide invalidation by query-key predicates, mutation-to-query coordination handled by the client itself, persistence plugins, and its full DevTools.
 
+One storage boundary follows from the design and is worth knowing up front: an injectable's result store is a single broadcast slot, so `useResult` reads the **last settle**, whatever args produced it (that is what makes keep-previous-data the default and renders cheap). Screens driving one injectable with several argument sets read through the keyed channel instead — `useKeyedResult(fn, args)` / `useArgsStatus(fn, args)` — which is the per-`queryKey` observer semantics TanStack gives you by construction.
+
 ## Write your project's query hook once
 
 React Toolroom ships no configurable preset hook — there is no `useQuery(options)`. That is deliberate: an options surface that re-encodes what the atomic hooks already express directly costs as much to maintain as the composition itself, and it hides the mechanism at exactly the moment you need to see it. Instead, write your project's query hook **once**, then use it everywhere — modifying that composition later is no more work than editing a config object.
@@ -627,6 +629,25 @@ const {data, dataUpdatedAt, dataUpdateCount} = useArgsStatus(fetchUser, [id]);
 - `dataUpdatedAt` — `Date.now()` of the most recent **successful** settle of exactly these args. It rides `data`'s provenance contract: a number while the displayed result was fetched with these args, `undefined` otherwise (including while a different args tuple's result is on display). Failures never touch it — a failed refetch of the same args leaves the last success stamped, so "data as of T" stays truthful across error states.
 - `dataUpdateCount` — successful settles of these args since they last took the display: `1` on the first, `+1` per same-args re-success. When these args retake the display after another tuple — or a provenance-unknown emission (an optimistic snapshot, `useInfinite`'s accumulated pages) — held it, the series restarts at `1`: it answers "the displayed data has updated N times since these args took the display", not a lifetime per-key tally. Use it as the effect dependency for "data changed" transitions (flash a row, replay an animation).
 
+### Read results keyed — `useKeyedResult(fn, args)`
+
+The result store is injectable-level and single-valued: `useResult` reads the **last settle**, whatever args produced it. On a single-args screen that is the whole story. When one injectable serves several argument sets at once — two keyed queries on one screen, a list of `Row({id})` components — whichever tuple settles last decides what every `useResult` reader renders. `useKeyedResult` is that same read gated by provenance:
+
+```tsx
+function Row({id}: {id: number}) {
+  const {data, dataUpdatedAt, loading, error} = useKeyedResult(fetchUser, [id]);
+  // Row 1 never renders user 2's data while Row 2's fetch settles, a Row 1
+  // failure never shows on Row 2 — and vice versa.
+  if (error) return <ErrorRow error={error} />;
+  if (loading && data === undefined) return <Spinner />;
+  return <UserCard user={data} fetchedAt={dataUpdatedAt} />;
+}
+```
+
+`data` is the shared last result exactly while it was fetched with these args — `undefined` while a different tuple's result is on display (the single-value store has no per-key retention; keeping each key's data across displays is the cache provider's job, and `useCache` refetches broadcast straight back into the keyed read). `dataUpdatedAt` rides the same contract, and `loading`/`error` are the per-key slots of the keyed store, so sibling calls with other args never flip them.
+
+The hook is a typed projection over `useArgsStatus` — same keyed mechanism, same subscriptions, no separate bookkeeping — with `data: R<AF> | undefined` instead of `any`, which is the whole point: the result channel with the key contract baked into the types. Everything true of `useArgsStatus` is true here, including that mounting it claims the injectable's errors (see [Errors as state](#errors-as-state--reading-claims-them)). The observability extras (`failureCount`, `dataUpdateCount`) stay on `useArgsStatus`; the two hooks share one keyed store.
+
 ### Suspend instead of a skeleton — `useSuspenseResult`
 
 ```tsx
@@ -829,6 +850,7 @@ The registry lists instances; it does not touch behavior. Every per-instance sto
 | `useInitialLoading(fn)` | `true` while a call is in flight and no result exists yet (SWR `isLoading`). |
 | `useArgsStatus(fn, args)` | Per-args observability — `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly one args tuple (structural key, trailing `AbortSignal` ignored). The keyed counterpart of `useLoading`/`useError`: two concurrent different-args calls of one injectable report independently instead of overwriting each other's injectable-level flag. `error` is typed `Error \| undefined` by default (no assertion needed at the call site); the `E` type parameter narrows it — `useArgsStatus<typeof fn, ApiError>` reports `ApiError \| undefined`. `data` mirrors `useResult` scoped to the key: the shared result only while its provenance matches these args; `dataUpdatedAt` (settle timestamp, `Date.now()`) and `dataUpdateCount` (successes since these args took the display) ride the same provenance contract and are never touched by failures. Like `useError`, mounting it claims the instance's errors (errors-as-state, see "Errors as state"). |
 | `usePlaceholderData(fn, args, placeholderData?)` | `true` while the displayed result was not fetched with `args` — the observable flag of the default keep-previous-data behavior (structural compare via `stableHash`, trailing `AbortSignal` ignored). With `placeholderData` given, also `true` until the first result ever arrives. |
+| `useKeyedResult(fn, args)` | `useResult` scoped to one args tuple — `{data, dataUpdatedAt, loading, error}` for exactly one key (same structural key semantics as `useArgsStatus`). `data` is the shared last result gated by provenance: the value while it was fetched with these args, `undefined` while another tuple's result is on display — a sibling key's settle never renders through this reader. Typed projection over `useArgsStatus` with `data: R<AF> \| undefined` instead of `any`; mounting it claims the injectable's errors the same way (see "Errors as state"). See [Read results keyed](#read-results-keyed--usekeyedresultfn-args). |
 | `useError(fn)` | The last thrown error, broadcast from an injectable-level shared store: every consumer updates in sync, components mounted after a failure read it from the shared snapshot, and a slow old call's failure can never clobber a newer call's success (seq-protected). Cleared on success. Mounting it (or `useArgsStatus`/`useFailureCount`) claims the instance's errors: calls resolve `undefined` on failure instead of rejecting while a reader is mounted — errors-as-state by declaration (see "Errors as state"). |
 | `useFailureCount(fn)` | Number of failures since the last success (reset on success), read from the same shared error store as `useError` — late-mounting consumers see the current count. Also claims the instance's errors like `useError` does. |
 | `useCatch(fn, catcher)` | Convert rejections into fallback values via `catcher(e) => result`. |

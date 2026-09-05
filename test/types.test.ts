@@ -13,10 +13,12 @@ import {
   createMutationBinder,
   invalidate,
   useArgsStatus,
+  useKeyedResult,
   type ArgsStatus,
   type BoundMutation,
   type CacheProvider,
   type CreateMutationBinder,
+  type KeyedResult,
   type MutationSpec,
   type MutationStatus
 } from 'react-toolroom/async';
@@ -140,6 +142,28 @@ function ArgsStatusTypeProbe(props: {fn: typeof fetchUser}) {
 }
 void ArgsStatusTypeProbe;
 
+// useKeyedResult 的差异点：data 不是 any 而是 R<AF> | undefined——结果通道
+// 的类型化 keyed 读。探测组件同样永不渲染（体内只做类型收口）。
+function KeyedResultTypeProbe(props: {fn: typeof fetchUser}) {
+  const result = useKeyedResult(props.fn, [1]);
+  expectTypeOf(result.data).toEqualTypeOf<
+    {id: number; name: string} | undefined
+  >();
+  expectTypeOf(result.loading).toEqualTypeOf<boolean>();
+  expectTypeOf(result.dataUpdatedAt).toEqualTypeOf<number | undefined>();
+  expectTypeOf(result.error).toEqualTypeOf<Error | undefined>();
+  const api = useKeyedResult<typeof fetchUser, ApiError>(props.fn, [1]);
+  expectTypeOf(api.error).toEqualTypeOf<ApiError | undefined>();
+  expectTypeOf(api.data).toEqualTypeOf<
+    {id: number; name: string} | undefined
+  >();
+  // args 按元组检查：fetchUser 收 number，字符串实参编译期即拒。
+  // @ts-expect-error wrong args for (id: number) => ...
+  useKeyedResult(props.fn, ['nope']);
+  return null;
+}
+void KeyedResultTypeProbe;
+
 describe('useArgsStatus error 泛型与 useMutation status 类型契约', () => {
   it('ArgsStatus 默认实例化可构造，E 实参收窄 error 字段', () => {
     const plain: ArgsStatus = {
@@ -169,5 +193,25 @@ describe('useArgsStatus error 泛型与 useMutation status 类型契约', () => 
       'error'
     ];
     expect(phases).toHaveLength(4);
+  });
+});
+
+describe('useKeyedResult 类型契约：data 即 R<AF> | undefined', () => {
+  it('KeyedResult 默认实例化可构造，E 实参收窄 error 字段', () => {
+    const empty: KeyedResult<{id: number; name: string}> = {
+      data: undefined,
+      dataUpdatedAt: undefined,
+      loading: false,
+      error: undefined
+    };
+    expect(empty.data).toBeUndefined();
+    const filled: KeyedResult<string, ApiError> = {
+      data: 'ok',
+      dataUpdatedAt: 1_000,
+      loading: false,
+      error: new ApiError(503)
+    };
+    expect(filled.error?.code).toBe(503);
+    expectTypeOf(filled.error).toEqualTypeOf<ApiError | undefined>();
   });
 });

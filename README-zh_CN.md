@@ -50,6 +50,8 @@ React Toolroom 并不想做完整的"服务端状态管理器"。它把使用频
 
 **选 react-toolroom**：中小型应用、嵌进组件库发布、或者只想按需挑几个能力且把代价压到最小的场景。**选 TanStack Query**：想要一个托管式服务端状态客户端——按 query-key 谓词全缓存失效、由客户端自身打理的 mutation 与 query 联动、持久化插件、以及完整 DevTools 的时候。
 
+一个随设计而来的存储边界值得先知道：injectable 的 result store 是单一广播槽，`useResult` 读到的是**最后一次 settle**，无论它由哪组参数产生（这正是 keep-previous-data 成为默认行为、渲染保持廉价的原因）。同一 injectable 服务多组参数的屏幕应改走 keyed 通道——`useKeyedResult(fn, args)` / `useArgsStatus(fn, args)`——即 TanStack 由 `queryKey` 天然赋予的按 key 观察语义。
+
 ## 一次性写好你项目的 query hook
 
 React Toolroom 不提供配置式 preset hook——没有 `useQuery(options)`。这是刻意为之：把原子 hooks 已经直接表达的东西重新编码成一张选项表，维护成本与组合本身相当，还会在你最需要看清机制的时刻把它藏起来。正确姿势是：**一次性**写好你项目的 query hook，然后到处使用——之后调整这段组合，代价并不比改配置对象高。
@@ -718,6 +720,7 @@ function App() {
 | `useInitialLoading(fn)` | 有调用进行中且尚无结果时为 `true`（SWR 的 `isLoading`）。 |
 | `useArgsStatus(fn, args)` | 按参数观测——`{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` 只描述一个参数元组（结构化键，忽略末尾 `AbortSignal`）。`useLoading`/`useError` 的按 key 对应物：同一 injectable 并发服务多组参数时各自独立上报，互不覆盖对方 injectable 级的标志位。`error` 默认类型即 `Error \| undefined`（调用处无需 as 断言）；`E` 类型参数可收窄——`useArgsStatus<typeof fn, ApiError>` 得到 `ApiError \| undefined`。`data` 是收窄到该 key 的 `useResult` 契约：仅当共享结果的 provenance 匹配这组参数时非空。挂载即认领实例错误（errors-as-state，同 `useError`）。 |
 | `usePlaceholderData(fn, args, placeholderData?)` | 当前显示的结果并非由 `args` 取回时为 `true`——默认 keep-previous-data 行为的可观察标志（经 `stableHash` 结构化比较，忽略末尾追加的 `AbortSignal`）。传入 `placeholderData` 时，首个结果到来之前也为 `true`。 |
+| `useKeyedResult(fn, args)` | `useResult` 收窄到单个参数元组——`{data, dataUpdatedAt, loading, error}` 只描述一个 key（键语义与 `useArgsStatus` 一致：结构化键，忽略末尾 `AbortSignal`）。`data` 是共享最近结果经 provenance 门控后的值：展示中结果由这组参数取回时为其值，另一元组的结果在展示时为 `undefined`——兄弟 key 的落定永远不会经由这个读者渲染出来。`useArgsStatus` 之上的类型化投影（`data: R<AF> \| undefined`，而非 `any`）；挂载即同样认领 injectable 的错误（errors-as-state，同 `useError`）。多参数场景下结果读取的首选通道（见「什么时候选这个库」的存储边界说明）。 |
 | `useError(fn)` | 最近一次抛出的错误；成功时清空。错误状态挂在 injectable 级的共享广播 store 上：晚挂载的组件直接从共享快照读到上一次错误，多个消费者同步更新；写入带序号保护，慢的旧调用失败不会覆盖新调用的成功状态。 |
 | `useFailureCount(fn)` | 距上次成功以来的失败次数（成功时归零）。与 `useError` 共用 injectable 级的共享广播 store，晚挂载的组件同样从共享快照起步。 |
 | `useCatch(fn, catcher)` | 通过 `catcher(e) => result` 把 rejection 转为兜底值。 |

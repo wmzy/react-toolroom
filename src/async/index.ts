@@ -1573,6 +1573,89 @@ export function useArgsStatus<AF extends AsyncFunc, E = Error>(
   };
 }
 
+/** What {@link useKeyedResult} returns for one args key. */
+export type KeyedResult<T, E = Error> = {
+  /**
+   * The shared last result while its provenance matches these args (the
+   * displayed data was actually fetched with them), `undefined` otherwise
+   * — {@link useResult}'s contract scoped to one key, typed as
+   * `R<AF> | undefined`.
+   */
+  data: T | undefined;
+  /**
+   * `Date.now()` of the most recent successful settle of these args, under
+   * the same provenance contract as `data`. TanStack Query's
+   * `dataUpdatedAt` analogue — see {@link ArgsStatus.dataUpdatedAt} for
+   * the full field semantics.
+   */
+  dataUpdatedAt?: number;
+  /** `true` while a call with THESE args is in flight — sibling calls of
+   * the same injectable with different args do not flip it. */
+  loading: boolean;
+  /**
+   * The last error of THESE args; a later same-args success clears it.
+   * Typed by the `E` type parameter (`Error` by default) — see
+   * {@link ArgsStatus.error}.
+   */
+  error: E | undefined;
+};
+
+/**
+ * {@link useResult} scoped to one args tuple — the keyed read of the
+ * injectable's shared result store.
+ *
+ * The result store is injectable-level and single-value: `lastResult` is
+ * swapped in place, and only its provenance stamp says which args tuple
+ * fetched what is on display. Bare `useResult` therefore reads "the last
+ * settle" — right for a single-args screen, wrong when one injectable
+ * serves several argument sets at once (two keyed queries on one screen, a
+ * list of `Row({id})` components): whichever tuple settled last decides
+ * what every reader renders. This hook gates the same store by
+ * provenance: `data` is the shared last result exactly while it was
+ * fetched with THESE args, `undefined` otherwise — and `loading`/`error`
+ * are the per-key slots of the keyed store, so sibling calls with other
+ * args never flip them.
+ *
+ * A typed projection over {@link useArgsStatus} — the same keyed
+ * mechanism (structural args hash via {@link stableHash}, trailing
+ * `AbortSignal` trimmed), the same subscriptions, no separate
+ * bookkeeping. `data` is simply `R<AF> | undefined` instead of `any`,
+ * which is the whole point: this is the result channel with the key
+ * contract baked into the types. Everything true of `useArgsStatus` is
+ * true here — mounting this hook claims the injectable's errors exactly
+ * like `useError` (calls resolve `undefined` on failure instead of
+ * rejecting while a keyed reader is mounted), and each key's slots are
+ * reclaimed once its calls drain (bounded retention, see
+ * {@link useArgsStatus}). The observability extras — `failureCount`,
+ * `dataUpdateCount` — stay on `useArgsStatus`; the two hooks share one
+ * keyed store.
+ *
+ * @param injectableFn the injectable to read
+ * @param args the args tuple identifying the display slot
+ * @returns `{data, dataUpdatedAt, loading, error}` for exactly these args
+ * @example
+ * ```tsx
+ * function Row({id}: {id: number}) {
+ *   const {data, loading, error} = useKeyedResult(fetchUser, [id]);
+ *   // Row 1 keeps rendering user 1 while Row 2's fetch settles — bare
+ *   // useResult would show whichever user settled last.
+ *   if (error) return <ErrorRow error={error} />;
+ *   if (loading && data === undefined) return <Spinner />;
+ *   return <UserCard user={data} />;
+ * }
+ * ```
+ */
+export function useKeyedResult<AF extends AsyncFunc, E = Error>(
+  injectableFn: AF,
+  args: Parameters<AF>
+): KeyedResult<R<AF>, E> {
+  const {data, dataUpdatedAt, loading, error} = useArgsStatus<AF, E>(
+    injectableFn,
+    args
+  );
+  return {data, dataUpdatedAt, loading, error};
+}
+
 /**
  * Strips the trailing parameter of a signature — the slot occupied by the
  * `AbortSignal` appended when `useRun` runs with `{signal: true}`.
