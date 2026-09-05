@@ -1284,6 +1284,129 @@ describe('useInfinite', () => {
     expect(screen.getByText('pages:p0')).toBeDefined();
   });
 
+  it("resetOn: 'args' — invalidate 重跑（同 args）保留已翻页聚合", async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = vi.fn(
+      (cursor: number) =>
+        new Promise<string>((resolve) =>
+          resolvers.push(() => resolve(`p${cursor}`))
+        )
+    );
+    const cache = createMemoryCacheProvider<string, [number]>();
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      useCache(fetchPages, cache, 60000);
+      const {pages, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor,
+        resetOn: 'args'
+      });
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        ),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => invalidate([cache])},
+          'invalidate'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    // the useCache wrapper routes the call through a promise chain before
+    // the load factory runs — flush it so fetchPage(0) is actually issued
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+
+    // invalidation purges the whole provider and re-runs EVERY seen tuple —
+    // here [0] and [1], both pages the aggregation already shows. Same-args
+    // reruns must NOT collapse the paged aggregation.
+    await act(async () => {
+      fireEvent.click(screen.getByText('invalidate'));
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(4);
+    expect(fetchPage.mock.calls[2]).toEqual([0]);
+    expect(fetchPage.mock.calls[3]).toEqual([1]);
+    await act(async () => {
+      resolvers[2]!();
+      resolvers[3]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+  });
+
+  it("resetOn: 'args' — args 变化的调用仍然重置聚合", async () => {
+    const resolvers: (() => void)[] = [];
+    const fetchPage = (cursor: number) =>
+      new Promise<string>((resolve) =>
+        resolvers.push(() => resolve(`p${cursor}`))
+      );
+
+    function TestComponent() {
+      const fetchPages = useInjectable(fetchPage);
+      const {pages, fetchNextPage} = useInfinite(fetchPages, {
+        getNextPageParam: nextCursor,
+        resetOn: 'args'
+      });
+      useRun(fetchPages, [0]);
+      return createElement(
+        'div',
+        null,
+        createElement('span', null, `pages:${pages.join(',')}`),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchNextPage()},
+          'more'
+        ),
+        createElement(
+          'button',
+          {type: 'button', onClick: () => void fetchPages(5)},
+          'jump'
+        )
+      );
+    }
+
+    render(createElement(TestComponent));
+    await act(async () => {
+      resolvers[0]!();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('more'));
+    });
+    await act(async () => {
+      resolvers[1]!();
+    });
+    expect(screen.getByText('pages:p0,p1')).toBeDefined();
+
+    // a call with DIFFERENT args restarts the list at the new param —
+    // 'args' mode only shields same-args reruns
+    await act(async () => {
+      fireEvent.click(screen.getByText('jump'));
+    });
+    await act(async () => {
+      resolvers[2]!();
+    });
+    expect(screen.getByText('pages:p5')).toBeDefined();
+  });
+
   it('should return undefined from fetchNextPage with no pages and at the end', async () => {
     const resolvers: (() => void)[] = [];
     const fetchPage = vi.fn(

@@ -7,6 +7,6 @@
   {
     "name": "async",
     "path": ["dist/async.mjs"],
-    "limit": "7.5 kB"
+    "limit": "7.6 kB"
   }
 ]

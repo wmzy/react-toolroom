@@ -1,6 +1,13 @@
 import {AsyncFunc, Func, R} from '@@/types';
+import {stableHash} from '@@/util';
 import {useCallback, useState} from 'react';
-import {emitResult, getResultStore, nextResultSeq, useStoreValue} from './base';
+import {
+  emitResult,
+  getResultStore,
+  nextResultSeq,
+  trimTrailingSignal,
+  useStoreValue
+} from './base';
 import {useInject} from './inject';
 
 // Pagination state keyed by the injectable itself, following the registry
@@ -14,9 +21,19 @@ type PageDir = 'next' | 'prev';
 // `pendingNext`/`pendingPrev` hold the in-flight fetch of each direction:
 // a second call while one is in flight would re-derive the same param from
 // the same pages and append/prepend the page twice (see fetchNextPage).
+//
+// `paramKeys` holds the args-key of every page in the aggregation, parallel
+// to `pageParams` (a trailing AbortSignal is trimmed before hashing, so a
+// rerun of the same page with and without a signal compares equal) — the
+// comparison anchor of `resetOn: 'args'`: a non-directional call whose
+// args are among the current aggregation's pages is a rerun of a page it
+// already shows and keeps the list; anything else restarts it. Unlike
+// `pages`/`pageParams` it is internal-only (never a store snapshot), so it
+// mutates in place instead of swapping identities.
 type InfiniteState = {
   pages: any[];
   pageParams: any[];
+  paramKeys: string[];
   pendingDirs: PageDir[];
   pendingNext?: Promise<any>;
   pendingPrev?: Promise<any>;
@@ -27,7 +44,7 @@ const infiniteStates = new WeakMap<Func, InfiniteState>();
 function stateOf(fn: Func): InfiniteState {
   let state = infiniteStates.get(fn);
   if (!state) {
-    state = {pages: [], pageParams: [], pendingDirs: []};
+    state = {pages: [], pageParams: [], paramKeys: [], pendingDirs: []};
     infiniteStates.set(fn, state);
   }
   return state;
@@ -54,7 +71,8 @@ function stateOf(fn: Func): InfiniteState {
  * `fetchPreviousPage()` prepends it to the front; any other call — a
  * `useRun` rerun, a manual call, a `useFocusRevalidate` tick — RESETS
  * `pages`/`pageParams` to that single result, so a refetch naturally
- * restarts the list (at the refetched page's param). The first page is
+ * restarts the list (at the refetched page's param) — unless
+ * `resetOn: 'args'` (see below) shields it as a rerun. The first page is
  * therefore driven exactly like any other query (`useRun(fetchPages,
  * [initialParam])` or a manual call); this hook never starts requests on
  * its own. `fetchNextPage`/`fetchPreviousPage` are in-flight debounced
@@ -64,6 +82,22 @@ function stateOf(fn: Func): InfiniteState {
  * pages and appending/prepending the page twice — TanStack
  * `fetchNextPage`'s default in-flight behavior. The two directions stay
  * independent: a forward and a backward fetch can be in flight together.
+ *
+ * `resetOn` (default `'rerun'`) decides which non-directional calls reset
+ * the aggregation. `'rerun'` keeps the historic contract: every one of
+ * them restarts the list — right for a feed whose rerun means "the world
+ * changed". `'args'` resets only when the call's args are NOT among the
+ * pages the aggregation already shows: a same-args rerun — a `useCache`
+ * invalidation re-running the first page (or every page), a focus
+ * revalidation, a `useRun` rerun of the same args — keeps the accumulated
+ * pages on screen instead of collapsing a list the user paged through,
+ * while a genuinely different param (a filter change driving
+ * `useRun(fetchPages, [newParam])`) still restarts it. The rerun's fresh
+ * page deliberately does not enter the aggregation (it still lands in any
+ * inner cache and the loading stores); pair the mode with `useCache` when
+ * other consumers need invalidation-driven freshness while the paged list
+ * stays put. A trailing `AbortSignal` is ignored in the comparison, so a
+ * `{signal: true}` rerun of the same page counts as the same args.
  *
  * `maxPages` (default `Infinity`) caps the window: when a fetch would
  * leave more pages than that, the far end is trimmed — `fetchNextPage`
@@ -82,7 +116,9 @@ function stateOf(fn: Func): InfiniteState {
  *   allPages, firstPageParam, allPageParams)` plays the same role at the
  *   front: without it `hasPreviousPage` stays `false` and
  *   `fetchPreviousPage()` is a no-op. Optional `maxPages` bounds the
- *   window as described above.
+ *   window as described above. Optional `resetOn` (`'rerun'` by default,
+ *   `'args'` to keep the aggregation across same-args reruns) is
+ *   described above.
  * @return {{pages: R<AF>[], pageParams: any[], fetchNextPage: () => Promise<R<AF>[] | undefined>, fetchPreviousPage: () => Promise<R<AF>[] | undefined>, isFetchingNextPage: boolean, isFetchingPreviousPage: boolean, hasNextPage: boolean, hasPreviousPage: boolean}} the aggregated pages and the paging controls.
  * @example
  * ```tsx
@@ -128,6 +164,7 @@ export function useInfinite<AF extends AsyncFunc>(
       allPageParams: any[]
     ) => any | undefined;
     maxPages?: number;
+    resetOn?: 'rerun' | 'args';
   }
 ): {
   pages: R<AF>[];
@@ -144,6 +181,10 @@ export function useInfinite<AF extends AsyncFunc>(
   // away and leave nothing to derive further params from). Infinity —
   // the default — keeps the pre-maxPages behavior: pages only ever grow.
   const maxPages = Math.max(1, options.maxPages ?? Infinity);
+  // 'rerun' keeps the historic contract: EVERY non-directional call resets
+  // the aggregation. 'args' shields reruns of pages the aggregation
+  // already shows (see paramKeys).
+  const resetOn = options.resetOn ?? 'rerun';
   const store = getResultStore(injectableFn);
   const state = stateOf(injectableFn);
 
@@ -156,31 +197,58 @@ export function useInfinite<AF extends AsyncFunc>(
         // shares: with several useInfinite consumers registered on one
         // injectable, the outermost wrapper consumes the queued direction
         // and the inner ones read the same verdict instead of re-deciding
-        // (and disagreeing). The deciding wrapper's maxPages rides along,
-        // so trim and verdict always come from one consumer's options.
+        // (and disagreeing). The deciding wrapper's maxPages and resetOn
+        // ride along, so trim, reset semantics, and verdict always come
+        // from one consumer's options.
         let verdict = callContext.infiniteVerdict;
         if (!verdict) {
           // FIFO: with a forward and a backward fetch in flight at once,
           // each settling call consumes the mark queued for it in issue
           // order.
           const dir = state.pendingDirs.shift() ?? null;
-          verdict = callContext.infiniteVerdict = {dir, maxPages, done: false};
+          verdict = callContext.infiniteVerdict = {
+            dir,
+            maxPages,
+            resetOn,
+            done: false
+          };
         }
         return f(...args).then((page: R<AF>) => {
           // Exactly one wrapper of this call updates the shared state.
           if (verdict.done) return state.pages;
           verdict.done = true;
           const param = args[0];
+          // The aggregation-membership key of this call: the args tuple
+          // with a trailing AbortSignal trimmed, so a rerun issued with a
+          // signal (a useRun {signal: true} rerun, an invalidation replay)
+          // compares equal to the page's original call.
+          const key = stableHash(trimTrailingSignal(args));
           if (verdict.dir === 'next') {
             state.pages = [...state.pages, page];
             state.pageParams = [...state.pageParams, param];
+            state.paramKeys.push(key);
           } else if (verdict.dir === 'prev') {
             state.pages = [page, ...state.pages];
             state.pageParams = [param, ...state.pageParams];
-          } else {
-            // Any other call resets the aggregation to the single result.
+            state.paramKeys.unshift(key);
+          } else if (
+            verdict.resetOn !== 'args' ||
+            !state.paramKeys.includes(key)
+          ) {
+            // Any other call resets the aggregation to the single result —
+            // except in 'args' mode, where a call whose args match a page
+            // the aggregation already shows is a rerun (an invalidation
+            // re-running the first page — or every page — a focus
+            // revalidation, a useRun rerun of the same args) and the
+            // accumulated pages stay: collapsing a list the user paged
+            // through is the surprising behavior the mode opts out of. The
+            // rerun's fresh page deliberately does NOT enter the
+            // aggregation — it still lands wherever inner wrappers put it
+            // (a useCache entry, the loading stores); restarting the list
+            // stays the job of a call with args outside the aggregation.
             state.pages = [page];
             state.pageParams = [param];
+            state.paramKeys = [key];
           }
           if (state.pages.length > verdict.maxPages) {
             // Trim from the far end: a forward fetch sheds the oldest
@@ -193,6 +261,7 @@ export function useInfinite<AF extends AsyncFunc>(
               head,
               head + verdict.maxPages
             );
+            state.paramKeys.splice(head, drop);
           }
           // The fresh ticket is reserved at RESOLVE time, not at call time:
           // this emission must win over any single-page emission an inner
@@ -206,11 +275,20 @@ export function useInfinite<AF extends AsyncFunc>(
 
   // The pages array is swapped (never mutated) on each update, so it is a
   // naturally stable snapshot for useSyncExternalStore; before the first
-  // result the shared state's initial [] shows.
+  // result the shared state's initial [] shows. A non-array `lastResult`
+  // is a single-page emission an inner wrapper made for a call still
+  // bubbling to this wrapper's aggregation emission (a useCache publish
+  // resolves one microtask earlier) or an inner cache-hit replay that never
+  // reaches this wrapper at all — either way the aggregation, not that
+  // page, is what this hook renders, so the shared state's pages stand in
+  // until the aggregated array takes the store back.
   const pages = useStoreValue(
     store,
     useCallback(
-      () => (store.hasResult ? store.lastResult : state.pages),
+      () =>
+        store.hasResult && Array.isArray(store.lastResult)
+          ? store.lastResult
+          : state.pages,
       [store, state]
     )
   );
