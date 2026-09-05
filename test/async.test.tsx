@@ -726,6 +726,32 @@ describe('async hooks', () => {
       vi.useRealTimers();
     });
 
+    it('should default cacheTime to 5 minutes — idle entries are reclaimed (TanStack gcTime alignment)', async () => {
+      vi.useFakeTimers();
+
+      // No cacheTime given: the default must be a finite 5-minute idle
+      // window, not Infinity — loader-primed entries nobody consumes must
+      // not reside in memory forever by default.
+      const provider = createMemoryCacheProvider<string, [string]>({
+        hash: (key) => JSON.stringify(key)
+      });
+
+      provider.set(['default-gc'], 'primed');
+
+      // One ms short of the window: still cached. (This read also refreshes
+      // the entry's GC clock and slides the sweep deadline along with it.)
+      vi.advanceTimersByTime(5 * 60_000 - 1);
+      expect(provider.get(['default-gc'])).toBeDefined();
+
+      // A full idle window after the last touch: the sweep reclaims it.
+      vi.advanceTimersByTime(5 * 60_000 + 2);
+      await vi.waitFor(() => {
+        expect(provider.get(['default-gc'])).toBeUndefined();
+      });
+
+      vi.useRealTimers();
+    });
+
     it('should carry the raw args of swept entries on the delete event', async () => {
       vi.useFakeTimers();
 

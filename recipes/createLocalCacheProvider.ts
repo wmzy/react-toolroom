@@ -55,8 +55,9 @@ import {
  *   plus the storage key.
  * @param {string} [options.key='react-toolroom:cache'] - the localStorage
  *   key to persist under — namespace it per cache to avoid collisions.
- * @param {number} [options.cacheTime=Infinity] - idle garbage-collection
- *   window of the memory provider; expiry is persisted too, so collected
+ * @param {number} [options.cacheTime=300000] - idle garbage-collection
+ *   window of the memory provider (5 minutes, the TanStack `gcTime`
+ *   default); expiry is persisted too, so collected
  *   entries do not resurrect after a refresh.
  * @param {(k: K) => string} [options.hash=stableHash] - key hash, shared
  *   with the memory provider.

@@ -62,13 +62,13 @@ its failure keeps the stale value on screen.
 
 | Concept | TanStack Query | react-toolroom |
 | --- | --- | --- |
-| Entry lifetime | `gcTime` (default 5 min) after the last observer unsubscribes | `cacheTime` (default `Infinity`) of idle time, measured per entry |
+| Entry lifetime | `gcTime` (default 5 min) after the last observer unsubscribes | `cacheTime` (default 5 min, `300000`) of idle time, measured per entry |
 | Mounted observers | query with observers is never collected | entry observed by a mounted `useCache` consumer is exempt until it unmounts (`provider.observe(args, on)`) |
 | Activity refresh | every observer attach refreshes the GC timer | every `get`/`peek`/`set`/`load` settle refreshes the entry's `lastUsedAt` |
 | No observers at all | entry is garbage after `gcTime` | entry is reclaimed too: every write debounce-schedules a sweep `cacheTime` out, so loader-primed entries with zero components still expire |
 | In-flight request | query with fetchStatus `fetching` is not collected | an entry with an in-flight request is never collected |
 | Freshness | `staleTime` (default 0) | `staleTime` on `useCache` (default 0) — identical meaning; `cachedAt` is stamped from settle, not request start |
-| Forever | `gcTime: Infinity` | `cacheTime: Infinity` (the default) |
+| Forever | `gcTime: Infinity` | `cacheTime: Infinity` (opt-in) |
 
 Trade-off vs. TanStack's per-query timers: the sweep is one shared deadline
 that every access reschedules, so a periodically read entry (polling,

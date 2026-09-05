@@ -48,13 +48,15 @@ type Entry<T, K extends any[]> = {
  * an entry observed by a mounted `useCache` consumer (marked via `observe`)
  * is exempt until unobserved. The sweep emits the same
  * `{type: 'delete', deleted: [...]}` events as `delete`.
- * `cacheTime: Infinity` never reclaims.
+ * `cacheTime: Infinity` opts out of reclamation entirely.
  *
  * @param {object} [options] - The cache provider options.
- * @param {number} [options.cacheTime=Infinity] - The time in milliseconds an idle
+ * @param {number} [options.cacheTime=300000] - The time in milliseconds an idle
  * entry is kept before being reclaimed (per-entry, like TanStack Query's
- * `gcTime`). Every access or write refreshes the entry's clock; `Infinity`
- * (the default) means entries are never reclaimed on their own.
+ * `gcTime`). Every access or write refreshes the entry's clock; the default
+ * is 5 minutes — TanStack Query's `gcTime` default — so loader-primed
+ * entries nobody consumes do not reside in memory forever. Pass `Infinity`
+ * to never reclaim entries on their own.
  * @param {(k: K) => string} [options.hash=stableHash] - The hash function used to generate
  * a unique key for each value. Defaults to {@link stableHash}, which serializes keys
  * deterministically (sorted object keys, structural recursion).
@@ -82,7 +84,7 @@ type Entry<T, K extends any[]> = {
  * ```
  */
 export default function create<T, K extends any[]>({
-  cacheTime = Infinity,
+  cacheTime = 5 * 60_000,
   hash = stableHash,
   persist
 }: {

@@ -314,7 +314,7 @@ function UserList() {
 }
 ```
 
-命中缓存时，缓存值**立即**广播给所有订阅者——组件不用等网络就能渲染出数据。若缓存已超过 `staleTime`（默认 `0`：每次命中都重新验证），会触发后台 refetch，完成后更新所有人；后台 refetch 的失败被静默吞掉，过期数据继续留在屏幕上。默认参数下，`createMemoryCacheProvider()` 永久保留条目（`cacheTime: Infinity`）并用 `stableHash` 计算键；设置了有限 `cacheTime` 时，一旦没有任何组件在使用，缓存会在该时长后自行清空。返回的 `stale` 是**按键（per-key）状态**：每个参数元组在 injectable 的 keyed store 里有自己的过期判定，hook 返回的是「当前展示的结果当初是用哪个元组取的」那条判定——同一 injectable 服务多个参数元组时，一个元组过期不会翻转另一个元组的展示（invalidate 某个键也不会让正展示其他键的屏幕被标过期）。单一参数元组下，所有消费者依然共享同一判定、一起更新。
+命中缓存时，缓存值**立即**广播给所有订阅者——组件不用等网络就能渲染出数据。若缓存已超过 `staleTime`（默认 `0`：每次命中都重新验证），会触发后台 refetch，完成后更新所有人；后台 refetch 的失败被静默吞掉，过期数据继续留在屏幕上。默认参数下，`createMemoryCacheProvider()` 用 `stableHash` 计算键，条目闲置 5 分钟后按条回收（`cacheTime: 300000`，对齐 TanStack Query 的 `gcTime` 默认）——loader 预写、无人消费的条目不再永久驻留内存；传 `cacheTime: Infinity` 可永久保留。返回的 `stale` 是**按键（per-key）状态**：每个参数元组在 injectable 的 keyed store 里有自己的过期判定，hook 返回的是「当前展示的结果当初是用哪个元组取的」那条判定——同一 injectable 服务多个参数元组时，一个元组过期不会翻转另一个元组的展示（invalidate 某个键也不会让正展示其他键的屏幕被标过期）。单一参数元组下，所有消费者依然共享同一判定、一起更新。
 
 ### mutation 之后失效缓存 — `useInvalidate`
 
@@ -730,7 +730,7 @@ function App() {
 | `invalidate(targets)` | 在 mutation 之外声明式地失效缓存（`useMutation` 的 `invalidates` 选项在成功时调用的就是它）。`targets` 的每个元素是一个 cache provider（其全部条目被清除）或 `[provider, ...argsPrefix]` 元组（经 provider 的 `deleteWhere` 只清参数元组在结构上延伸自该前缀的条目——任何 `hash` 约定下都成立）。纯缓存操作：不需要 injectable、不发请求；挂载中的 `useCache` 消费者经 provider 的删除事件自行刷新（经 wrapper 链重跑、重写、广播）。 |
 | `useOptimistic(fn, updater)` | 乐观更新：`fn` 每次调用立即把 `updater(当前结果, ...args)` 发布到 result store；成功时真实结果覆盖它，失败时回滚为调用前的值，同时拒绝继续传给 `useError`/`useCatch`。与 `useInvalidate` 配合——本地可预测的编辑用乐观 UI，其余用硬失效。 |
 | `useInfinite(fn, {getNextPageParam, getPreviousPageParam?, maxPages?})` | 面向 `(pageParam) => page` fetcher 的无限加载：把页聚合为数组发布到 result store，返回 `{pages, pageParams, fetchNextPage, fetchPreviousPage, isFetchingNextPage, isFetchingPreviousPage, hasNextPage, hasPreviousPage}`——TanStack `useInfiniteQuery` 的子集，含双向分页与 `maxPages` 滑动窗口。只有 `fetchNextPage()`/`fetchPreviousPage()` 发起的调用会增长列表（按方向在飞防抖——TanStack 默认行为）；任何直接调用（如 `useRun` 重跑）都会重置 `pages`。 |
-| `createMemoryCacheProvider({cacheTime = Infinity, hash = stableHash, persist?})` | 此处为便捷再导出——详见上方核心表。 |
+| `createMemoryCacheProvider({cacheTime = 300000, hash = stableHash, persist?})` | 此处为便捷再导出——详见上方核心表。 |
 | `usePolling(fn, interval, {whenHidden = false, args = []}?)` | 每 `interval` 毫秒调用一次 `fn(...args)`；上一轮未完成时跳过本轮；页面隐藏时暂停（除非 `whenHidden`）。`interval` 变化会重启定时器。每轮落定结果都会记录到错误通道（`useError`/`useArgsStatus`），即使 tick 时无一挂载——之后挂载的读者仍能看到无人观看期间发生的失败，下一次成功 tick 将其清除。`args` 命中与 `useRun(fn, args)` 相同的 `useCache` 键——`useRun` 带键时请传相同元组。 |
 | `useFocusRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 窗口聚焦及 `visibilitychange` 变回可见时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。传 `cacheProvider` 时按条目年龄门控——TanStack `refetchOnWindowFocus` 配 `staleTime` 的语义：年龄小于 `staleTime` 跳过重取，缺失/过期才重取；不传 provider 每次事件都重验证。rejection 走错误通道、无人认领则静默吞掉，绝不产生 unhandled rejection。 |
 | `useReconnectRevalidate(fn, {interval = 0, args = [], cacheProvider?, staleTime = 0}?)` | 监听 window `online` 事件：断网恢复（`navigator.onLine` 为真）时重新请求，`interval` 节流；`args` 展开进每次重新验证，键语义与 `useRun` 一致。与 `useFocusRevalidate` 相同的 `cacheProvider`/`staleTime` 年龄门控；rejection 绝不产生 unhandled rejection。对齐 SWR `revalidateOnReconnect` / TanStack `refetchOnReconnect`。 |
