@@ -128,22 +128,26 @@ class ApiError extends Error {
 }
 const fetchUser = async (id: number) => ({id, name: 'Ada'});
 
-// 探测组件：永不渲染。默认调用形态下 error 即 Error | undefined——
-// 消费方不再需要 as 断言（painless useQuery 的 `as Error | undefined`
-// 由本断言背书删除）；第二泛型显式收窄。
+// 探测组件：永不渲染。默认调用形态下 error 即 Error | undefined、data 即
+// R<AF> | undefined——消费方不再需要 as 断言（painless useQuery 的
+// `as Error | undefined` 由本断言背书删除）；第二泛型显式收窄。
 function ArgsStatusTypeProbe(props: {fn: typeof fetchUser}) {
   const status = useArgsStatus(props.fn, [1]);
   expectTypeOf(status.error).toEqualTypeOf<Error | undefined>();
   expectTypeOf(status.loading).toEqualTypeOf<boolean>();
   expectTypeOf(status.failureCount).toEqualTypeOf<number>();
+  expectTypeOf(status.data).toEqualTypeOf<
+    {id: number; name: string} | undefined
+  >();
   const api = useArgsStatus<typeof fetchUser, ApiError>(props.fn, [1]);
   expectTypeOf(api.error).toEqualTypeOf<ApiError | undefined>();
   return null;
 }
 void ArgsStatusTypeProbe;
 
-// useKeyedResult 的差异点：data 不是 any 而是 R<AF> | undefined——结果通道
-// 的类型化 keyed 读。探测组件同样永不渲染（体内只做类型收口）。
+// useKeyedResult 的差异点：只保留结果通道（data/dataUpdatedAt/loading/
+// error）——failureCount、dataUpdateCount 等观测项留在 useArgsStatus；两边
+// 的 data 同为 R<AF> | undefined。探测组件同样永不渲染（体内只做类型收口）。
 function KeyedResultTypeProbe(props: {fn: typeof fetchUser}) {
   const result = useKeyedResult(props.fn, [1]);
   expectTypeOf(result.data).toEqualTypeOf<
@@ -164,8 +168,8 @@ function KeyedResultTypeProbe(props: {fn: typeof fetchUser}) {
 }
 void KeyedResultTypeProbe;
 
-describe('useArgsStatus error 泛型与 useMutation status 类型契约', () => {
-  it('ArgsStatus 默认实例化可构造，E 实参收窄 error 字段', () => {
+describe('useArgsStatus error/data 泛型与 useMutation status 类型契约', () => {
+  it('ArgsStatus 默认实例化可构造，E/D 实参分别收窄 error 与 data', () => {
     const plain: ArgsStatus = {
       loading: false,
       error: undefined,
@@ -180,6 +184,18 @@ describe('useArgsStatus error 泛型与 useMutation status 类型契约', () => 
       error: new ApiError(418)
     };
     expect(narrowed.error?.code).toBe(418);
+    // D 实参收窄 data：同形对象可赋值，错误形状编译期即拒。
+    const typedData: ArgsStatus<Error, {id: number}> = {
+      ...plain,
+      data: {id: 1}
+    };
+    expect(typedData.data?.id).toBe(1);
+    const wrongData: ArgsStatus<Error, {id: number}> = {
+      ...plain,
+      // @ts-expect-error data 形状不符 D 实参 {id: number}
+      data: {name: 'nope'}
+    };
+    void wrongData;
   });
 
   it('MutationStatus.status 是 TanStack 同款四态字面量联合', () => {

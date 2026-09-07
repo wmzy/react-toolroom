@@ -26,7 +26,13 @@ import type {CacheProvider, PersistOptions} from '@@/types';
  * - Cross-tab: a storage event for this key — another tab's new mirror
  *   (`newValue` set) or its logout wipe (`newValue: null`) — clears this
  *   tab's memory so consumers refetch server truth. Foreign bytes are never
- *   re-hydrated.
+ *   re-hydrated. The listener's lifetime follows the provider's
+ *   reachability: a module singleton keeps it — and its convergence — for
+ *   the page's whole life, while a provider nothing references anymore
+ *   stops rooting itself on `window`: the handler derefs a WeakRef per
+ *   event and a FinalizationRegistry detaches it once the provider is
+ *   collected. The memory provider's own sweep timers may delay that
+ *   collection by up to `cacheTime` — bounded, and GC-correct.
  * - `clear()` writes the empty table first (through the mirror above), then
  *   removes the key outright — belt-and-braces, so a quota-swallowed empty
  *   write cannot leave the previous session's mirror behind. Clears
@@ -113,32 +119,122 @@ export default function attachPersistence<T, K extends any[]>(
     }
   });
 
-  // Cross-tab convergence. Storage events fire in OTHER documents only;
-  // both a new mirror (`newValue` set) and a logout wipe (`null`) get the
-  // same answer: drop this tab's memory, consumers refetch server truth.
-  // The listener stays attached for the provider's whole life — a cache
-  // that stops mirroring (suspended) must keep converging.
+  // Cross-tab convergence and the event-aware clear wipe, installed by the
+  // two module-private helpers below — separate functions on purpose, not
+  // for tidiness: their closures share the `syncing` flag, so they must
+  // share a scope with the storage handler, and that scope must NOT also
+  // capture `provider`. Closures capture whole scopes, not single variables
+  // (one context per scope, shared by every closure over it): a `provider`
+  // binding in the handler's scope would give `window` → handler → scope →
+  // provider — a strong edge no WeakRef can break. See the helper headers.
+  //
+  // The contract the helpers implement: while the provider is reachable —
+  // a module singleton, for the page's whole life, unchanged — the
+  // listener stays attached and a storage event for this key (another
+  // tab's new mirror, `newValue` set, or its logout wipe, `null`) drops
+  // this tab's memory so consumers refetch server truth; foreign bytes
+  // are never re-hydrated, and a cache that stops mirroring (suspended)
+  // keeps converging. Once the provider is unreachable, `window` must not
+  // root the inert closure forever: the handler derefs a WeakRef per
+  // matching event and a FinalizationRegistry detaches the handler after
+  // collection, without waiting for a storage event. (The memory
+  // provider's own sweep timers may keep it reachable for up to
+  // `cacheTime` after its last write — bounded, and GC-correct: a pending
+  // timer is a live reference like any other.)
+  const isSyncing = attachCrossTabListener(provider, key);
+  wrapClearForCrossTab(provider, isSyncing, key, storage);
+}
+
+/**
+ * The cross-tab storage listener: while the provider is reachable, a
+ * matching storage event (another tab's new mirror or its logout wipe)
+ * clears this tab's memory so consumers refetch server truth. Returns the
+ * `syncing` flag's reader for the clear wrapper — a storage-event-triggered
+ * clear must skip its removeItem, or the wipe would restart the very chain
+ * the event is converging.
+ *
+ * The listener's lifetime follows the provider's REACHABILITY, and the
+ * scope discipline in here is what makes that real. The handler must stay
+ * window-rooted, so everything its closure captures (`key`, the WeakRef,
+ * the registry, its token, `syncing`) must not reach the provider
+ * strongly: `provider` is used only synchronously below — WeakRef
+ * construction, registry registration — and captured by no closure, so it
+ * dies with this call's frame. A `provider` binding captured by any
+ * closure of this function would hand `window` a strong edge
+ * (`window` → handler → context → provider) that no WeakRef can break.
+ *
+ * The FinalizationRegistry detaches the handler once the provider is
+ * collected, without waiting for a storage event to notice. But a registry
+ * nothing references dies with its target and never fires — it must stay
+ * reachable while the handler lives: the handler's dead path references it
+ * (`window` → handler → registry), and once the finalizer removes the
+ * handler that whole cycle is unreachable too.
+ */
+function attachCrossTabListener<T, K extends any[]>(
+  provider: CacheProvider<T, K>,
+  key: string
+): () => boolean {
+  const providerRef = new WeakRef(provider);
+  const token = {};
+  const registry = new FinalizationRegistry<void>(() => {
+    window.removeEventListener('storage', onStorage);
+  });
+  registry.register(provider, undefined, token);
   let syncing = false;
-  const onStorage = (ev: StorageEvent) => {
+  // A function DECLARATION, not a const arrow: the registry callback
+  // above references `onStorage` before this line — runtime-safe (the
+  // finalizer only fires post-collection, long after this frame) and the
+  // lint rule's `functions: false` option reads declarations as hoisted
+  // (the same pattern memory-cache-provider's `scheduleSweep` uses).
+  function onStorage(ev: StorageEvent) {
     if (ev.key !== key) return;
+    const live = providerRef.deref();
+    if (live === undefined) {
+      // Dead path — the provider is gone; nothing left to converge.
+      // Unregister before detaching: a no-op once the finalizer already
+      // ran, but this reference is also what keeps the registry (and with
+      // it the finalizer) alive while the handler is still attached.
+      registry.unregister(token);
+      window.removeEventListener('storage', onStorage);
+      return;
+    }
     syncing = true;
     try {
-      provider.clear();
+      live.clear();
     } finally {
       syncing = false;
     }
-  };
+  }
   window.addEventListener('storage', onStorage);
+  return () => syncing;
+}
 
-  // The clear() wipe: delete events have already mirrored the empty table;
-  // the explicit removeItem guarantees the outcome even when that write was
-  // swallowed (quota) — the logout guarantee, for free on every clear.
-  // Storage-event-triggered clears skip it: the event-driven empty write is
-  // what converges the two tabs, and a removeItem would restart the chain.
+/**
+ * The clear() wipe: delete events have already mirrored the empty table;
+ * the explicit removeItem guarantees the outcome even when that write was
+ * swallowed (quota) — the logout guarantee, for free on every clear.
+ * Storage-event-triggered clears skip it (the `isSyncing` reader): the
+ * event-driven empty write is what converges the two tabs, and a
+ * removeItem would restart the chain.
+ *
+ * Same scope discipline as the listener, from the other side: the wrapper
+ * becomes a property of the provider, so its closure lives and dies with
+ * the provider's own cluster — it captures the original `clear`, the
+ * reader, `key` and `storage`, never the provider binding itself, and
+ * nothing here is window-rooted. The captured original `clear` keeps the
+ * provider's factory scope alive, but only through the provider — the
+ * cluster is collectable the moment the provider is.
+ */
+function wrapClearForCrossTab<T, K extends any[]>(
+  provider: CacheProvider<T, K>,
+  isSyncing: () => boolean,
+  key: string,
+  storage: Storage
+): void {
   const {clear} = provider;
   provider.clear = () => {
     clear();
-    if (syncing) return;
+    if (isSyncing()) return;
     try {
       storage.removeItem(key);
     } catch {

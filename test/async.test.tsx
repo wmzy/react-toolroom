@@ -4765,6 +4765,34 @@ describe('async hooks', () => {
       }
     });
 
+    it('keeps ticking when there is no document at all (workers, RN)', async () => {
+      vi.useFakeTimers();
+      try {
+        // `document` is stubbed away only AFTER render: mounting itself
+        // needs the real one. What must survive is the tick callback — a
+        // bare `document.hidden` dereference throws inside every interval
+        // fire, which advanceTimersByTimeAsync surfaces right here, so the
+        // guard below the stub is what lets this test pass at all.
+        const fetchUser = vi.fn(async (id: number) => `user ${id}`);
+        function TestComponent() {
+          const injectable = useInjectable(fetchUser);
+          usePolling(injectable, 1000, {args: [42]});
+          return null;
+        }
+        const {unmount} = render(<TestComponent />);
+        vi.stubGlobal('document', undefined);
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(fetchUser).toHaveBeenCalledTimes(3);
+        expect(fetchUser.mock.calls[2]).toEqual([42]);
+        // RTL needs the real document back before the tree comes down.
+        vi.unstubAllGlobals();
+        unmount();
+      } finally {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+      }
+    });
+
     it('records a failed tick for error channels that mount later', async () => {
       vi.useFakeTimers();
       try {

@@ -79,7 +79,9 @@ function revalidateOnce<AF extends AsyncFunc>(
  * A tick is skipped while the previous call is still pending, so a slow
  * function never piles up concurrent requests — the semantic equivalent of
  * `refetchInterval` in react-query. While `document.hidden` is `true` the
- * polling is paused unless `whenHidden` is set, and changing `interval`
+ * polling is paused unless `whenHidden` is set; an environment with no
+ * `document` at all (workers, React Native) has no hidden state, so there
+ * the gate always reads visible and every tick runs. Changing `interval`
  * restarts the timer. The timer is cleaned up on unmount.
  *
  * Every tick's settle outcome is recorded on the injectable's error
@@ -184,7 +186,12 @@ export function usePolling<AF extends AsyncFunc>(
   useEffect(() => {
     let inFlight = false;
     const tick = () => {
-      if (!whenHidden && document.hidden) return;
+      // Probe instead of dereference: with no `document` at all (workers,
+      // React Native) nothing can ever be hidden, so the gate reads
+      // visible — the same answer an explicit `whenHidden: true` gives a
+      // DOM environment — rather than throwing on every tick.
+      if (!whenHidden && typeof document !== 'undefined' && document.hidden)
+        return;
       if (inFlight) return;
       inFlight = true;
       tickingRef.current = true;

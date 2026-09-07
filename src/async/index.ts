@@ -888,11 +888,24 @@ export type MutationOptions<
 > = {
   /** Fires synchronously right before the call starts. */
   onMutate?: (...args: Parameters<M>) => void;
-  /** Fires with the resolved value when the call succeeds. */
+  /**
+   * Fires with the resolved value when the call succeeds. Isolated: a
+   * throwing callback never rejects the succeeded call and never starves
+   * `onSettled` — dev builds report the throw via console.error.
+   */
   onSuccess?: (result: R<M>, ...args: Parameters<M>) => void;
-  /** Fires with the rejection when the call fails. */
+  /**
+   * Fires with the rejection when the call fails. Isolated: a throwing
+   * callback never masks the call's own rejection reason (the original
+   * keeps flowing to the caller) and never starves `onSettled` — dev
+   * builds report the throw via console.error.
+   */
   onError?: (error: Error, ...args: Parameters<M>) => void;
-  /** Fires exactly once per call, after `onSuccess` or `onError`. */
+  /**
+   * Fires exactly once per call, after `onSuccess` or `onError` — even
+   * when that callback (or the `invalidates` purge) threw, since both are
+   * isolated from the call's outcome.
+   */
   onSettled?: (
     result: R<M> | undefined,
     error: Error | undefined,
@@ -973,6 +986,24 @@ const enqueueByScope = <T>(
   return run;
 };
 
+// Fires one lifecycle callback in isolation. The call's outcome is settled
+// business by the time these run, so a throwing callback must not reject a
+// succeeded call, must not mask a real rejection (the original reason keeps
+// flowing to the caller), and must not starve the callbacks after it —
+// `onSettled` fires exactly once per call no matter what happened before it.
+// The promise is not a reporting channel: dev builds surface the failure via
+// console.error, production builds swallow it and keep the outcome intact.
+const fireLifecycle = (name: string, fire: () => void): void => {
+  try {
+    fire();
+  } catch (e) {
+    if (process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console -- the dev report IS the feature
+      console.error(`useMutation: the ${name} callback threw`, e);
+    }
+  }
+};
+
 /**
  * Wrap a write function with mutation lifecycle tracking — the write-side
  * counterpart of `useRun`.
@@ -991,10 +1022,16 @@ const enqueueByScope = <T>(
  * per-call callbacks are simply `.then` / `.catch` on the returned promise
  * — no separate per-call options API. Hook-level callbacks go through a
  * ref funnel: `options` may be a fresh inline object every render and the
- * latest closures still fire. `reset` clears the settled bookkeeping
- * without touching the ticket sequence: with no call in flight `status`
- * reads `'idle'` again, while an in-flight call keeps `pending` and its
- * outcome still lands after the reset.
+ * latest closures still fire. Every lifecycle callback is isolated from
+ * the call's outcome: a throwing `onSuccess` never rejects the succeeded
+ * call, a throwing `onError` never masks the call's own rejection reason,
+ * and nothing ever starves `onSettled` — it fires exactly once per call
+ * even when the callback before it (or the invalidation) threw. The
+ * promise is not a reporting channel: dev builds surface such failures
+ * via `console.error`, production builds swallow them. `reset` clears the
+ * settled bookkeeping without touching the ticket sequence: with no call in
+ * flight `status` reads `'idle'` again, while an in-flight call keeps
+ * `pending` and its outcome still lands after the reset.
  *
  * `invalidates` is the declarative mutation→query link: on success (only)
  * each target — a cache provider for its whole cache, or a
@@ -1003,7 +1040,11 @@ const enqueueByScope = <T>(
  * that provider refresh themselves through its deletion event, so the
  * mutation component needs no reference to any injectable — the provider
  * (usually a module constant) is all it takes.
- * A rejected mutation invalidates nothing.
+ * A rejected mutation invalidates nothing. A purge failure is contained
+ * like a throwing callback: an invalid target that slipped past the
+ * dev-only render check, or a provider whose purge throws, never turns
+ * the succeeded call into a rejection — dev builds report it via
+ * `console.error`, production builds swallow it.
  *
  * Division of labor: `useMutation` owns the lifecycle and status;
  * `useOptimistic` adds optimistic snapshots for locally predictable edits;
@@ -1089,17 +1130,41 @@ export function useMutation<
             // Invalidation runs before the user callbacks: it is library
             // plumbing and must not be hostage to a throwing onSuccess.
             // Rejections never reach here — a failed mutation invalidates
-            // nothing.
-            if (invalidates) invalidate(invalidates as readonly any[]);
-            onSuccess?.(result, ...args);
-            onSettled?.(result, undefined, ...args);
+            // nothing. A purge failure is contained too: the render-time
+            // dev check is compiled out in production, so a broken target
+            // or provider can still throw inside invalidate() here — that
+            // must not turn the succeeded call into a rejection. Dev
+            // builds report it; production swallows it.
+            if (invalidates) {
+              try {
+                invalidate(invalidates as readonly any[]);
+              } catch (e) {
+                if (process.env.NODE_ENV !== 'production') {
+                  // eslint-disable-next-line no-console -- the dev report IS the feature
+                  console.error(
+                    'useMutation: invalidates threw while purging on success',
+                    e
+                  );
+                }
+              }
+            }
+            // Each callback fires separately through fireLifecycle: a
+            // throwing onSuccess never rejects the settled call and never
+            // starves onSettled.
+            fireLifecycle('onSuccess', () => onSuccess?.(result, ...args));
+            fireLifecycle('onSettled', () =>
+              onSettled?.(result, undefined, ...args)
+            );
             return result;
           },
           (e: any) => {
-            onError?.(e, ...args);
-            onSettled?.(undefined, e, ...args);
+            fireLifecycle('onError', () => onError?.(e, ...args));
+            fireLifecycle('onSettled', () =>
+              onSettled?.(undefined, e, ...args)
+            );
             // Rejections keep flowing: `mutate` behaves like the original
-            // function, so awaiting callers can branch on the outcome.
+            // function, so awaiting callers can branch on the outcome —
+            // with the ORIGINAL reason, never a callback's own error.
             throw e;
           }
         );
@@ -1437,7 +1502,7 @@ export function useInitialLoading<AF extends AsyncFunc>(injectableFn: AF) {
 }
 
 /** What {@link useArgsStatus} returns for one args key. */
-export type ArgsStatus<E = Error> = {
+export type ArgsStatus<E = Error, D = any> = {
   /** `true` while a call with THESE args is in flight — sibling calls of
    * the same injectable with different args do not flip it. */
   loading: boolean;
@@ -1454,9 +1519,13 @@ export type ArgsStatus<E = Error> = {
   /**
    * The shared last result while its provenance matches these args (the
    * displayed data was actually fetched with them), `undefined` otherwise
-   * — `useResult`'s contract scoped to one key.
+   * — `useResult`'s contract scoped to one key. Through
+   * `useArgsStatus(fn, args)` this is typed `R<AF> | undefined` (the
+   * injectable's resolved type, like `useResult`); the `D` type parameter
+   * exists for bare type instantiations and narrowing —
+   * `ArgsStatus<Error, {id: number}>` types `data` accordingly.
    */
-  data: any | undefined;
+  data: D | undefined;
   /**
    * `Date.now()` of the most recent successful settle of these args,
    * exposed under the same provenance contract as `data`: a number while
@@ -1513,6 +1582,10 @@ export type ArgsStatus<E = Error> = {
  * a declaration, not an inference — the runtime slot holds whatever the
  * call actually rejected with.
  *
+ * `data` is typed `R<AF> | undefined` — the injectable's resolved type,
+ * exactly what `useResult` would hand you — so no assertion is needed
+ * where you consume it, under the provenance gating above.
+ *
  * @param injectableFn the injectable to observe
  * @param args the args tuple identifying the call slot
  * @returns `{loading, error, failureCount, data, dataUpdatedAt, dataUpdateCount}` for exactly these args
@@ -1529,7 +1602,7 @@ export type ArgsStatus<E = Error> = {
 export function useArgsStatus<AF extends AsyncFunc, E = Error>(
   injectableFn: AF,
   args: Parameters<AF>
-): ArgsStatus<E> {
+): ArgsStatus<E, R<AF>> {
   // Mounting this hook claims the instance's errors, exactly like
   // `useError`/`useFailureCount`: the keyed failure reads declare
   // ownership, so the instance's calls stop rejecting at the boundary.
@@ -1616,14 +1689,15 @@ export type KeyedResult<T, E = Error> = {
  * are the per-key slots of the keyed store, so sibling calls with other
  * args never flip them.
  *
- * A typed projection over {@link useArgsStatus} — the same keyed
- * mechanism (structural args hash via {@link stableHash}, trailing
- * `AbortSignal` trimmed), the same subscriptions, no separate
- * bookkeeping. `data` is simply `R<AF> | undefined` instead of `any`,
- * which is the whole point: this is the result channel with the key
- * contract baked into the types. Everything true of `useArgsStatus` is
- * true here — mounting this hook claims the injectable's errors exactly
- * like `useError` (calls resolve `undefined` on failure instead of
+ * A projection over {@link useArgsStatus} — the same keyed mechanism
+ * (structural args hash via {@link stableHash}, trailing `AbortSignal`
+ * trimmed), the same subscriptions, no separate bookkeeping. `data` is
+ * simply `R<AF> | undefined` gated by the key — where bare `useResult`
+ * hands you the shared last settle with no key gating, this is the
+ * result channel with the key contract baked into the types.
+ * Everything true of `useArgsStatus` is true here — mounting this hook
+ * claims the injectable's errors exactly like `useError` (calls resolve
+ * `undefined` on failure instead of
  * rejecting while a keyed reader is mounted), and each key's slots are
  * reclaimed once its calls drain (bounded retention, see
  * {@link useArgsStatus}). The observability extras — `failureCount`,

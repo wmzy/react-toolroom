@@ -11,7 +11,9 @@
  * test/setup.ts 把 jsdom 的 localStorage 换成了 no-op vi.fn()，本组
  * 每个用例换上真实的内存 Storage；storage-event 派发还原浏览器
  * 「其它文档改动才广播」的行为（jsdom 不自动广播）。storage 监听
- * 与 provider 同生命周期不摘除，用例间靠唯一键隔离。
+ * 的生命周期跟随 provider 可达性：模块单例整页在挂（行为不变），
+ * 用例内创建、事后无人引用的 provider 会被 GC 连监听一起回收（见
+ * --expose-gc 门控的泄漏回归用例）；用例间仍靠唯一键隔离。
  */
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {act, render, waitFor} from '@testing-library/react';
@@ -23,6 +25,26 @@ import {
   useResult,
   useRun
 } from '../src/async';
+import type {CacheProvider} from '../src/types';
+
+// GC 门控的用例开关：globalThis.gc 仅在 node --expose-gc 下存在
+// （NODE_OPTIONS=--expose-gc npx vitest run …）。默认跑干净跳过——
+// finalizer 的调度时机引擎不保证，不拿它赌 CI。
+const itGc = typeof (globalThis as any).gc === 'function' ? it : it.skip;
+
+// 泄漏回归用例的 provider 工厂：必须是普通（非 async）函数——其栈帧
+// 在 return 时即弹出，局部 cache 随之彻底死亡；async 测试函数的挂起帧
+// 会保守保留块级局部，provider 反而收不掉。cacheTime: Infinity 甩掉
+// sweep 定时器（定时器回调经工厂作用域强持有 provider 一个 cacheTime
+// 窗口——源码注释说明的有界延迟），让回收时机在用例里确定。
+function leakyProvider(key: string): WeakRef<CacheProvider<string[], []>> {
+  const cache = createMemoryCacheProvider<string[], []>({
+    cacheTime: Infinity,
+    persist: {key}
+  });
+  cache.set([], ['leak-me']); // 完整接线：镜像落盘 + 监听已挂
+  return new WeakRef(cache);
+}
 
 // A minimal spec-compliant Storage, so the persistence path runs against
 // a store that actually reads back what was written. Write failures are
@@ -448,6 +470,77 @@ describe('createMemoryCacheProvider persist', () => {
 
     vi.useRealTimers();
   });
+
+  itGc(
+    '监听器随可达性摘除：无人引用的 provider 被 GC 后 FinalizationRegistry 把 storage 监听从 window 摘下',
+    async () => {
+      const KEY = 'rt:persist:listener-gc';
+      // wrap-through spy：记录调用的同时仍调原生实现——真实注册/摘除
+      // 照常发生，断言打的才是真实链路
+      const origAdd = window.addEventListener.bind(window);
+      const origRemove = window.removeEventListener.bind(window);
+      const addSpy = vi
+        .spyOn(window, 'addEventListener')
+        .mockImplementation(
+          (...args: Parameters<typeof window.addEventListener>) => {
+            origAdd(...args);
+          }
+        );
+      const removeSpy = vi
+        .spyOn(window, 'removeEventListener')
+        .mockImplementation(
+          (...args: Parameters<typeof window.removeEventListener>) => {
+            origRemove(...args);
+          }
+        );
+      try {
+        // leakyProvider（见其头部注释）：同步工厂 + cacheTime
+        // Infinity——provider 在出栈帧里死亡且无定时器强持有，回收
+        // 时机确定
+        const baseline = addSpy.mock.calls.length;
+        const weak = leakyProvider(KEY);
+        const handler = addSpy.mock.calls
+          .slice(baseline)
+          .find(([type]) => type === 'storage')![1];
+
+        // 正向对照：provider 未回收（WeakRef 可 deref）、监听在挂且
+        // 干活——按本文件惯例手动派发 storage 事件（jsdom 不自动广
+        // 播），本 tab 内存被清空。两次 deref 各自即取即弃，不留强
+        // 引用局部
+        expect(weak.deref()).toBeDefined();
+        expect(weak.deref()!.snapshot!().length).toBe(1);
+        window.dispatchEvent(
+          new StorageEvent('storage', {
+            key: KEY,
+            newValue: null
+          })
+        );
+        expect(weak.deref()!.snapshot!()).toEqual([]);
+
+        // 两轮 gc（中间让任务队列跑一拍）通常已完成收集并排好
+        // finalizer；V8 不保证收集后立刻执行 FinalizationRegistry
+        // 回调，轮询兜底（每轮顺带再 gc）
+        (globalThis as any).gc();
+        await new Promise((r) => setTimeout(r, 20));
+        (globalThis as any).gc();
+
+        await vi.waitFor(
+          () => {
+            (globalThis as any).gc();
+            // provider 已被回收（WeakRef 失效）且监听已被摘下——用的
+            // 正是当初挂上去的那个 handler
+            expect(weak.deref()).toBeUndefined();
+            expect(removeSpy).toHaveBeenCalledWith('storage', handler);
+          },
+          {timeout: 8000, interval: 100}
+        );
+      } finally {
+        addSpy.mockRestore();
+        removeSpy.mockRestore();
+      }
+    },
+    15000
+  );
 });
 
 // 不传 persist：storage 全程无人触碰（纯新增选项，缺省行为不变）。

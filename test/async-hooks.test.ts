@@ -2587,6 +2587,124 @@ describe('useMutation', () => {
       )
     ).toThrow(/useMutation: invalidates/);
   });
+
+  it('should keep a succeeded call resolved when onSuccess and onSettled throw', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onSuccess = vi.fn(() => {
+      throw new Error('success blew up');
+    });
+    const onSettled = vi.fn(() => {
+      throw new Error('settled blew up');
+    });
+    let captured: Promise<string> | undefined;
+
+    try {
+      render(
+        createElement(MutationView, {
+          save: () => Promise.resolve('saved'),
+          options: {onSuccess, onSettled},
+          onPromise: (p) => {
+            captured = p;
+          }
+        })
+      );
+      fireEvent.click(screen.getByText('rename'));
+      await act(async () => {
+        // The call SUCCEEDED: throwing callbacks must not reject it.
+        await expect(captured).resolves.toBe('saved');
+      });
+      // onSettled still fired — after onSuccess, despite its throw.
+      expect(onSuccess).toHaveBeenCalledWith('saved', 'alpha');
+      expect(onSettled).toHaveBeenCalledWith('saved', undefined, 'alpha');
+      expect(onSuccess.mock.invocationCallOrder[0]).toBeLessThan(
+        onSettled.mock.invocationCallOrder[0]
+      );
+      // Dev reports: one per throwing callback.
+      expect(err.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(err.mock.calls[0]![0]).toContain('onSuccess');
+      expect(err.mock.calls[1]![0]).toContain('onSettled');
+      expect(screen.getByText('status success')).toBeTruthy();
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it('should keep the original rejection when onError throws', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const boom = new Error('boom');
+    const onError = vi.fn(() => {
+      throw new Error('cb');
+    });
+    const onSettled = vi.fn();
+    let captured: Promise<string> | undefined;
+
+    try {
+      render(
+        createElement(MutationView, {
+          save: () => Promise.reject(boom),
+          options: {onError, onSettled},
+          onPromise: (p) => {
+            captured = p;
+          }
+        })
+      );
+      fireEvent.click(screen.getByText('rename'));
+      await act(async () => {
+        // Identity, not just message: the caller sees the call's own
+        // failure, never the callback's.
+        await expect(captured).rejects.toBe(boom);
+      });
+      expect(onError).toHaveBeenCalledWith(boom, 'alpha');
+      expect(onSettled).toHaveBeenCalledWith(undefined, boom, 'alpha');
+      expect(err.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(err.mock.calls[0]![0]).toContain('onError');
+      expect(screen.getByText('boom')).toBeTruthy();
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it('should contain an invalidates purge failure instead of rejecting the call', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Passes the dev render-time shape check (truthy value with function
+    // `delete` and `clear`) but blows up when actually purged — the same
+    // runtime throw a production build (render check compiled out) hits
+    // on a broken provider.
+    const broken = {
+      set() {},
+      get() {},
+      delete() {},
+      clear() {
+        throw new Error('clear blew up');
+      },
+      use() {
+        return () => {};
+      }
+    } as any;
+    let captured: Promise<string> | undefined;
+
+    try {
+      render(
+        createElement(MutationView, {
+          save: () => Promise.resolve('saved'),
+          options: {invalidates: [broken]},
+          onPromise: (p) => {
+            captured = p;
+          }
+        })
+      );
+      fireEvent.click(screen.getByText('rename'));
+      await act(async () => {
+        // Library plumbing failing must not turn success into rejection.
+        await expect(captured).resolves.toBe('saved');
+      });
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(err.mock.calls[0]![0]).toContain('invalidates');
+      expect(screen.getByText('status success')).toBeTruthy();
+    } finally {
+      err.mockRestore();
+    }
+  });
 });
 
 describe('useMutation scope (serial queue)', () => {
